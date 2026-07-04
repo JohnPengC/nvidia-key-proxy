@@ -1,0 +1,42 @@
+listen_addr = "0.0.0.0:8888"
+base_url    = "https://integrate.api.nvidia.com"
+
+# API keys – can also be set via NVIDIA_KEYS env var (comma-separated)
+keys = [
+    "nvapi-xxxxxxxxxxxxxxxx1",
+    "nvapi-xxxxxxxxxxxxxxxx2",
+    "nvapi-xxxxxxxxxxxxxxxx3",
+]
+
+[rate_limiter]
+qps_per_key = 0.65
+burst       = 8
+
+[cooldown]
+base_seconds = 60
+max_seconds  = 600
+
+[health_check]
+interval_seconds = 30
+timeout_seconds  = 5
+max_consecutive_failures = 3
+
+[observability]
+enable_metrics = true
+metrics_path   = "/metrics"
+log_level      = "info"
+
+# Request timeout in seconds. Set to 0 to disable (recommended for streaming).
+# Streaming requests bypass this timeout regardless.
+request_timeout_seconds = 60
+
+[codex]
+enabled                  = true
+default_model            = "z-ai/glm-5.2"
+model_reasoning_effort   = "high"
+disable_response_storage = true
+bearer_token             = "proxy-managed"
+# models = [
+#   "z-ai/glm-5.2:GLM 5.2:1000000",
+#   "moonshotai/kimi-k2.6:Kimi K2.6:256000",
+# ]
