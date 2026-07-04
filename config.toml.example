@@ -30,6 +30,16 @@ log_level      = "info"
 # Streaming requests bypass this timeout regardless.
 request_timeout_seconds = 60
 
+
+[retry]
+# Upstream (NVIDIA) auth/forbidden retry policy.
+# On 401/403/429 *without* `Retry-After`, the proxy retries the same request
+# against another healthy key with exponential backoff.
+max_retries           = 3      # retry attempts per client request (excluding initial)
+backoff_base_ms       = 200    # first retry sleeps ~backoff_base_ms
+backoff_max_ms        = 2000   # single backoff cap
+auth_fail_threshold   = 3      # consecutive auth-failures to disable a key
+
 [codex]
 enabled                  = true
 default_model            = "z-ai/glm-5.2"

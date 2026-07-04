@@ -47,11 +47,13 @@ async fn main() {
     key_pool.refresh_metrics().await;
 
     let request_timeout = config.request_timeout_seconds;
+    let retry_config = config.retry.clone();
     let proxy = Proxy::new(
         config.base_url.clone(),
         key_pool.clone(),
         metrics.clone(),
         request_timeout,
+        retry_config,
     );
     let health_checker = Arc::new(HealthChecker::new(
         key_pool.clone(),
@@ -188,8 +190,11 @@ async fn main() {
 
     // Stop background tasks.
     stop_signal.notify_waiters();
-    let _ = cooldown_task;
-    let _ = bad_key_task;
+    // Drop the JoinHandles explicitly. We don't await them (we are shutting
+    // down and don't want to block on in-flight probes), but binding them to
+    // `let _ =` would trigger `clippy::let_underscore_future`.
+    drop(cooldown_task);
+    drop(bad_key_task);
     info!("Shutdown complete");
 }
 

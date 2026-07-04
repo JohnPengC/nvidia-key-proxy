@@ -534,3 +534,126 @@ fn chrono_like_id() -> String {
         .as_millis();
     format!("{}", now)
 }
+
+
+#[cfg(test)]
+mod streaming_behavior_tests {
+    // Streaming behavior tests: emits created/delta/completed on normal stream, no completed on abort.
+
+    use super::{translate_stream_chunk, StreamState};
+    use serde_json::Value;
+
+    fn drive(upstream_chunks: &[String], upstream_aborted: bool, model: &str) -> Vec<Value> {
+        let mut state = StreamState::new();
+        let mut buffer = String::new();
+        let mut out: Vec<Value> = Vec::new();
+        for chunk in upstream_chunks {
+            buffer.push_str(chunk);
+            while let Some(pos) = buffer.find("\n\n") {
+                let block = buffer[..pos].to_string();
+                buffer = buffer[pos + 2..].to_string();
+                if let Some(line) = block.lines().find(|l| l.starts_with("data: ")) {
+                    let data = &line[6..];
+                    let payload: &[u8] = if data == "[DONE]" { b"null" } else { data.as_bytes() };
+                    for ev in translate_stream_chunk(payload, &mut state, model) {
+                        if let Some(json_part) = ev.strip_prefix("data: ").and_then(|s| s.strip_suffix("\n\n")) {
+                            if let Ok(v) = serde_json::from_str::<Value>(json_part) {
+                                out.push(v);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if !upstream_aborted && !state.emitted_completed {
+            for ev in translate_stream_chunk(b"null", &mut state, model) {
+                if let Some(json_part) = ev.strip_prefix("data: ").and_then(|s| s.strip_suffix("\n\n")) {
+                    if let Ok(v) = serde_json::from_str::<Value>(json_part) {
+                        out.push(v);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn types_of(events: &[Value]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|v| v.get("type").and_then(|t| t.as_str()).map(String::from))
+            .collect()
+    }
+
+    fn data(s: &str) -> String {
+        format!("data: {}\n\n", s)
+    }
+
+    #[test]
+    fn normal_stream_emits_created_deltas_and_completed() {
+        let chunks = vec![
+            data(r#"{"choices":[{"delta":{"content":"Hel"}}]}"#),
+            "data: ".to_string(),
+            r#"{"choices":[{"delta":{"content":"lo"}}]}"#.to_string(),
+            "\n\n".to_string(),
+            data(r#"{"choices":[{"delta":{"content":" world"}}]}"#),
+            data("[DONE]"),
+        ];
+
+        let events = drive(&chunks, false, "");
+        let types = types_of(&events);
+
+        assert!(types.iter().any(|t| *t == "response.created"), "{:?}", types);
+        assert!(
+            types.iter().filter(|t| **t == *"response.output_text.delta").count() >= 3,
+            "{:?}",
+            types
+        );
+        assert!(types.iter().any(|t| *t == "response.completed"), "{:?}", types);
+    }
+
+    #[test]
+    fn aborted_stream_does_not_emit_completed() {
+        let chunks = vec![data(r#"{"choices":[{"delta":{"content":"partial"}}]}"#)];
+        let events = drive(&chunks, true, "");
+        let types = types_of(&events);
+
+        assert!(
+            !types.iter().any(|t| *t == "response.completed"),
+            "aborted stream must NOT emit response.completed; got {:?}",
+            types
+        );
+        assert!(types.iter().any(|t| *t == "response.created"), "{:?}", types);
+        assert!(
+            types.iter().any(|t| *t == "response.output_text.delta"),
+            "{:?}",
+            types
+        );
+    }
+
+    #[test]
+    fn model_is_propagated_into_created_and_completed_events() {
+        // drive with a non-empty model and assert the created/completed events
+        // carry that model string (regression guard for the previously-empty
+        // `model` field in translated Responses events).
+        let chunks = vec![
+            data(r#"{"choices":[{"delta":{"content":"hi"}}]}"#),
+            data("[DONE]"),
+        ];
+        let events = drive(&chunks, false, "z-ai/glm-5.2");
+
+        let created = events.iter().find(|v| v.get("type").and_then(|t| t.as_str()) == Some("response.created"));
+        let completed = events.iter().find(|v| v.get("type").and_then(|t| t.as_str()) == Some("response.completed"));
+
+        let created_model = created
+            .and_then(|v| v.get("response"))
+            .and_then(|r| r.get("model"))
+            .and_then(|m| m.as_str());
+        let completed_model = completed
+            .and_then(|v| v.get("response"))
+            .and_then(|r| r.get("model"))
+            .and_then(|m| m.as_str());
+
+        assert_eq!(created_model, Some("z-ai/glm-5.2"), "created model missing");
+        assert_eq!(completed_model, Some("z-ai/glm-5.2"), "completed model missing");
+    }
+}

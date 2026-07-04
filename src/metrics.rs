@@ -24,6 +24,11 @@ lazy_static! {
         prometheus::exponential_buckets(0.005, 2.0, 12).unwrap()
     )
     .unwrap();
+    static ref RETRY_ATTEMPT_FAILURE: Counter = register_counter!(
+        "proxy_retry_attempt_failures_total",
+        "Per-attempt upstream failures retried internally (not visible to client). Distinct from proxy_requests_errors_total which counts client-visible failures."
+    )
+    .unwrap();
     static ref KEY_ACTIVE: Gauge = register_gauge!(
         "proxy_key_active",
         "Number of API keys currently in active state"
@@ -57,6 +62,10 @@ impl Metrics {
 
     pub fn inc_success(&self) {
         REQUEST_SUCCESS.inc();
+    }
+
+    pub fn inc_retry_attempt_failure(&self) {
+        RETRY_ATTEMPT_FAILURE.inc();
     }
 
     pub fn inc_error(&self) {

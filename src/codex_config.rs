@@ -488,8 +488,6 @@ pub fn get_catalog() -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     /// Manual removal of [model_providers.custom] section.
     /// Mirrors the logic in `generate_config_toml` — Rust's regex crate
     /// does not support lookahead, so we find the section header then

@@ -79,21 +79,21 @@ impl HealthChecker {
         };
 
         for key_str in keys {
-            let result = self.probe_key(&key_str).await;
-            match result {
+            match self.probe_key(&key_str).await {
                 Ok(status) if status.is_success() => {
                     self.key_pool.mark_good(&key_str).await;
                 }
                 Ok(status) => {
-                    warn!(key = %mask_key(&key_str), status = %status, "Health check failed");
-                    self.key_pool.mark_bad(&key_str, None).await;
+                    // Don't punish the key: NVIDIA's /v1/models can return
+                    // 403/401 on a perfectly valid key (account/region gating).
+                    // Cool-down here would drain the pool. Only log and leave
+                    // the key's state untouched.
+                    warn!(key = %mask_key(&key_str), status = %status, "Startup probe non-2xx; leaving key state untouched");
                 }
                 Err(e) => {
-                    warn!(key = %mask_key(&key_str), error = %e, "Health check error");
-                    self.key_pool.mark_bad(&key_str, None).await;
+                    warn!(key = %mask_key(&key_str), error = %e, "Startup probe error; leaving key state untouched");
                 }
             }
-            let _ = self.timeout; // timeout already applied via client builder
         }
         Ok(())
     }
@@ -103,22 +103,46 @@ impl HealthChecker {
     /// so cooldown timing is respected and we avoid probing a key too early.
     async fn check_bad_keys(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let bad_keys = self.key_pool.get_bad_keys().await;
-        if bad_keys.is_empty() {
+        // Also probe Disabled keys: those were marked bad after repeated
+        // auth failures (see Proxy::handle_request + KeyPool::mark_failure).
+        // A success here reactivates them; a non-success leaves them Disabled.
+        let disabled_keys = self.key_pool.get_disabled_keys().await;
+        if bad_keys.is_empty() && disabled_keys.is_empty() {
             return Ok(());
         }
-        info!("Checking {} bad key(s) for recovery", bad_keys.len());
-        for key_str in bad_keys {
-            let result = self.probe_key(&key_str).await;
-            match result {
+        info!(
+            bad = bad_keys.len(),
+            disabled = disabled_keys.len(),
+            "Recovery probe round"
+        );
+        for key_str in &bad_keys {
+            match self.probe_key(key_str).await {
                 Ok(status) if status.is_success() => {
-                    info!(key = %mask_key(&key_str), "Bad key recovered, marking as good");
-                    self.key_pool.mark_good(&key_str).await;
+                    info!(key = %mask_key(key_str), "Bad key recovered via probe; marking as good");
+                    self.key_pool.mark_good(key_str).await;
                 }
                 Ok(status) => {
-                    warn!(key = %mask_key(&key_str), status = %status, "Bad key still not healthy");
+                    // /v1/models returning non-2xx is not decisive evidence
+                    // the key is bad. Defer to cooldown timing for recovery
+                    // (cool_down_task reactivates once ready_at passes).
+                    warn!(key = %mask_key(key_str), status = %status, "Recovery probe non-2xx; deferring to cooldown timer");
                 }
                 Err(e) => {
-                    warn!(key = %mask_key(&key_str), error = %e, "Bad key probe error");
+                    warn!(key = %mask_key(key_str), error = %e, "Recovery probe error; deferring to cooldown timer");
+                }
+            }
+        }
+        for key_str in &disabled_keys {
+            match self.probe_key(key_str).await {
+                Ok(status) if status.is_success() => {
+                    info!(key = %mask_key(key_str), "Disabled key recovered via probe; reactivating");
+                    self.key_pool.recover_disabled(key_str).await;
+                }
+                Ok(status) => {
+                    warn!(key = %mask_key(key_str), status = %status, "Disabled key still failing probe; staying Disabled");
+                }
+                Err(e) => {
+                    warn!(key = %mask_key(key_str), error = %e, "Disabled key probe error; staying Disabled");
                 }
             }
         }

@@ -21,6 +21,9 @@ pub struct Config {
     /// (recommended when proxying long-running streaming requests).
     #[serde(default = "default_request_timeout_seconds")]
     pub request_timeout_seconds: u64,
+    /// Retry/upstream-error policy (exponential backoff, key-disable threshold).
+    #[serde(default)]
+    pub retry: RetryConfig,
 }
 
 fn default_request_timeout_seconds() -> u64 {
@@ -48,6 +51,7 @@ impl fmt::Debug for Config {
             .field("observability", &self.observability)
             .field("codex", &self.codex.enabled)
             .field("request_timeout_seconds", &self.request_timeout_seconds)
+            .field("retry", &self.retry)
             .finish()
     }
 }
@@ -62,6 +66,48 @@ pub struct RateLimiterConfig {
 pub struct CooldownConfig {
     pub base_seconds: u64,
     pub max_seconds: u64,
+}
+
+/// Retry/upstream-error policy for proxy → NVIDIA.
+///
+/// When NVIDIA returns 401/403/429 *without* `Retry-After`, the proxy will
+/// retry the same request against another healthy key with exponential
+/// backoff. Each attempt that fails increments the offending key's
+/// `fail_count`; once `auth_fail_threshold` is reached, the key is moved to
+/// `KeyState::Disabled` and is no longer acquired. A background health probe
+/// must see a success before the key is reactivated.
+#[derive(Debug, Deserialize, Clone)]
+pub struct RetryConfig {
+    /// Maximum retry attempts per client request (excluding the initial
+    /// attempt). Default 3.
+    #[serde(default = "default_max_retries")]
+    pub max_retries: u32,
+    /// Base delay for exponential backoff in milliseconds. Default 200.
+    #[serde(default = "default_backoff_base_ms")]
+    pub backoff_base_ms: u64,
+    /// Cap for a single backoff sleep. Default 2000.
+    #[serde(default = "default_backoff_max_ms")]
+    pub backoff_max_ms: u64,
+    /// Per-key consecutive upstream auth/forbidden failures after which the
+    /// key is Disabled (until a health probe recovers it). Default 3.
+    #[serde(default = "default_auth_fail_threshold")]
+    pub auth_fail_threshold: u32,
+}
+
+fn default_max_retries() -> u32 { 3 }
+fn default_backoff_base_ms() -> u64 { 200 }
+fn default_backoff_max_ms() -> u64 { 2000 }
+fn default_auth_fail_threshold() -> u32 { 3 }
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            max_retries: default_max_retries(),
+            backoff_base_ms: default_backoff_base_ms(),
+            backoff_max_ms: default_backoff_max_ms(),
+            auth_fail_threshold: default_auth_fail_threshold(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -108,6 +154,7 @@ impl Config {
             },
             codex: crate::codex_config::CodexConfig::default(),
             request_timeout_seconds: default_request_timeout_seconds(),
+            retry: RetryConfig::default(),
         };
 
         // Prefer NVIDIA_CONFIG_PATH, fall back to ./config.toml
@@ -127,6 +174,7 @@ impl Config {
             config.observability = toml_config.observability;
             config.codex = toml_config.codex;
             config.request_timeout_seconds = toml_config.request_timeout_seconds;
+            config.retry = toml_config.retry;
         }
 
         // Override from environment variables (NVIDIA_*)
@@ -210,6 +258,26 @@ impl Config {
                 "request_timeout_seconds" => {
                     if let Ok(v) = value.parse::<u64>() {
                         config.request_timeout_seconds = v;
+                    }
+                }
+                "retry_max_retries" => {
+                    if let Ok(v) = value.parse::<u32>() {
+                        config.retry.max_retries = v;
+                    }
+                }
+                "retry_backoff_base_ms" => {
+                    if let Ok(v) = value.parse::<u64>() {
+                        config.retry.backoff_base_ms = v;
+                    }
+                }
+                "retry_backoff_max_ms" => {
+                    if let Ok(v) = value.parse::<u64>() {
+                        config.retry.backoff_max_ms = v;
+                    }
+                }
+                "retry_auth_fail_threshold" => {
+                    if let Ok(v) = value.parse::<u32>() {
+                        config.retry.auth_fail_threshold = v;
                     }
                 }
                 _ => {}
