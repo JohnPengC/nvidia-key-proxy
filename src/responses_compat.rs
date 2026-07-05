@@ -22,10 +22,7 @@ pub fn translate_request(body: &Bytes) -> (String, Vec<u8>) {
         Ok(v) => v,
         Err(e) => {
             debug!("responses_compat: failed to parse request body: {}", e);
-            return (
-                "/v1/chat/completions".to_string(),
-                Vec::new(),
-            );
+            return ("/v1/chat/completions".to_string(), Vec::new());
         }
     };
 
@@ -72,10 +69,7 @@ pub fn translate_request(body: &Bytes) -> (String, Vec<u8>) {
                     match item_type {
                         "message" => {
                             // {type:"message", role:"user"/"assistant"/"system", content: ...}
-                            let role = item
-                                .get("role")
-                                .and_then(|r| r.as_str())
-                                .unwrap_or("user");
+                            let role = item.get("role").and_then(|r| r.as_str()).unwrap_or("user");
                             let content = item.get("content").cloned().unwrap_or(Value::Null);
                             // content can be a string or an array of content blocks
                             let content_text = match &content {
@@ -84,9 +78,12 @@ pub fn translate_request(body: &Bytes) -> (String, Vec<u8>) {
                                     // Extract text from content blocks
                                     let mut texts = Vec::new();
                                     for block in blocks {
-                                        if let Some(t) = block.get("text").and_then(|t| t.as_str()) {
+                                        if let Some(t) = block.get("text").and_then(|t| t.as_str())
+                                        {
                                             texts.push(t.to_string());
-                                        } else if let Some(t) = block.get("content").and_then(|t| t.as_str()) {
+                                        } else if let Some(t) =
+                                            block.get("content").and_then(|t| t.as_str())
+                                        {
                                             texts.push(t.to_string());
                                         }
                                     }
@@ -102,8 +99,12 @@ pub fn translate_request(body: &Bytes) -> (String, Vec<u8>) {
                         "function_call" => {
                             // Previous function call from the assistant → assistant message with tool_calls
                             let name = item.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                            let arguments = item.get("arguments").and_then(|a| a.as_str()).unwrap_or("{}");
-                            let call_id = item.get("call_id").and_then(|c| c.as_str()).unwrap_or("");
+                            let arguments = item
+                                .get("arguments")
+                                .and_then(|a| a.as_str())
+                                .unwrap_or("{}");
+                            let call_id =
+                                item.get("call_id").and_then(|c| c.as_str()).unwrap_or("");
                             messages.push(json!({
                                 "role": "assistant",
                                 "content": Value::Null,
@@ -119,8 +120,12 @@ pub fn translate_request(body: &Bytes) -> (String, Vec<u8>) {
                         }
                         "function_call_output" => {
                             // Tool result → tool message
-                            let call_id = item.get("call_id").and_then(|c| c.as_str()).unwrap_or("");
-                            let output = item.get("output").cloned().unwrap_or(Value::String(String::new()));
+                            let call_id =
+                                item.get("call_id").and_then(|c| c.as_str()).unwrap_or("");
+                            let output = item
+                                .get("output")
+                                .cloned()
+                                .unwrap_or(Value::String(String::new()));
                             let output_text = match &output {
                                 Value::String(s) => s.clone(),
                                 _ => output.to_string(),
@@ -173,15 +178,24 @@ pub fn translate_request(body: &Bytes) -> (String, Vec<u8>) {
             let chat_tools: Vec<Value> = tools_arr
                 .iter()
                 .filter_map(|tool| {
-                    let tool_type = tool.get("type").and_then(|t| t.as_str()).unwrap_or("function");
+                    let tool_type = tool
+                        .get("type")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("function");
                     if tool_type == "function" {
                         // Already might have a name/description/parameters or a nested function object
                         if let Some(func) = tool.get("function") {
                             return Some(json!({"type": "function", "function": func}));
                         }
                         // Flat: name, description, parameters at top level
-                        let name = tool.get("name").cloned().unwrap_or(Value::String(String::new()));
-                        let description = tool.get("description").cloned().unwrap_or(Value::String(String::new()));
+                        let name = tool
+                            .get("name")
+                            .cloned()
+                            .unwrap_or(Value::String(String::new()));
+                        let description = tool
+                            .get("description")
+                            .cloned()
+                            .unwrap_or(Value::String(String::new()));
                         let parameters = tool.get("parameters").cloned().unwrap_or(json!({}));
                         return Some(json!({
                             "type": "function",
@@ -228,7 +242,10 @@ pub fn translate_response(body: &[u8], model: &str) -> Vec<u8> {
         if let Some(choice) = choices.first() {
             // Handle message content → output message
             if let Some(message) = choice.get("message") {
-                let role = message.get("role").and_then(|r| r.as_str()).unwrap_or("assistant");
+                let role = message
+                    .get("role")
+                    .and_then(|r| r.as_str())
+                    .unwrap_or("assistant");
                 let content = message.get("content");
 
                 // Handle tool calls first (if any)
@@ -237,7 +254,10 @@ pub fn translate_response(body: &[u8], model: &str) -> Vec<u8> {
                         let id = tc.get("id").and_then(|i| i.as_str()).unwrap_or("");
                         let func = tc.get("function").unwrap_or(&Value::Null);
                         let name = func.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                        let arguments = func.get("arguments").and_then(|a| a.as_str()).unwrap_or("{}");
+                        let arguments = func
+                            .get("arguments")
+                            .and_then(|a| a.as_str())
+                            .unwrap_or("{}");
                         output.push(json!({
                             "type": "function_call",
                             "id": id,
@@ -404,13 +424,22 @@ pub fn translate_stream_chunk(chunk: &[u8], state: &mut StreamState, model: &str
                 for tc in tool_calls {
                     let index = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
                     let func = tc.get("function").unwrap_or(&Value::Null);
-                    let arguments_delta = func.get("arguments").and_then(|a| a.as_str()).unwrap_or("");
+                    let arguments_delta =
+                        func.get("arguments").and_then(|a| a.as_str()).unwrap_or("");
 
                     // Accumulate tool call
                     if index >= state.tool_calls.len() {
                         state.tool_calls.push(ToolCallAccum {
-                            id: tc.get("id").and_then(|i| i.as_str()).unwrap_or("").to_string(),
-                            name: func.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string(),
+                            id: tc
+                                .get("id")
+                                .and_then(|i| i.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            name: func
+                                .get("name")
+                                .and_then(|n| n.as_str())
+                                .unwrap_or("")
+                                .to_string(),
                             arguments: String::new(),
                         });
                     }
@@ -535,7 +564,6 @@ fn chrono_like_id() -> String {
     format!("{}", now)
 }
 
-
 #[cfg(test)]
 mod streaming_behavior_tests {
     // Streaming behavior tests: emits created/delta/completed on normal stream, no completed on abort.
@@ -554,9 +582,16 @@ mod streaming_behavior_tests {
                 buffer = buffer[pos + 2..].to_string();
                 if let Some(line) = block.lines().find(|l| l.starts_with("data: ")) {
                     let data = &line[6..];
-                    let payload: &[u8] = if data == "[DONE]" { b"null" } else { data.as_bytes() };
+                    let payload: &[u8] = if data == "[DONE]" {
+                        b"null"
+                    } else {
+                        data.as_bytes()
+                    };
                     for ev in translate_stream_chunk(payload, &mut state, model) {
-                        if let Some(json_part) = ev.strip_prefix("data: ").and_then(|s| s.strip_suffix("\n\n")) {
+                        if let Some(json_part) = ev
+                            .strip_prefix("data: ")
+                            .and_then(|s| s.strip_suffix("\n\n"))
+                        {
                             if let Ok(v) = serde_json::from_str::<Value>(json_part) {
                                 out.push(v);
                             }
@@ -567,7 +602,10 @@ mod streaming_behavior_tests {
         }
         if !upstream_aborted && !state.emitted_completed {
             for ev in translate_stream_chunk(b"null", &mut state, model) {
-                if let Some(json_part) = ev.strip_prefix("data: ").and_then(|s| s.strip_suffix("\n\n")) {
+                if let Some(json_part) = ev
+                    .strip_prefix("data: ")
+                    .and_then(|s| s.strip_suffix("\n\n"))
+                {
                     if let Ok(v) = serde_json::from_str::<Value>(json_part) {
                         out.push(v);
                     }
@@ -602,13 +640,25 @@ mod streaming_behavior_tests {
         let events = drive(&chunks, false, "");
         let types = types_of(&events);
 
-        assert!(types.iter().any(|t| *t == "response.created"), "{:?}", types);
         assert!(
-            types.iter().filter(|t| **t == *"response.output_text.delta").count() >= 3,
+            types.iter().any(|t| *t == "response.created"),
             "{:?}",
             types
         );
-        assert!(types.iter().any(|t| *t == "response.completed"), "{:?}", types);
+        assert!(
+            types
+                .iter()
+                .filter(|t| **t == *"response.output_text.delta")
+                .count()
+                >= 3,
+            "{:?}",
+            types
+        );
+        assert!(
+            types.iter().any(|t| *t == "response.completed"),
+            "{:?}",
+            types
+        );
     }
 
     #[test]
@@ -622,7 +672,11 @@ mod streaming_behavior_tests {
             "aborted stream must NOT emit response.completed; got {:?}",
             types
         );
-        assert!(types.iter().any(|t| *t == "response.created"), "{:?}", types);
+        assert!(
+            types.iter().any(|t| *t == "response.created"),
+            "{:?}",
+            types
+        );
         assert!(
             types.iter().any(|t| *t == "response.output_text.delta"),
             "{:?}",
@@ -641,8 +695,12 @@ mod streaming_behavior_tests {
         ];
         let events = drive(&chunks, false, "z-ai/glm-5.2");
 
-        let created = events.iter().find(|v| v.get("type").and_then(|t| t.as_str()) == Some("response.created"));
-        let completed = events.iter().find(|v| v.get("type").and_then(|t| t.as_str()) == Some("response.completed"));
+        let created = events
+            .iter()
+            .find(|v| v.get("type").and_then(|t| t.as_str()) == Some("response.created"));
+        let completed = events
+            .iter()
+            .find(|v| v.get("type").and_then(|t| t.as_str()) == Some("response.completed"));
 
         let created_model = created
             .and_then(|v| v.get("response"))
@@ -654,6 +712,10 @@ mod streaming_behavior_tests {
             .and_then(|m| m.as_str());
 
         assert_eq!(created_model, Some("z-ai/glm-5.2"), "created model missing");
-        assert_eq!(completed_model, Some("z-ai/glm-5.2"), "completed model missing");
+        assert_eq!(
+            completed_model,
+            Some("z-ai/glm-5.2"),
+            "completed model missing"
+        );
     }
 }

@@ -1,9 +1,9 @@
+use reqwest::StatusCode;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, info, warn};
-use reqwest::StatusCode;
 
-use crate::key_pool::{KeyPool, mask_key};
+use crate::key_pool::{mask_key, KeyPool};
 
 #[allow(dead_code)]
 pub struct HealthChecker {
@@ -13,7 +13,6 @@ pub struct HealthChecker {
     timeout: Duration,
     max_failures: usize,
     client: reqwest::Client,
-    stop_flag: Arc<tokio::sync::Notify>,
 }
 
 impl HealthChecker {
@@ -35,7 +34,6 @@ impl HealthChecker {
             timeout: Duration::from_secs(timeout_seconds),
             max_failures: max_consecutive_failures,
             client,
-            stop_flag: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -65,11 +63,6 @@ impl HealthChecker {
                 }
             }
         }
-    }
-
-    #[allow(dead_code)]
-    pub fn stop(&self) {
-        self.stop_flag.notify_one();
     }
 
     async fn check_all_keys(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -149,9 +142,13 @@ impl HealthChecker {
         Ok(())
     }
 
-    async fn probe_key(&self, key: &str) -> Result<StatusCode, Box<dyn std::error::Error + Send + Sync>> {
+    async fn probe_key(
+        &self,
+        key: &str,
+    ) -> Result<StatusCode, Box<dyn std::error::Error + Send + Sync>> {
         let url = format!("{}/v1/models", self.base_url);
-        let resp = self.client
+        let resp = self
+            .client
             .get(&url)
             .header(reqwest::header::AUTHORIZATION, format!("Bearer {}", key))
             .send()

@@ -22,7 +22,11 @@ const DEFAULT_CODEX_MODELS: &[(&str, &str, u64)] = &[
     ("z-ai/glm-5.2", "GLM 5.2", 1_000_000),
     ("moonshotai/kimi-k2.6", "Kimi K2.6", 256_000),
     ("deepseek-ai/deepseek-v4-pro", "DeepSeek V4 Pro", 1_000_000),
-    ("deepseek-ai/deepseek-v4-flash", "DeepSeek V4 Flash", 1_000_000),
+    (
+        "deepseek-ai/deepseek-v4-flash",
+        "DeepSeek V4 Flash",
+        1_000_000,
+    ),
     ("qwen/qwen3.5-397b-a17b", "Qwen 3.5 397B", 256_000),
     ("meta/llama-3.3-70b-instruct", "Llama 3.3 70B", 128_000),
 ];
@@ -178,7 +182,13 @@ fn load_template_from_cache() -> Option<Value> {
 
 /// Generate a model catalog entry from the gpt-5.5 template, customizing
 /// slug/display_name/context_window.
-fn make_catalog_entry(template: &Value, model_id: &str, display_name: &str, context_window: u64, priority: usize) -> Value {
+fn make_catalog_entry(
+    template: &Value,
+    model_id: &str,
+    display_name: &str,
+    context_window: u64,
+    priority: usize,
+) -> Value {
     let mut entry = template.clone();
     let obj = entry.as_object_mut().expect("template must be object");
 
@@ -269,13 +279,6 @@ experimental_bearer_token = "{token}"
         token = config.bearer_token,
     );
 
-    // Check if existing config has our provider section
-    let _has_provider = existing.contains(&format!("[model_providers.{PROVIDER_ID}]"));
-
-    // Check if existing config has a [model_providers] section at all
-    let _has_model_providers_header = existing.contains("[model_providers]")
-        || existing.contains("[model_providers.");
-
     // Build the managed fields map
     let managed_fields = vec![
         ("model_provider", format!("\"{}\"", PROVIDER_ID)),
@@ -292,10 +295,7 @@ experimental_bearer_token = "{token}"
                 "false".to_string()
             },
         ),
-        (
-            "model_catalog_json",
-            format!("\"{}\"", catalog_str),
-        ),
+        ("model_catalog_json", format!("\"{}\"", catalog_str)),
     ];
 
     let mut result = existing;
@@ -495,9 +495,7 @@ mod tests {
     fn remove_custom_provider_section(mut result: String) -> String {
         if let Some(start) = result.find("[model_providers.custom]") {
             let after = &result[start..];
-            let next_section = after[1..]
-                .find("\n[")
-                .map(|pos| start + 1 + pos + 1);
+            let next_section = after[1..].find("\n[").map(|pos| start + 1 + pos + 1);
             let end = next_section.unwrap_or(result.len());
             result = format!("{}{}", &result[..start], &result[end..]);
         }
@@ -519,12 +517,28 @@ wire_api = "responses"
 [mcp_servers.node_repl]
 "#;
         let result = remove_custom_provider_section(text.to_string());
-        assert!(!result.contains("model_providers.custom"), "custom should be removed, got: {}", result);
+        assert!(
+            !result.contains("model_providers.custom"),
+            "custom should be removed, got: {}",
+            result
+        );
         // Following sections must survive
-        assert!(result.contains("[mcp_servers]"), "[mcp_servers] should survive, got: {}", result);
-        assert!(result.contains("[mcp_servers.node_repl]"), "[mcp_servers.node_repl] should survive, got: {}", result);
+        assert!(
+            result.contains("[mcp_servers]"),
+            "[mcp_servers] should survive, got: {}",
+            result
+        );
+        assert!(
+            result.contains("[mcp_servers.node_repl]"),
+            "[mcp_servers.node_repl] should survive, got: {}",
+            result
+        );
         // Our provider section must survive
-        assert!(result.contains("[model_providers.nvidia-proxy]"), "nvidia-proxy should survive, got: {}", result);
+        assert!(
+            result.contains("[model_providers.nvidia-proxy]"),
+            "nvidia-proxy should survive, got: {}",
+            result
+        );
     }
 
     #[test]
@@ -535,8 +549,16 @@ base_url = "http://localhost:8888/v1"
 wire_api = "responses"
 "#;
         let result = remove_custom_provider_section(text.to_string());
-        assert!(!result.contains("model_providers.custom"), "custom should be removed, got: {}", result);
-        assert!(result.trim().is_empty(), "result should be empty, got: {:?}", result);
+        assert!(
+            !result.contains("model_providers.custom"),
+            "custom should be removed, got: {}",
+            result
+        );
+        assert!(
+            result.trim().is_empty(),
+            "result should be empty, got: {:?}",
+            result
+        );
     }
 
     #[test]
@@ -578,8 +600,20 @@ experimental_bearer_token = "proxy-managed"
             .unwrap_or(result.len());
         result = format!("{}{}{}", &result[..start], provider_section, &result[end..]);
 
-        assert!(result.contains("localhost:8888"), "new base_url should be present, got: {}", result);
-        assert!(!result.contains("old:9999"), "old base_url should be gone, got: {}", result);
-        assert!(result.contains("[mcp_servers]"), "[mcp_servers] should survive, got: {}", result);
+        assert!(
+            result.contains("localhost:8888"),
+            "new base_url should be present, got: {}",
+            result
+        );
+        assert!(
+            !result.contains("old:9999"),
+            "old base_url should be gone, got: {}",
+            result
+        );
+        assert!(
+            result.contains("[mcp_servers]"),
+            "[mcp_servers] should survive, got: {}",
+            result
+        );
     }
 }

@@ -9,7 +9,7 @@ A lightweight, high‑performance proxy written in Rust that fronts multiple NVI
 - **Health checking** – startup probe + periodic bad-key recovery keep the pool aware of dead keys.
 - **Responses API ↔ Chat Completions translation** – Codex CLI (`wire_api = "responses"`) can use NVIDIA's `/v1/chat/completions` backend transparently.
 - **Codex CLI auto‑configuration** – on startup, generates `~/.codex/config.toml` and model catalog, replacing cc-switch for the Codex use case.
-- **Observability** – Prometheus metrics at root path and structured tracing.
+- **Observability** – Prometheus metrics at `metrics_path` (default `/metrics`) and structured tracing.
 - **Secure** – real keys never leave the process; logs use `XXXX***XXXX` masking.
 
 ## Quick Start
@@ -154,9 +154,9 @@ Codex CLI                    Proxy                      NVIDIA API
 
 | Field | Description |
 |---|---|
-| `enable_metrics` | Enable Prometheus metrics |
-| `metrics_path` | Reserved for future use |
-| `log_level` | Tracing log level |
+| `enable_metrics` | Enable Prometheus metrics endpoint |
+| `metrics_path` | Path where metrics are exposed (default `/metrics`) |
+| `log_level` | Tracing log level (also overridable via `RUST_LOG`) |
 
 ### `[codex]`
 
@@ -171,7 +171,7 @@ Codex CLI                    Proxy                      NVIDIA API
 
 ## Metrics
 
-Prometheus metrics are exposed at the root path (`/`) when `observability.enable_metrics` is `true`.
+Prometheus metrics are exposed at `observability.metrics_path` (default `/metrics`) when `observability.enable_metrics` is `true`.
 
 - `proxy_requests_total` – total HTTP requests processed
 - `proxy_requests_success_total` – 2xx requests
@@ -185,7 +185,7 @@ Prometheus metrics are exposed at the root path (`/`) when `observability.enable
 
 | Method | Path | Description |
 |---|---|---|
-| GET | `/` | Prometheus metrics |
+| GET | `{metrics_path}` | Prometheus metrics |
 | GET | `/v1/models` | Model catalog (from generated catalog JSON) |
 | GET | `/models` | Same as above (no `/v1` prefix) |
 | GET | `/health` | Health check (returns 204) |

@@ -153,9 +153,9 @@ Codex CLI                    代理                       NVIDIA API
 
 | 字段 | 说明 |
 |---|---|
-| `enable_metrics` | 是否开启 Prometheus 指标 |
-| `metrics_path` | 预留字段（当前指标暴露在根路径） |
-| `log_level` | tracing 日志级别 |
+| `enable_metrics` | 是否暴露 Prometheus 指标端点 |
+| `metrics_path` | 指标端点路径（默认 `/metrics`） |
+| `log_level` | tracing 日志级别（也可通过 `RUST_LOG` 覆盖） |
 
 ### `[codex]` Codex 集成
 

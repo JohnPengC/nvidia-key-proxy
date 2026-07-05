@@ -26,13 +26,17 @@ pub struct KeyId(pub Arc<String>);
 #[allow(dead_code)]
 pub enum KeyState {
     Active,
-    Cooling { ready_at: Instant },
+    Cooling {
+        ready_at: Instant,
+    },
     /// Disabled after repeated auth failures. `ready_at` is a fallback expiry:
     /// if a health probe never recovers the key (probe endpoint itself is
     /// unavailable, or probes keep failing), `cool_down_task` will reactivate
     /// the key once `ready_at` passes — so the pool can't permanently shrink
     /// to zero when probes fail.
-    Disabled { ready_at: Instant },
+    Disabled {
+        ready_at: Instant,
+    },
 }
 
 /// Internal state stored per key.
@@ -185,7 +189,11 @@ impl TokenBucket {
 
 impl std::fmt::Debug for TokenBucket {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "TokenBucket {{ capacity: {}, refill_per_sec: {} }}", self.capacity, self.refill_per_sec)
+        write!(
+            f,
+            "TokenBucket {{ capacity: {}, refill_per_sec: {} }}",
+            self.capacity, self.refill_per_sec
+        )
     }
 }
 
@@ -198,7 +206,6 @@ pub struct KeyPool {
     pub_notifier: tokio::sync::broadcast::Sender<KeyStateHandle>,
 }
 
-
 impl KeyPool {
     pub fn new(config: &Config, metrics: Arc<Metrics>) -> Self {
         let (tx, _) = tokio::sync::broadcast::channel(16);
@@ -206,7 +213,14 @@ impl KeyPool {
         // Initialize keys
         for key_str in &config.keys {
             let key_id = KeyId(Arc::new(key_str.clone()));
-            let bucket = TokenBucket::new(config.rate_limiter.burst as u32, if config.rate_limiter.qps_per_key > 0.0 { config.rate_limiter.qps_per_key } else { 1.0 });
+            let bucket = TokenBucket::new(
+                config.rate_limiter.burst as u32,
+                if config.rate_limiter.qps_per_key > 0.0 {
+                    config.rate_limiter.qps_per_key
+                } else {
+                    1.0
+                },
+            );
             let handle = KeyStateHandle {
                 inner: Arc::new(RwLock::new(InnerKeyState {
                     key: key_id.0.clone(),
@@ -267,26 +281,40 @@ impl KeyPool {
 
     /// Get all keys currently in Cooling state (for bad key recovery).
     pub async fn get_bad_keys(&self) -> Vec<String> {
-        let read_guard = self.inner.read().await;
+        // Snapshot the handles first so we don't hold the outer lock while
+        // awaiting each inner lock.
+        let handles: Vec<(String, KeyStateHandle)> = {
+            let read_guard = self.inner.read().await;
+            read_guard
+                .iter()
+                .map(|(k, h)| (k.clone(), h.clone()))
+                .collect()
+        };
         let mut bad = Vec::new();
-        for (key_str, handle) in read_guard.iter() {
+        for (key_str, handle) in handles {
             let guard = handle.inner.read().await;
-            let is_cooling = matches!(guard.state, KeyState::Cooling { .. });
-            drop(guard);
-            if is_cooling { bad.push(key_str.clone()); }
+            if matches!(guard.state, KeyState::Cooling { .. }) {
+                bad.push(key_str);
+            }
         }
         bad
     }
 
     /// Get all keys currently in Disabled state (for health-probe recovery).
     pub async fn get_disabled_keys(&self) -> Vec<String> {
-        let read_guard = self.inner.read().await;
+        let handles: Vec<(String, KeyStateHandle)> = {
+            let read_guard = self.inner.read().await;
+            read_guard
+                .iter()
+                .map(|(k, h)| (k.clone(), h.clone()))
+                .collect()
+        };
         let mut disabled = Vec::new();
-        for (key_str, handle) in read_guard.iter() {
+        for (key_str, handle) in handles {
             let guard = handle.inner.read().await;
-            let is_disabled = matches!(guard.state, KeyState::Disabled { .. });
-            drop(guard);
-            if is_disabled { disabled.push(key_str.clone()); }
+            if matches!(guard.state, KeyState::Disabled { .. }) {
+                disabled.push(key_str);
+            }
         }
         disabled
     }
@@ -317,8 +345,8 @@ impl KeyPool {
                 handle.add_weight(delta).await;
             }
             if fail_count >= threshold {
-                let ready_at = Instant::now()
-                    + Duration::from_secs(self.config.cooldown.max_seconds);
+                let ready_at =
+                    Instant::now() + Duration::from_secs(self.config.cooldown.max_seconds);
                 handle.set_state(KeyState::Disabled { ready_at }).await;
                 warn!(
                     key = %mask_key(key_str),
@@ -349,12 +377,16 @@ impl KeyPool {
 
     /// Count keys by state — for Prometheus gauges.
     pub async fn count_states(&self) -> (i64, i64, i64) {
-        let read_guard = self.inner.read().await;
+        let handles: Vec<KeyStateHandle> = {
+            let read_guard = self.inner.read().await;
+            read_guard.values().cloned().collect()
+        };
         let mut active = 0i64;
         let mut cooling = 0i64;
         let mut disabled = 0i64;
-        for (_, handle) in read_guard.iter() {
-            match handle.state().await {
+        for handle in handles {
+            let guard = handle.inner.read().await;
+            match guard.state {
                 KeyState::Active => active += 1,
                 KeyState::Cooling { .. } => cooling += 1,
                 KeyState::Disabled { .. } => disabled += 1,
@@ -414,9 +446,9 @@ impl KeyPool {
     /// Background task to move cooling keys back to active when ready.
     /// `stop` is a Notify that signals graceful shutdown.
     pub async fn cool_down_task(self: Arc<Self>, stop: Arc<tokio::sync::Notify>) {
-        let mut interval = tokio::time::interval(
-            Duration::from_secs(self.config.health_check.interval_seconds),
-        );
+        let mut interval = tokio::time::interval(Duration::from_secs(
+            self.config.health_check.interval_seconds,
+        ));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
@@ -448,44 +480,52 @@ impl KeyPool {
             }
             drop(read_guard);
             for (key_str, handle) in to_update {
-                match handle.inner.try_write() {
-                    Ok(mut guard) => {
-                        let was_disabled = matches!(guard.state, KeyState::Disabled { .. });
-                        guard.state = KeyState::Active;
-                        guard.weight = 1;
-                        guard.fail_count = 0;
-                        if was_disabled {
-                            info!(key = %mask_key(&key_str), "Disabled key reactivated by cooldown expiry (probes likely failing)");
-                        } else {
-                            info!(key = %mask_key(&key_str), "Cooldown finished, reactivating key (no probe)");
-                        }
-                    }
-                    Err(_) => {
-                        warn!(key = %mask_key(&key_str), "Failed to acquire write lock for cooldown reactivation");
-                    }
+                let mut guard = handle.inner.write().await;
+                let was_disabled = matches!(guard.state, KeyState::Disabled { .. });
+                guard.state = KeyState::Active;
+                guard.weight = 1;
+                guard.fail_count = 0;
+                if was_disabled {
+                    info!(key = %mask_key(&key_str), "Disabled key reactivated by cooldown expiry (probes likely failing)");
+                } else {
+                    info!(key = %mask_key(&key_str), "Cooldown finished, reactivating key (no probe)");
                 }
             }
             self.refresh_metrics().await;
         }
     }
-
 }
-
 
 #[cfg(test)]
 mod retry_state_machine_tests {
     use super::*;
-    use crate::config::{CooldownConfig, HealthCheckConfig, ObservabilityConfig, RateLimiterConfig};
+    use crate::config::{
+        CooldownConfig, HealthCheckConfig, ObservabilityConfig, RateLimiterConfig,
+    };
 
     fn build_pool(keys: &[&str]) -> KeyPool {
         let cfg = Config {
             listen_addr: "0.0.0.0:8888".to_string(),
             base_url: "https://example.test".to_string(),
             keys: keys.iter().map(|s| s.to_string()).collect(),
-            rate_limiter: RateLimiterConfig { qps_per_key: 100.0, burst: 100 },
-            cooldown: CooldownConfig { base_seconds: 1, max_seconds: 2 },
-            health_check: HealthCheckConfig { interval_seconds: 1, timeout_seconds: 1, max_consecutive_failures: 3 },
-            observability: ObservabilityConfig { enable_metrics: false, metrics_path: "/metrics".to_string(), log_level: "info".to_string() },
+            rate_limiter: RateLimiterConfig {
+                qps_per_key: 100.0,
+                burst: 100,
+            },
+            cooldown: CooldownConfig {
+                base_seconds: 1,
+                max_seconds: 2,
+            },
+            health_check: HealthCheckConfig {
+                interval_seconds: 1,
+                timeout_seconds: 1,
+                max_consecutive_failures: 3,
+            },
+            observability: ObservabilityConfig {
+                enable_metrics: false,
+                metrics_path: "/metrics".to_string(),
+                log_level: "info".to_string(),
+            },
             codex: crate::codex_config::CodexConfig::default(),
             request_timeout_seconds: 0,
             retry: crate::config::RetryConfig::default(),
@@ -510,7 +550,10 @@ mod retry_state_machine_tests {
         let pool = build_pool(&["k1", "k2"]);
         pool.mark_failure("k1", 3).await;
         pool.mark_failure("k1", 3).await;
-        assert!(pool.mark_failure("k1", 3).await, "third failure should disable the key");
+        assert!(
+            pool.mark_failure("k1", 3).await,
+            "third failure should disable the key"
+        );
         let handle = pool.inner.read().await.get("k1").cloned().unwrap();
         assert!(matches!(handle.state().await, KeyState::Disabled { .. }));
         // A Disabled key is no longer acquired.
@@ -521,7 +564,9 @@ mod retry_state_machine_tests {
     #[tokio::test]
     async fn recover_disabled_reactivates_key() {
         let pool = build_pool(&["k1", "k2"]);
-        for _ in 0..3 { pool.mark_failure("k1", 3).await; }
+        for _ in 0..3 {
+            pool.mark_failure("k1", 3).await;
+        }
         let handle = pool.inner.read().await.get("k1").cloned().unwrap();
         assert!(matches!(handle.state().await, KeyState::Disabled { .. }));
         pool.recover_disabled("k1").await;
@@ -532,8 +577,12 @@ mod retry_state_machine_tests {
     #[tokio::test]
     async fn get_disabled_keys_lists_only_disabled() {
         let pool = build_pool(&["k1", "k2", "k3"]);
-        for _ in 0..3 { pool.mark_failure("k1", 3).await; }
-        for _ in 0..3 { pool.mark_failure("k2", 3).await; }
+        for _ in 0..3 {
+            pool.mark_failure("k1", 3).await;
+        }
+        for _ in 0..3 {
+            pool.mark_failure("k2", 3).await;
+        }
         let disabled = pool.get_disabled_keys().await;
         assert_eq!(disabled.len(), 2);
         assert!(disabled.contains(&"k1".to_string()));
@@ -555,7 +604,10 @@ mod retry_state_machine_tests {
         let disabled = pool.mark_failure("k1", 100).await; // threshold high → no disable
         assert!(!disabled);
         let w = handle.weight().await;
-        assert_eq!(w, 4, "weight should be halved (8 → 4) after one mark_failure");
+        assert_eq!(
+            w, 4,
+            "weight should be halved (8 → 4) after one mark_failure"
+        );
         let disabled2 = pool.mark_failure("k1", 100).await;
         assert!(!disabled2);
         let w2 = handle.weight().await;

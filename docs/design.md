@@ -52,7 +52,7 @@ Key goals
 | **ResponsesCompat** | Translate Responses API ↔ Chat Completions API (request body, non-streaming response, streaming SSE). | `serde_json` |
 | **CodexConfig** | Auto-manage `~/.codex/config.toml` + model catalog on startup. Removes conflicting cc-switch providers. | `serde_json` + manual TOML editing (Rust regex crate lacks lookahead) |
 | **HealthChecker** | Startup probe + periodic bad-key recovery. Update state. | `tokio::task::spawn` loop |
-| **Observability** | Prometheus endpoint at root path; tracing with `tracing`+`tracing-subscriber`. | `prometheus`, `tracing` |
+| **Observability** | Prometheus endpoint at `metrics_path` (default `/metrics`); tracing with `tracing`+`tracing-subscriber`. | `prometheus`, `tracing` |
 | **Graceful Shutdown** | Listen for SIGINT/SIGTERM, stop accepting new connections, drain ongoing requests. | `tokio::signal`, warp’s graceful shutdown |
 
 ### Key Acquisition Algorithm

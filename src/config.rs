@@ -1,5 +1,5 @@
-use serde::Deserialize;
 use dotenvy::dotenv;
+use serde::Deserialize;
 use std::fmt;
 use std::fs;
 use std::net::SocketAddr;
@@ -32,19 +32,24 @@ fn default_request_timeout_seconds() -> u64 {
 
 impl fmt::Debug for Config {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let masked_keys: Vec<String> = self.keys.iter()
+        let masked_keys: Vec<String> = self
+            .keys
+            .iter()
             .map(|k| {
                 if k.len() <= 8 {
                     "***".to_string()
                 } else {
-                    format!("{}***{}", &k[..4], &k[k.len()-4..])
+                    format!("{}***{}", &k[..4], &k[k.len() - 4..])
                 }
             })
             .collect();
         f.debug_struct("Config")
             .field("listen_addr", &self.listen_addr)
             .field("base_url", &self.base_url)
-            .field("keys", &format!("<{} keys: {:?}>", self.keys.len(), masked_keys))
+            .field(
+                "keys",
+                &format!("<{} keys: {:?}>", self.keys.len(), masked_keys),
+            )
             .field("rate_limiter", &self.rate_limiter)
             .field("cooldown", &self.cooldown)
             .field("health_check", &self.health_check)
@@ -99,10 +104,18 @@ pub struct RetryConfig {
     pub auth_fail_threshold: u32,
 }
 
-fn default_max_retries() -> u32 { 3 }
-fn default_backoff_base_ms() -> u64 { 200 }
-fn default_backoff_max_ms() -> u64 { 2000 }
-fn default_auth_fail_threshold() -> u32 { 3 }
+fn default_max_retries() -> u32 {
+    3
+}
+fn default_backoff_base_ms() -> u64 {
+    200
+}
+fn default_backoff_max_ms() -> u64 {
+    2000
+}
+fn default_auth_fail_threshold() -> u32 {
+    3
+}
 
 impl Default for RetryConfig {
     fn default() -> Self {
@@ -145,7 +158,7 @@ impl Config {
             },
             cooldown: CooldownConfig {
                 base_seconds: 60,
-                max_seconds: 300,
+                max_seconds: 600,
             },
             health_check: HealthCheckConfig {
                 interval_seconds: 30,
@@ -163,8 +176,8 @@ impl Config {
         };
 
         // Prefer NVIDIA_CONFIG_PATH, fall back to ./config.toml
-        let config_path = std::env::var("NVIDIA_CONFIG_PATH")
-            .unwrap_or_else(|_| "config.toml".to_string());
+        let config_path =
+            std::env::var("NVIDIA_CONFIG_PATH").unwrap_or_else(|_| "config.toml".to_string());
 
         if let Ok(content) = fs::read_to_string(&config_path) {
             let toml_config: Config = toml::from_str(&content)?;
@@ -186,7 +199,9 @@ impl Config {
         Self::apply_env_overrides(&mut config);
 
         if config.keys.is_empty() {
-            return Err("No API keys configured. Set `keys` in config.toml or NVIDIA_KEYS env var.".into());
+            return Err(
+                "No API keys configured. Set `keys` in config.toml or NVIDIA_KEYS env var.".into(),
+            );
         }
 
         Ok(config)

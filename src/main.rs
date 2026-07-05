@@ -1,40 +1,39 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use tracing::{info, error};
+use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 use warp::http::StatusCode;
 use warp::{Filter, Rejection, Reply};
 
 use crate::config::Config;
-use crate::key_pool::KeyPool;
-use crate::proxy::Proxy;
 use crate::health::HealthChecker;
+use crate::key_pool::KeyPool;
 use crate::metrics::Metrics;
+use crate::proxy::Proxy;
 
-mod config;
-mod key_pool;
-mod proxy;
-mod health;
-mod metrics;
-mod responses_compat;
 mod codex_config;
+mod config;
+mod health;
+mod key_pool;
+mod metrics;
+mod proxy;
+mod responses_compat;
 
 #[tokio::main]
 async fn main() {
-    // Initialize tracing. Honor NVIDIA_LOG_LEVEL before falling back to "info".
-    let filter = EnvFilter::try_from_default_env()
-        .or_else(|_| EnvFilter::try_new("info"))
-        .unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .init();
-
-    // Load configuration
+    // Load configuration first so tracing can honor the configured log level.
     let config = Config::load().unwrap_or_else(|e| {
         eprintln!("Failed to load configuration: {}", e);
         std::process::exit(1);
     });
+
+    // Initialize tracing. Honor RUST_LOG first, then the config file / env override.
+    let filter = EnvFilter::try_from_default_env()
+        .or_else(|_| EnvFilter::try_new(&config.observability.log_level))
+        .unwrap_or_else(|_| EnvFilter::new("info"));
+    tracing_subscriber::fmt().with_env_filter(filter).init();
+
     info!("Loaded configuration: {:?}", config);
 
     // Auto-configure Codex CLI (~/.codex/config.toml + model catalog)
@@ -86,8 +85,55 @@ async fn main() {
         health_checker_bad.run_bad_key_checker(bad_key_stop).await;
     });
 
+    // Health endpoint
+    let health_route = warp::path!("health")
+        .and(warp::get())
+        .map(|| warp::http::Response::builder().status(204).body(""));
+
+    // Codex reachability check: GET /v1/models → return our catalog
+    let models_route = warp::path!("v1" / "models").and(warp::get()).map(|| {
+        let catalog = crate::codex_config::get_catalog();
+        warp::reply::with_header(
+            warp::reply::json(&catalog),
+            "Content-Type",
+            "application/json",
+        )
+    });
+
+    // Also handle GET /models (no v1 prefix)
+    let models_route_alt = warp::path!("models").and(warp::get()).map(|| {
+        let catalog = crate::codex_config::get_catalog();
+        warp::reply::with_header(
+            warp::reply::json(&catalog),
+            "Content-Type",
+            "application/json",
+        )
+    });
+
+    // Proxy all paths: need to capture headers
+    let proxy_route = warp::path::full()
+        .map(|p: warp::path::FullPath| p.as_str().to_string())
+        .and(warp::method())
+        .and(warp::header::headers_cloned())
+        .and(warp::body::bytes())
+        .and(warp::addr::remote())
+        .and_then({
+            let proxy = proxy.clone();
+            move |path: String, method, headers, body, remote| {
+                let proxy = proxy.clone();
+                async move {
+                    proxy
+                        .handle_request(path, method, headers, body, remote)
+                        .await
+                }
+            }
+        });
+
     // Metrics endpoint exposed at the configured `metrics_path` (default /metrics).
+    // When `enable_metrics` is false the route returns 404 so it can be hidden
+    // without changing the filter chain type.
     let metrics_path = config.observability.metrics_path.clone();
+    let enable_metrics = config.observability.enable_metrics;
     let metrics_route = warp::path::full()
         .and_then(move |p: warp::path::FullPath| {
             let metrics_path = metrics_path.clone();
@@ -106,57 +152,14 @@ async fn main() {
             move || {
                 let metrics = metrics.clone();
                 async move {
+                    if !enable_metrics {
+                        return Err::<_, Rejection>(warp::reject::not_found());
+                    }
                     Ok::<_, Rejection>(warp::reply::with_header(
                         metrics.render(),
                         "Content-Type",
                         "text/plain; version=0.0.4",
                     ))
-                }
-            }
-        });
-
-    // Health endpoint
-    let health_route = warp::path!("health")
-        .and(warp::get())
-        .map(|| warp::http::Response::builder().status(204).body(""));
-
-    // Codex reachability check: GET /v1/models → return our catalog
-    let models_route = warp::path!("v1" / "models")
-        .and(warp::get())
-        .map(|| {
-            let catalog = crate::codex_config::get_catalog();
-            warp::reply::with_header(
-                warp::reply::json(&catalog),
-                "Content-Type",
-                "application/json",
-            )
-        });
-
-    // Also handle GET /models (no v1 prefix)
-    let models_route_alt = warp::path!("models")
-        .and(warp::get())
-        .map(|| {
-            let catalog = crate::codex_config::get_catalog();
-            warp::reply::with_header(
-                warp::reply::json(&catalog),
-                "Content-Type",
-                "application/json",
-            )
-        });
-
-    // Proxy all paths: need to capture headers
-    let proxy_route = warp::path::full()
-        .map(|p: warp::path::FullPath| p.as_str().to_string())
-        .and(warp::method())
-        .and(warp::header::headers_cloned())
-        .and(warp::body::bytes())
-        .and(warp::addr::remote())
-        .and_then({
-            let proxy = proxy.clone();
-            move |path: String, method, headers, body, remote| {
-                let proxy = proxy.clone();
-                async move {
-                    proxy.handle_request(path, method, headers, body, remote).await
                 }
             }
         });
@@ -169,7 +172,10 @@ async fn main() {
         .recover(handle_rejection);
 
     let addr: SocketAddr = config.listen_addr.parse().expect("Invalid listen address");
-    info!("Listening on {}, metrics at {}", addr, config.observability.metrics_path);
+    info!(
+        "Listening on {}, metrics at {}",
+        addr, config.observability.metrics_path
+    );
 
     let (_, server_future) = warp::serve(routes).bind_with_graceful_shutdown(addr, async move {
         // Wait for Ctrl+C, then signal warp to stop accepting new connections.
@@ -209,6 +215,11 @@ async fn handle_rejection(err: Rejection) -> Result<impl Reply, Rejection> {
         Ok(warp::reply::with_status(
             "Method not allowed".to_string(),
             StatusCode::METHOD_NOT_ALLOWED,
+        ))
+    } else if err.is_not_found() {
+        Ok(warp::reply::with_status(
+            "Not found".to_string(),
+            StatusCode::NOT_FOUND,
         ))
     } else {
         error!("Unhandled rejection: {:?}", err);
