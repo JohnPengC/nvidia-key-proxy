@@ -70,12 +70,17 @@ pub struct CooldownConfig {
 
 /// Retry/upstream-error policy for proxy → NVIDIA.
 ///
-/// When NVIDIA returns 401/403/429 *without* `Retry-After`, the proxy will
-/// retry the same request against another healthy key with exponential
-/// backoff. Each attempt that fails increments the offending key's
-/// `fail_count`; once `auth_fail_threshold` is reached, the key is moved to
-/// `KeyState::Disabled` and is no longer acquired. A background health probe
-/// must see a success before the key is reactivated.
+/// Only a 401 *without* `Retry-After` triggers a retry against another healthy
+/// key with exponential backoff. Each such attempt that fails increments the
+/// offending key's `fail_count`; once `auth_fail_threshold` is reached, the key
+/// is moved to `KeyState::Disabled` and is no longer acquired. A background
+/// health probe must see a success before the key is reactivated.
+///
+/// 401 with `Retry-After`, and 429/403 regardless of `Retry-After`, are NOT
+/// retried: they are deterministic upstream decisions (per-key throttle /
+/// region / account gating) and retrying on another key would only burn the
+/// whole pool. A `Retry-After` value cools the offending key; otherwise the
+/// response is surfaced to the client unchanged.
 #[derive(Debug, Deserialize, Clone)]
 pub struct RetryConfig {
     /// Maximum retry attempts per client request (excluding the initial

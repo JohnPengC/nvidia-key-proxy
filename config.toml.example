@@ -32,9 +32,12 @@ request_timeout_seconds = 60
 
 
 [retry]
-# Upstream (NVIDIA) auth/forbidden retry policy.
-# On 401/403/429 *without* `Retry-After`, the proxy retries the same request
-# against another healthy key with exponential backoff.
+# Upstream (NVIDIA) auth retry policy.
+# Only a 401 *without* `Retry-After` triggers a retry against another healthy
+# key with exponential backoff. 429/403 (and 401 with `Retry-After`) are NOT
+# retried: they are deterministic upstream decisions and retrying on another
+# key would only burn the whole pool. A `Retry-After` value cools the
+# offending key; otherwise the response is surfaced to the client unchanged.
 max_retries           = 3      # retry attempts per client request (excluding initial)
 backoff_base_ms       = 200    # first retry sleeps ~backoff_base_ms
 backoff_max_ms        = 2000   # single backoff cap

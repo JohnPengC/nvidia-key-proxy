@@ -290,26 +290,28 @@ passthrough 流式分支头已发，中途上游 5xx 已无修正窗口，但上
 - `docs/streaming-refactor.md`：本规划。
 
 
-## 9. 401/403/429 重试与失效 key 处理
+## 9. 401 重试与失效 key 处理
 
 ### 背景
 
 用户反馈偶发 `unexpected status 403 Forbidden: Authorization failed`。诊断：
-403 是 NVIDIA 上游对某把 key 偶发拒绝（账号级限制 / 区域 / key 失效），
-代理原本策略是「不带 Retry-After 不惩罚 key、直接透传」，导致偶发失效
-key 直接让客户端看到 403。
+403 是 NVIDIA 上游对某把 key 偶发拒绝（账号级限制 / 区域 / key 失效）。
+最终的实现里，重试只覆盖 401（最清晰的"这把 key 本身被拒"信号）；
+429/403 属于确定性上游决策（限流 / 禁止），重试只会把整个池子都烧光，
+因此透传给客户端、不重试。
 
-### 新策略
+### 实际策略
 
 `handle_request` 的上游请求段包进 `attempt loop`：
 
-- 上游 401/403/429 且**无** `Retry-After` → `mark_failure(key)` 记一次失败，
+- 上游 **401 且无 `Retry-After`** → `mark_failure(key)` 记一次失败，
   换一把健康 key 重发同一请求，sleep 指数退避
   (`backoff_base_ms * 2^(attempt-1)`，cap `backoff_max_ms`)；
 - 每把 key 维护 `fail_count`，连续达 `auth_fail_threshold` →
   `KeyState::Disabled`，acquire 时跳过；
-- `Retry-After` 形式的 4xx（显式 throttle）照旧 `mark_bad` + 透传，不重试
-  （这是确定性信号，不该重试）；
+- **401 带 `Retry-After`**：显式冷却信号，`mark_bad` + 透传，不重试；
+- **429 / 403**（带不带 `Retry-After`）：不重试。带 `Retry-After` 时 `mark_bad`
+  冷却该 key；不带则不冷却，直接透传（确定性上游决策，不该烧整个池子）；
 - 网络层错误 / timeout 也走另一把 key（不算 auth 失败计数，但 `mark_bad`
   短冷却）；
 - 达 `max_retries` 仍失败，把最后一次上游响应透传给客户端。

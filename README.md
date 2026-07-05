@@ -5,7 +5,7 @@ A lightweight, high‑performance proxy written in Rust that fronts multiple NVI
 ## Features
 
 - **Load‑balancing** across many keys to avoid per‑key rate limits.
-- **Automatic throttling detection** – 429/403/401 triggers a cool‑down for the offending key.
+- **Automatic throttling detection** – 429/403 (with `Retry-After`) cools the offending key; 401 without `Retry-After` triggers a retry on another healthy key, and repeated auth failures disable the key.
 - **Health checking** – startup probe + periodic bad-key recovery keep the pool aware of dead keys.
 - **Responses API ↔ Chat Completions translation** – Codex CLI (`wire_api = "responses"`) can use NVIDIA's `/v1/chat/completions` backend transparently.
 - **Codex CLI auto‑configuration** – on startup, generates `~/.codex/config.toml` and model catalog, replacing cc-switch for the Codex use case.

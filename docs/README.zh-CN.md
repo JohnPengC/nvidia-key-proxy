@@ -5,7 +5,7 @@
 ## 功能特性
 
 - **多 Key 负载均衡** — 轮换使用多个 Key，规避单 Key 速率限制。
-- **自动限流检测** — 收到 429/403/401 时自动对问题 Key 冷却降权。
+- **自动限流检测** — 401（无 `Retry-After`）触发换 Key 重试，连续失败则禁用该 Key；429/403 属于确定性上游决策，带 `Retry-After` 才冷却该 Key，否则透传不重试。
 - **健康检查** — 启动时探测 + 定期恢复检查，保持 Key 池健康。
 - **Responses API ↔ Chat Completions 协议翻译** — Codex CLI（`wire_api = "responses"`）可直接对接 NVIDIA 的 `/v1/chat/completions` 后端，代理自动双向翻译。
 - **Codex CLI 自动配置** — 启动时自动生成 `~/.codex/config.toml` 和模型目录，无需 cc-switch 中转。

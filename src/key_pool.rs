@@ -478,7 +478,7 @@ mod retry_state_machine_tests {
     use crate::config::{CooldownConfig, HealthCheckConfig, ObservabilityConfig, RateLimiterConfig};
 
     fn build_pool(keys: &[&str]) -> KeyPool {
-        let mut cfg = Config {
+        let cfg = Config {
             listen_addr: "0.0.0.0:8888".to_string(),
             base_url: "https://example.test".to_string(),
             keys: keys.iter().map(|s| s.to_string()).collect(),
@@ -501,7 +501,6 @@ mod retry_state_machine_tests {
         assert!(!pool.mark_failure("k1", 3).await);
         assert!(!pool.mark_failure("k1", 3).await);
         let handle = pool.inner.read().await.get("k1").cloned().unwrap();
-        drop(()); // keep borrow scope clean
         assert_eq!(handle.state().await, KeyState::Active);
         assert_eq!(handle.fail_count().await, 2);
     }

@@ -35,6 +35,14 @@ impl Proxy {
     ) -> Self {
         let client = reqwest::Client::builder()
             .pool_idle_timeout(Duration::from_secs(90))
+            // Connection-level backstop so a stalled/hung upstream can't pin
+            // a proxy connection indefinitely. This bounds the *connection*
+            // phase and the read-quiet period between bytes; streaming bodies
+            // (the common case here) are NOT bound by it because each SSE
+            // chunk resets the read-quiet timer. The per-request
+            // `request_timeout_secs` wrapper still governs non-streaming
+            // responses end-to-end.
+            .connect_timeout(Duration::from_secs(10))
             .build()
             .expect("Failed to build reqwest client");
         Self {
@@ -173,16 +181,18 @@ impl Proxy {
 
         // --- Upstream attempt loop with exponential backoff retry ---
         //
-        // On 401/403/429 *without* `Retry-After`, we retry the same request
-        // against another healthy key, sleeping with exponential backoff
+        // Only 401 *without* `Retry-After` triggers a retry against another
+        // healthy key, sleeping with exponential backoff
         // (backoff_base * 2^attempt, capped at backoff_max). Each such
         // failure increments the offending key's fail_count; once it crosses
         // `auth_fail_threshold` we mark the key Disabled, and it will only be
         // reactivated by a successful background health probe.
         //
-        // A 4xx/5xx with `Retry-After` (explicit per-key throttle) is NOT
-        // retried here — it's a deterministic cool-down signal and we want the
-        // client to see it as upstream intended.
+        // 401 *with* `Retry-After`, and 429/403 in either case, are NOT retried:
+        // they are deterministic upstream decisions (per-key throttle / region /
+        // account gating) and retrying on another key would only burn the whole
+        // pool. A 4xx with `Retry-After` cools the offending key (if present)
+        // and the response is surfaced to the client as upstream intended.
         let req_method = method;
         let mut key_handle = key_handle;
         let request_body_ref = &request_body;
