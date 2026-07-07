@@ -7,14 +7,15 @@ use tracing::{info, warn};
 use crate::config::Config;
 use crate::metrics::Metrics;
 
-/// Mask an API key for display: first 4 + "***" + last 4 chars.
-/// If key is shorter than 8 chars, returns "".
+/// Mask an API key for display: first 4 chars + "***" + last 4 chars.
+/// If the key has fewer than 8 characters, returns "***".
 pub fn mask_key(key: &str) -> String {
-    if key.len() < 8 {
+    let chars: Vec<char> = key.chars().collect();
+    if chars.len() < 8 {
         return "***".to_string();
     }
-    let first = &key[..4];
-    let last = &key[key.len() - 4..];
+    let first: String = chars.iter().take(4).collect();
+    let last: String = chars.iter().skip(chars.len() - 4).collect();
     format!("{}***{}", first, last)
 }
 
@@ -213,6 +214,10 @@ impl KeyPool {
         // Initialize keys
         for key_str in &config.keys {
             let key_id = KeyId(Arc::new(key_str.clone()));
+            // A non-positive qps_per_key is treated as 1.0 token/sec rather
+            // than unlimited, so the bucket always has a defined refill rate.
+            // Consider adding a config validation or explicit "unlimited" mode
+            // if that is the intended semantics.
             let bucket = TokenBucket::new(
                 config.rate_limiter.burst as u32,
                 if config.rate_limiter.qps_per_key > 0.0 {
@@ -244,20 +249,23 @@ impl KeyPool {
     /// Returns a handle to a randomly selected active key based on weight.
     /// Returns None if no active keys.
     pub async fn acquire(&self) -> Option<KeyStateHandle> {
-        // Sample active keys and their weights in a single read lock per key
-        // (rather than once for `state()` and again for `weight()`).
-        let mut active: Vec<(KeyStateHandle, u32)> = vec![];
-        let read_guard = self.inner.read().await;
-        for (_key_str, handle) in read_guard.iter() {
+        // Snapshot the handles first so we don't hold the outer map lock across
+        // multiple inner-lock awaits. Staleness is acceptable for load-balancing.
+        let handles: Vec<KeyStateHandle> = {
+            let read_guard = self.inner.read().await;
+            read_guard.values().cloned().collect()
+        };
+
+        let mut active: Vec<(KeyStateHandle, u32)> = Vec::new();
+        for handle in handles {
             let guard = handle.inner.read().await;
             let is_active = matches!(guard.state, KeyState::Active);
             let w = guard.weight;
             drop(guard);
             if is_active && w > 0 {
-                active.push((handle.clone(), w));
+                active.push((handle, w));
             }
         }
-        drop(read_guard);
         if active.is_empty() {
             None
         } else {
@@ -418,6 +426,10 @@ impl KeyPool {
     }
 
     /// Mark a key as bad (got 429/403) and put it into cooldown.
+    ///
+    /// If the upstream asks for a Retry-After longer than `cooldown.max_seconds`,
+    /// we cap it to `max_seconds` to prevent a single key from draining the
+    /// pool for an unbounded time. This is an intentional policy choice.
     pub async fn mark_bad(&self, key_str: &str, retry_after: Option<u64>) {
         let read_guard = self.inner.read().await;
         if let Some(handle) = read_guard.get(key_str) {
@@ -445,6 +457,10 @@ impl KeyPool {
 
     /// Background task to move cooling keys back to active when ready.
     /// `stop` is a Notify that signals graceful shutdown.
+    ///
+    /// This task currently reuses `health_check.interval_seconds` as its sweep
+    /// period. If the two intervals need to diverge in the future, add a
+    /// dedicated `cooldown.interval_seconds` field.
     pub async fn cool_down_task(self: Arc<Self>, stop: Arc<tokio::sync::Notify>) {
         let mut interval = tokio::time::interval(Duration::from_secs(
             self.config.health_check.interval_seconds,
@@ -459,26 +475,29 @@ impl KeyPool {
                 }
             }
             let now = Instant::now();
-            let read_guard = self.inner.read().await;
+            // Snapshot handles first to avoid holding the outer read lock across
+            // multiple inner-lock awaits.
+            let handles: Vec<(String, KeyStateHandle)> = {
+                let read_guard = self.inner.read().await;
+                read_guard
+                    .iter()
+                    .map(|(k, h)| (k.clone(), h.clone()))
+                    .collect()
+            };
             let mut to_update = Vec::new();
-            for (key_str, handle) in read_guard.iter() {
-                match handle.state().await {
-                    KeyState::Cooling { ready_at } if now >= ready_at => {
-                        let handle_clone = handle.clone();
-                        to_update.push((key_str.clone(), handle_clone));
+            for (key_str, handle) in handles {
+                let expired = {
+                    let guard = handle.inner.read().await;
+                    match guard.state {
+                        KeyState::Cooling { ready_at } if now >= ready_at => true,
+                        KeyState::Disabled { ready_at } if now >= ready_at => true,
+                        _ => false,
                     }
-                    KeyState::Disabled { ready_at } if now >= ready_at => {
-                        // Fallback recovery: a health probe is the primary
-                        // recovery path, but if probes keep failing (or the
-                        // probe endpoint itself is unavailable) we must not
-                        // let the pool permanently shrink. Let the key retry.
-                        let handle_clone = handle.clone();
-                        to_update.push((key_str.clone(), handle_clone));
-                    }
-                    _ => {}
+                };
+                if expired {
+                    to_update.push((key_str, handle));
                 }
             }
-            drop(read_guard);
             for (key_str, handle) in to_update {
                 let mut guard = handle.inner.write().await;
                 let was_disabled = matches!(guard.state, KeyState::Disabled { .. });
@@ -612,5 +631,29 @@ mod retry_state_machine_tests {
         assert!(!disabled2);
         let w2 = handle.weight().await;
         assert_eq!(w2, 2, "weight should halve again (4 → 2)");
+    }
+}
+
+#[cfg(test)]
+mod mask_key_tests {
+    use super::mask_key;
+
+    #[test]
+    fn short_key_returns_masked_placeholder() {
+        assert_eq!(mask_key("abc"), "***");
+        assert_eq!(mask_key("abcdefg"), "***");
+    }
+
+    #[test]
+    fn ascii_key_reveals_first_and_last_four() {
+        assert_eq!(mask_key("nvapi-1234567890abcd"), "nvap***abcd");
+    }
+
+    #[test]
+    fn unicode_key_does_not_panic() {
+        // 8+ Unicode characters: should not panic and should produce some mask.
+        let key = "ключ-для-теста-12345";
+        let masked = mask_key(key);
+        assert!(masked.contains("***"), "masked={}", masked);
     }
 }

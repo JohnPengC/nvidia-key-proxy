@@ -5,6 +5,7 @@ use std::fs;
 use std::net::SocketAddr;
 
 use crate::codex_config::CodexConfig;
+use crate::key_pool::mask_key;
 
 #[derive(Deserialize, Clone)]
 pub struct Config {
@@ -32,17 +33,7 @@ fn default_request_timeout_seconds() -> u64 {
 
 impl fmt::Debug for Config {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let masked_keys: Vec<String> = self
-            .keys
-            .iter()
-            .map(|k| {
-                if k.len() <= 8 {
-                    "***".to_string()
-                } else {
-                    format!("{}***{}", &k[..4], &k[k.len() - 4..])
-                }
-            })
-            .collect();
+        let masked_keys: Vec<String> = self.keys.iter().map(|k| mask_key(k)).collect();
         f.debug_struct("Config")
             .field("listen_addr", &self.listen_addr)
             .field("base_url", &self.base_url)

@@ -256,145 +256,60 @@ fn generate_catalog(config: &CodexConfig) -> Value {
 
 /// Generate the Codex config.toml content, preserving user sections.
 ///
-/// Strategy: read existing config.toml, then use regex to update only the
-/// fields we manage (model_provider, model, model_reasoning_effort,
-/// disable_response_storage, model_catalog_json, and the [model_providers.X]
-/// section). User-defined sections (notify, mcp_servers, marketplaces,
-/// features, projects, plugins) are preserved untouched.
-fn generate_config_toml(config: &CodexConfig, proxy_port: u16) -> String {
-    let catalog = catalog_path();
-    let catalog_str = catalog.to_string_lossy();
-    let existing = fs::read_to_string(config_toml_path()).unwrap_or_default();
+/// Strategy: parse existing config.toml as an editable TOML document, then
+/// update only the root-level fields we manage and the
+/// `[model_providers.nvidia-proxy]` section. User-defined sections and
+/// comments outside of those fields are preserved.
+fn generate_config_toml_with_existing(
+    config: &CodexConfig,
+    proxy_port: u16,
+    existing: &str,
+    catalog_path: &str,
+) -> String {
+    let mut doc = existing
+        .parse::<toml_edit::DocumentMut>()
+        .unwrap_or_else(|_| toml_edit::DocumentMut::new());
 
-    // Our managed provider section
-    let provider_section = format!(
-        r#"[model_providers.{PROVIDER_ID}]
-name = "NVIDIA Proxy"
-base_url = "http://localhost:{port}/v1"
-wire_api = "responses"
-requires_openai_auth = true
-experimental_bearer_token = "{token}"
-"#,
-        port = proxy_port,
-        token = config.bearer_token,
-    );
+    // Managed root-level fields.
+    doc["model_provider"] = toml_edit::value(PROVIDER_ID);
+    doc["model"] = toml_edit::value(config.default_model.as_str());
+    doc["model_reasoning_effort"] = toml_edit::value(config.model_reasoning_effort.as_str());
+    doc["disable_response_storage"] = toml_edit::value(config.disable_response_storage);
+    doc["model_catalog_json"] = toml_edit::value(catalog_path);
 
-    // Build the managed fields map
-    let managed_fields = vec![
-        ("model_provider", format!("\"{}\"", PROVIDER_ID)),
-        ("model", format!("\"{}\"", config.default_model)),
-        (
-            "model_reasoning_effort",
-            format!("\"{}\"", config.model_reasoning_effort),
-        ),
-        (
-            "disable_response_storage",
-            if config.disable_response_storage {
-                "true".to_string()
-            } else {
-                "false".to_string()
-            },
-        ),
-        ("model_catalog_json", format!("\"{}\"", catalog_str)),
-    ];
-
-    let mut result = existing;
-
-    // Update or insert each managed top-level field
-    for (key, value) in &managed_fields {
-        let pattern = format!(r"(?m)^{}\s*=.*$", regex_escape(key));
-        let replacement = format!("{} = {}", key, value);
-        if let Ok(re) = regex::Regex::new(&pattern) {
-            if re.is_match(&result) {
-                result = re.replace(&result, replacement.as_str()).to_string();
-            } else {
-                // Insert at the beginning
-                result = format!("{} = {}\n{}", key, value, result);
-            }
-        }
+    // Remove any conflicting cc-switch provider section.
+    if let Some(model_providers) = doc
+        .get_mut("model_providers")
+        .and_then(|v| v.as_table_mut())
+    {
+        model_providers.remove("custom");
     }
 
-    // Remove any cc-switch managed provider sections (custom, etc.)
-    // that would conflict with our provider.
-    // NOTE: Rust's `regex` crate does NOT support lookahead (?=...),
-    // so we match the section up to and including its trailing newline,
-    // then also any bare [model_providers] header line.
-    let remove_patterns: &[&str] = &[
-        // Bare [model_providers] header line (Toml allows it but it's noise)
-        r"(?m)^\[model_providers\]\s*\n",
-        // [model_providers.custom] section — match from the header to the
-        // *content* before the next section. Since we can't use lookahead,
-        // we match greedily to end-of-string then backtrack by finding the
-        // next \n[ manually after the match.
-    ];
-    for pat in remove_patterns {
-        if let Ok(re) = regex::Regex::new(pat) {
-            result = re.replace(&result, "").to_string();
-        }
-    }
-    // Manual removal of [model_providers.custom] section (no lookahead):
-    if let Some(start) = result.find("[model_providers.custom]") {
-        // Find the next section header after this one
-        let after = &result[start..];
-        let next_section = after[1..] // skip the [ we just found
-            .find("\n[")
-            .map(|pos| start + 1 + pos + 1); // +1 for the [ we skipped, +1 for \n
-        let end = next_section.unwrap_or(result.len());
-        result = format!("{}{}", &result[..start], &result[end..]);
+    // Ensure the [model_providers] table exists and set our managed section.
+    {
+        let model_providers =
+            doc["model_providers"].or_insert(toml_edit::Item::Table(toml_edit::Table::new()));
+        let model_providers = model_providers
+            .as_table_mut()
+            .expect("model_providers must be a table");
+        let nvidia = model_providers
+            .entry(PROVIDER_ID)
+            .or_insert(toml_edit::Item::Table(toml_edit::Table::new()));
+        let nvidia = nvidia.as_table_mut().expect("nvidia-proxy must be a table");
+        nvidia["name"] = toml_edit::value("NVIDIA Proxy");
+        nvidia["base_url"] = toml_edit::value(format!("http://localhost:{}/v1", proxy_port));
+        nvidia["wire_api"] = toml_edit::value("responses");
+        nvidia["requires_openai_auth"] = toml_edit::value(true);
+        nvidia["experimental_bearer_token"] = toml_edit::value(config.bearer_token.as_str());
     }
 
-    // Re-check after removal
-    let has_provider = result.contains(&format!("[model_providers.{PROVIDER_ID}]"));
-    let has_model_providers_header =
-        result.contains("[model_providers]") || result.contains("[model_providers.");
-
-    if has_provider {
-        // Replace existing provider section (no lookahead — find end manually)
-        let marker = format!("[model_providers.{PROVIDER_ID}]");
-        let start = result.find(&marker).unwrap_or(0);
-        let after = &result[start..];
-        let end = after[1..]
-            .find("\n[")
-            .map(|pos| start + 1 + pos + 1)
-            .unwrap_or(result.len());
-        result = format!("{}{}{}", &result[..start], provider_section, &result[end..]);
-    } else if has_model_providers_header {
-        // Insert before the first [model_providers] section
-        if let Some(pos) = result.find("[model_providers") {
-            result = format!(
-                "{}\n{}\n{}",
-                &result[..pos].trim_end_matches('\n'),
-                provider_section,
-                &result[pos..]
-            );
-        }
-    } else {
-        // Append at the end
-        if !result.is_empty() && !result.ends_with('\n') {
-            result.push('\n');
-        }
-        result = format!("{}\n{}", result, provider_section);
-    }
-
-    // Clean up excessive blank lines (more than 2 consecutive)
-    while result.contains("\n\n\n") {
-        result = result.replace("\n\n\n", "\n\n");
-    }
-
-    result
+    doc.to_string()
 }
 
-/// Escape special regex characters in a string.
-fn regex_escape(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '_' {
-                c.to_string()
-            } else {
-                format!("\\{}", c)
-            }
-        })
-        .collect()
+fn generate_config_toml(config: &CodexConfig, proxy_port: u16) -> String {
+    let existing = fs::read_to_string(config_toml_path()).unwrap_or_default();
+    let catalog = catalog_path();
+    generate_config_toml_with_existing(config, proxy_port, &existing, &catalog.to_string_lossy())
 }
 
 /// Extract the port from a listen address like "0.0.0.0:8888".
@@ -488,132 +403,145 @@ pub fn get_catalog() -> Value {
 
 #[cfg(test)]
 mod tests {
-    /// Manual removal of [model_providers.custom] section.
-    /// Mirrors the logic in `generate_config_toml` — Rust's regex crate
-    /// does not support lookahead, so we find the section header then
-    /// cut everything up to the next `\n[` or end of string.
-    fn remove_custom_provider_section(mut result: String) -> String {
-        if let Some(start) = result.find("[model_providers.custom]") {
-            let after = &result[start..];
-            let next_section = after[1..].find("\n[").map(|pos| start + 1 + pos + 1);
-            let end = next_section.unwrap_or(result.len());
-            result = format!("{}{}", &result[..start], &result[end..]);
-        }
-        result
+    use super::*;
+
+    fn default_config() -> CodexConfig {
+        CodexConfig::default()
     }
 
     #[test]
-    fn test_remove_custom_provider_with_following_section() {
-        let text = r#"model_provider = "nvidia-proxy"
+    fn test_update_root_fields_and_provider() {
+        let existing = r#"model = "old-model"
 [model_providers.nvidia-proxy]
-name = "NVIDIA Proxy"
-base_url = "http://localhost:8888/v1"
-[model_providers.custom]
-name = "Nvidia proxy"
-base_url = "http://localhost:8888/v1"
-wire_api = "responses"
-
-[mcp_servers]
-[mcp_servers.node_repl]
-"#;
-        let result = remove_custom_provider_section(text.to_string());
-        assert!(
-            !result.contains("model_providers.custom"),
-            "custom should be removed, got: {}",
-            result
-        );
-        // Following sections must survive
-        assert!(
-            result.contains("[mcp_servers]"),
-            "[mcp_servers] should survive, got: {}",
-            result
-        );
-        assert!(
-            result.contains("[mcp_servers.node_repl]"),
-            "[mcp_servers.node_repl] should survive, got: {}",
-            result
-        );
-        // Our provider section must survive
-        assert!(
-            result.contains("[model_providers.nvidia-proxy]"),
-            "nvidia-proxy should survive, got: {}",
-            result
-        );
-    }
-
-    #[test]
-    fn test_remove_custom_provider_at_end_of_string() {
-        let text = r#"[model_providers.custom]
-name = "Nvidia proxy"
-base_url = "http://localhost:8888/v1"
-wire_api = "responses"
-"#;
-        let result = remove_custom_provider_section(text.to_string());
-        assert!(
-            !result.contains("model_providers.custom"),
-            "custom should be removed, got: {}",
-            result
-        );
-        assert!(
-            result.trim().is_empty(),
-            "result should be empty, got: {:?}",
-            result
-        );
-    }
-
-    #[test]
-    fn test_remove_custom_provider_not_present() {
-        let text = r#"model = "z-ai/glm-5.2"
-[model_providers.nvidia-proxy]
-name = "NVIDIA Proxy"
-"#;
-        let result = remove_custom_provider_section(text.to_string());
-        // No custom section → text unchanged
-        assert_eq!(result, text);
-    }
-
-    #[test]
-    fn test_replace_nvidia_proxy_section() {
-        // Simulate the provider-replacement logic from generate_config_toml
-        let text = r#"[model_providers.nvidia-proxy]
 name = "Old Name"
 base_url = "http://old:9999/v1"
 wire_api = "chat"
 
 [mcp_servers]
 "#;
-        let marker = "[model_providers.nvidia-proxy]";
-        let provider_section = r#"[model_providers.nvidia-proxy]
-name = "NVIDIA Proxy"
+        let out = generate_config_toml_with_existing(
+            &default_config(),
+            8888,
+            existing,
+            "/tmp/catalog.json",
+        );
+        assert!(
+            out.contains(r#"model = "z-ai/glm-5.2""#),
+            "model updated: {}",
+            out
+        );
+        assert!(
+            out.contains(r#"base_url = "http://localhost:8888/v1""#),
+            "base_url updated: {}",
+            out
+        );
+        assert!(
+            out.contains(r#"wire_api = "responses""#),
+            "wire_api updated: {}",
+            out
+        );
+        assert!(
+            out.contains("[mcp_servers]"),
+            "mcp_servers preserved: {}",
+            out
+        );
+        assert!(!out.contains("old:9999"), "old base_url removed: {}", out);
+        assert!(!out.contains("old-model"), "old model removed: {}", out);
+    }
+
+    #[test]
+    fn test_remove_custom_provider_and_preserve_others() {
+        let existing = r#"[model_providers.custom]
+name = "cc-switch"
 base_url = "http://localhost:8888/v1"
 wire_api = "responses"
-requires_openai_auth = true
-experimental_bearer_token = "proxy-managed"
+
+[model_providers.nvidia-proxy]
+name = "Old Name"
+base_url = "http://old:9999/v1"
+
+[mcp_servers]
 "#;
-
-        let mut result = text.to_string();
-        let start = result.find(marker).unwrap();
-        let after = &result[start..];
-        let end = after[1..]
-            .find("\n[")
-            .map(|pos| start + 1 + pos + 1)
-            .unwrap_or(result.len());
-        result = format!("{}{}{}", &result[..start], provider_section, &result[end..]);
-
-        assert!(
-            result.contains("localhost:8888"),
-            "new base_url should be present, got: {}",
-            result
+        let out = generate_config_toml_with_existing(
+            &default_config(),
+            8888,
+            existing,
+            "/tmp/catalog.json",
         );
         assert!(
-            !result.contains("old:9999"),
-            "old base_url should be gone, got: {}",
-            result
+            !out.contains("[model_providers.custom]"),
+            "custom removed: {}",
+            out
         );
         assert!(
-            result.contains("[mcp_servers]"),
-            "[mcp_servers] should survive, got: {}",
-            result
+            !out.contains("cc-switch"),
+            "custom content removed: {}",
+            out
+        );
+        assert!(
+            out.contains("[model_providers.nvidia-proxy]"),
+            "nvidia-proxy preserved: {}",
+            out
+        );
+        assert!(
+            out.contains("[mcp_servers]"),
+            "mcp_servers preserved: {}",
+            out
+        );
+        assert!(
+            out.contains(r#"base_url = "http://localhost:8888/v1""#),
+            "nvidia-proxy updated: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn test_does_not_touch_nested_model_key() {
+        let existing = r#"model = "old-model"
+[some_plugin]
+model = "plugin-internal-model"
+"#;
+        let out = generate_config_toml_with_existing(
+            &default_config(),
+            8888,
+            existing,
+            "/tmp/catalog.json",
+        );
+        assert!(
+            out.contains(r#"model = "z-ai/glm-5.2""#),
+            "root model updated: {}",
+            out
+        );
+        assert!(
+            out.contains(r#"[some_plugin]"#),
+            "plugin table preserved: {}",
+            out
+        );
+        assert!(
+            out.contains(r#"model = "plugin-internal-model""#),
+            "nested model untouched: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn test_insert_into_empty_config() {
+        let out =
+            generate_config_toml_with_existing(&default_config(), 1234, "", "/tmp/catalog.json");
+        assert!(
+            out.contains(r#"model_provider = "nvidia-proxy""#),
+            "model_provider inserted: {}",
+            out
+        );
+        assert!(
+            out.contains(r#"base_url = "http://localhost:1234/v1""#),
+            "base_url inserted: {}",
+            out
+        );
+        assert!(
+            out.contains(r#"model_catalog_json = "/tmp/catalog.json""#),
+            "catalog inserted: {}",
+            out
         );
     }
 }

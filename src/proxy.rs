@@ -172,7 +172,17 @@ impl Proxy {
         let (upstream_path, request_body, is_streaming);
 
         if is_responses {
-            let (_translated_path, translated_body) = responses_compat::translate_request(&body);
+            let (_translated_path, translated_body) =
+                match responses_compat::translate_request(&body) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        warn!("Failed to translate Responses request: {}", e);
+                        self.metrics.inc_error();
+                        return Err(warp::reject::custom(BadRequest {
+                            msg: "Invalid Responses request body".into(),
+                        }));
+                    }
+                };
             upstream_path = "/v1/chat/completions".to_string();
             request_body = Bytes::from(translated_body);
             // Codex's Responses API defaults to streaming.
@@ -229,7 +239,6 @@ impl Proxy {
                 is_responses,
                 is_streaming,
                 &model,
-                start,
                 is_last_attempt,
             );
 
@@ -256,7 +265,10 @@ impl Proxy {
             };
 
             match result {
-                Ok(AttemptResponse::Done(resp)) => return Ok(resp),
+                Ok(AttemptResponse::Done(resp)) => {
+                    self.metrics.observe_latency(start.elapsed().as_secs_f64());
+                    return Ok(resp);
+                }
                 Ok(AttemptResponse::Retry) => {
                     // 401 without Retry-After: caller still has retry budget.
                     if attempt < self.retry_config.max_retries {
@@ -368,15 +380,11 @@ impl Proxy {
         is_responses: bool,
         is_streaming: bool,
         model: &str,
-        start: std::time::Instant,
         is_last_attempt: bool,
     ) -> Result<AttemptResponse, AttemptError> {
         let key_str = key_handle.key().await;
         let req_builder = self.build_upstream_request(url, method, headers, request_body, &key_str);
         let resp = req_builder.send().await.map_err(AttemptError::Network)?;
-
-        let duration = start.elapsed();
-        self.metrics.observe_latency(duration.as_secs_f64());
 
         let status = resp.status();
         info!(status = %status, url = %url, "Upstream response");
@@ -770,17 +778,22 @@ impl Proxy {
 }
 
 // Custom rejections
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ServiceUnavailable {
     msg: String,
 }
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct BadGateway {
+    msg: String,
+}
+#[derive(Debug, Clone)]
+struct BadRequest {
     msg: String,
 }
 
 impl warp::reject::Reject for ServiceUnavailable {}
 impl warp::reject::Reject for BadGateway {}
+impl warp::reject::Reject for BadRequest {}
 
 impl Reply for ServiceUnavailable {
     fn into_response(self) -> warp::reply::Response {
@@ -791,5 +804,211 @@ impl Reply for ServiceUnavailable {
 impl Reply for BadGateway {
     fn into_response(self) -> warp::reply::Response {
         warp::reply::with_status(self.msg, warp::http::StatusCode::BAD_GATEWAY).into_response()
+    }
+}
+impl Reply for BadRequest {
+    fn into_response(self) -> warp::reply::Response {
+        warp::reply::with_status(self.msg, warp::http::StatusCode::BAD_REQUEST).into_response()
+    }
+}
+
+#[cfg(test)]
+mod proxy_integration_tests {
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use warp::{Filter, Rejection, Reply};
+    use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+
+    use crate::codex_config::CodexConfig;
+    use crate::config::{
+        Config, CooldownConfig, HealthCheckConfig, ObservabilityConfig, RateLimiterConfig,
+        RetryConfig,
+    };
+    use crate::key_pool::KeyPool;
+    use crate::metrics::Metrics;
+    use crate::proxy::Proxy;
+
+    fn test_config(base_url: &str, max_retries: u32, request_timeout: u64) -> Config {
+        Config {
+            listen_addr: "127.0.0.1:0".to_string(),
+            base_url: base_url.to_string(),
+            keys: vec!["fake-key".to_string()],
+            rate_limiter: RateLimiterConfig {
+                qps_per_key: 1000.0,
+                burst: 1000,
+            },
+            cooldown: CooldownConfig {
+                base_seconds: 1,
+                max_seconds: 2,
+            },
+            health_check: HealthCheckConfig {
+                interval_seconds: 30,
+                timeout_seconds: 5,
+                max_consecutive_failures: 3,
+            },
+            observability: ObservabilityConfig {
+                enable_metrics: false,
+                metrics_path: "/metrics".to_string(),
+                log_level: "info".to_string(),
+            },
+            codex: CodexConfig::default(),
+            request_timeout_seconds: request_timeout,
+            retry: RetryConfig {
+                max_retries,
+                backoff_base_ms: 100,
+                backoff_max_ms: 2000,
+                auth_fail_threshold: 3,
+            },
+        }
+    }
+
+    async fn start_proxy(config: Config) -> SocketAddr {
+        let metrics = Arc::new(Metrics::new());
+        let key_pool = Arc::new(KeyPool::new(&config, metrics.clone()));
+        let proxy = Proxy::new(
+            config.base_url.clone(),
+            key_pool,
+            metrics,
+            config.request_timeout_seconds,
+            config.retry.clone(),
+        );
+
+        let proxy_route = warp::path::full()
+            .map(|p: warp::path::FullPath| p.as_str().to_string())
+            .and(warp::method())
+            .and(warp::header::headers_cloned())
+            .and(warp::body::bytes())
+            .and(warp::addr::remote())
+            .and_then({
+                let proxy = proxy.clone();
+                move |path: String, method, headers, body, remote| {
+                    let proxy = proxy.clone();
+                    async move {
+                        proxy
+                            .handle_request(path, method, headers, body, remote)
+                            .await
+                    }
+                }
+            })
+            .recover(recover_rejection);
+
+        let (addr, server) =
+            warp::serve(proxy_route).bind_ephemeral("127.0.0.1:0".parse::<SocketAddr>().unwrap());
+        tokio::spawn(server);
+        addr
+    }
+
+    #[tokio::test]
+    async fn max_retries_zero_passes_401_through() {
+        let mock_server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let addr = start_proxy(test_config(&mock_server.uri(), 0, 5)).await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://{}/v1/chat/completions", addr))
+            .body(r#"{"model":"m","messages":[]}"#)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 401);
+    }
+
+    #[tokio::test]
+    async fn max_retries_one_retries_once() {
+        let mock_server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(2)
+            .mount(&mock_server)
+            .await;
+
+        let addr = start_proxy(test_config(&mock_server.uri(), 1, 5)).await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://{}/v1/chat/completions", addr))
+            .body(r#"{"model":"m","messages":[]}"#)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 401);
+    }
+
+    #[tokio::test]
+    async fn last_attempt_does_not_backoff() {
+        let mock_server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(2)
+            .mount(&mock_server)
+            .await;
+
+        let mut cfg = test_config(&mock_server.uri(), 1, 5);
+        cfg.retry.backoff_base_ms = 500;
+        let addr = start_proxy(cfg).await;
+
+        let client = reqwest::Client::new();
+        let start = Instant::now();
+        let _resp = client
+            .post(format!("http://{}/v1/chat/completions", addr))
+            .body(r#"{"model":"m","messages":[]}"#)
+            .send()
+            .await
+            .unwrap();
+        let elapsed = start.elapsed();
+
+        // Only the initial attempt + 1 retry, with no backoff before the final
+        // attempt. Give a generous margin to avoid flakiness.
+        assert!(
+            elapsed < Duration::from_millis(450),
+            "expected no backoff before last attempt, elapsed {:?}",
+            elapsed
+        );
+    }
+
+    async fn recover_rejection(err: Rejection) -> Result<impl Reply, Rejection> {
+        if let Some(e) = err.find::<super::BadGateway>().cloned() {
+            return Ok(e.into_response());
+        }
+        if let Some(e) = err.find::<super::ServiceUnavailable>().cloned() {
+            return Ok(e.into_response());
+        }
+        if let Some(e) = err.find::<super::BadRequest>().cloned() {
+            return Ok(e.into_response());
+        }
+        Err(err)
+    }
+
+    #[tokio::test]
+    async fn request_timeout_covers_response_delay() {
+        let mock_server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(3)))
+            .expect(1..)
+            .mount(&mock_server)
+            .await;
+
+        let addr = start_proxy(test_config(&mock_server.uri(), 0, 1)).await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://{}/v1/chat/completions", addr))
+            .body(r#"{"model":"m","messages":[]}"#)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 502);
     }
 }

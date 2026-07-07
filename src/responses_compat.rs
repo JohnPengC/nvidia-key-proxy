@@ -17,14 +17,9 @@ pub fn is_responses_path(path: &str) -> bool {
 /// Convert a Responses API request body to a Chat Completions request body.
 ///
 /// Returns the translated JSON body and the upstream path to send it to.
-pub fn translate_request(body: &Bytes) -> (String, Vec<u8>) {
-    let req: Value = match serde_json::from_slice(body) {
-        Ok(v) => v,
-        Err(e) => {
-            debug!("responses_compat: failed to parse request body: {}", e);
-            return ("/v1/chat/completions".to_string(), Vec::new());
-        }
-    };
+pub fn translate_request(body: &Bytes) -> Result<(String, Vec<u8>), String> {
+    let req: Value = serde_json::from_slice(body)
+        .map_err(|e| format!("responses_compat: failed to parse request body: {}", e))?;
 
     let mut chat_req = json!({
         "stream": req.get("stream").cloned().unwrap_or(Value::Bool(true)),
@@ -223,7 +218,7 @@ pub fn translate_request(body: &Bytes) -> (String, Vec<u8>) {
     // reasoning — drop (NVIDIA models don't support reasoning config in chat completions)
 
     let body_bytes = serde_json::to_vec(&chat_req).unwrap_or_default();
-    ("/v1/chat/completions".to_string(), body_bytes)
+    Ok(("/v1/chat/completions".to_string(), body_bytes))
 }
 
 /// Convert a non-streaming Chat Completions response to Responses API format.
@@ -717,5 +712,29 @@ mod streaming_behavior_tests {
             Some("z-ai/glm-5.2"),
             "completed model missing"
         );
+    }
+}
+
+#[cfg(test)]
+mod translate_request_tests {
+    use super::translate_request;
+    use bytes::Bytes;
+
+    #[test]
+    fn invalid_json_returns_error() {
+        let body = Bytes::from_static(b"not json");
+        assert!(translate_request(&body).is_err());
+    }
+
+    #[test]
+    fn valid_responses_request_returns_chat_completions() {
+        let body =
+            Bytes::from_static(br#"{"model":"z-ai/glm-5.2","input":"hello","stream":false}"#);
+        let (path, bytes) = translate_request(&body).expect("valid JSON should translate");
+        assert_eq!(path, "/v1/chat/completions");
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["model"], "z-ai/glm-5.2");
+        assert_eq!(json["stream"], false);
+        assert!(json["messages"].is_array());
     }
 }
