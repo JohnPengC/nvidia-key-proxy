@@ -5,6 +5,9 @@ config.toml
 /target
 **/*.rs.bk
 
+# Runtime log artifacts
+failure.log
+
 # Editor / OS
 .DS_Store
 .idea/

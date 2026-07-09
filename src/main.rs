@@ -14,6 +14,7 @@ use crate::proxy::Proxy;
 
 mod codex_config;
 mod config;
+mod failure_log;
 mod health;
 mod key_pool;
 mod metrics;

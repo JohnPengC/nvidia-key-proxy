@@ -1,15 +1,27 @@
 use bytes::Bytes;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, info, warn};
 use warp::{self, Rejection, Reply};
 
+use crate::failure_log;
 use crate::key_pool::{mask_key, KeyPool};
 use crate::metrics::Metrics;
 use crate::responses_compat;
 use futures_util::{Stream, StreamExt};
 use reqwest::header::{self as req_header, HeaderValue as ReqHeaderValue};
 use std::pin::Pin;
+
+/// Process-wide monotonic counter used to mint per-failure `req_id`s.
+/// Monotonic, never resets — gives us a stable correlation id for retries
+/// belonging to the same logical client request (every retry for the same
+/// request gets the next counter value, so they sort together).
+static REQ_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn next_req_id() -> u64 {
+    REQ_COUNTER.fetch_add(1, Ordering::Relaxed)
+}
 
 /// Proxy handles forwarding requests to NVIDIA API using a key from the pool.
 #[derive(Clone)]
@@ -240,6 +252,7 @@ impl Proxy {
                 is_streaming,
                 &model,
                 is_last_attempt,
+                attempt,
             );
 
             // For streaming requests we never wrap in a hard timeout
@@ -298,6 +311,20 @@ impl Proxy {
                     // an auth failure.
                     let k = key_handle.key().await;
                     warn!(key = %mask_key(&k), "Request send error: {}", e);
+                    failure_log::write_failure(
+                        method.as_str(),
+                        &url,
+                        &url,
+                        &model,
+                        &k,
+                        None,
+                        "network_error",
+                        &e.to_string(),
+                        "",
+                        attempt,
+                        next_req_id(),
+                        Some("network"),
+                    );
                     self.key_pool.mark_bad(&k, None).await;
                     if attempt < self.retry_config.max_retries {
                         if let Some(next) = self.key_pool.acquire().await {
@@ -319,6 +346,25 @@ impl Proxy {
                     }));
                 }
                 Err(AttemptError::Timeout) => {
+                    let k = key_handle.key().await;
+                    warn!(key = %mask_key(&k), "Upstream request timeout");
+                    failure_log::write_failure(
+                        method.as_str(),
+                        &url,
+                        &url,
+                        &model,
+                        &k,
+                        None,
+                        "timeout",
+                        &format!(
+                            "exceeded request_timeout_secs={}",
+                            self.request_timeout_secs
+                        ),
+                        "",
+                        attempt,
+                        next_req_id(),
+                        Some("timeout"),
+                    );
                     if attempt < self.retry_config.max_retries {
                         if let Some(next) = self.key_pool.acquire().await {
                             let will_retry_again = attempt + 1 < self.retry_config.max_retries;
@@ -344,6 +390,20 @@ impl Proxy {
                 Err(AttemptError::BodyRead(e)) => {
                     let k = key_handle.key().await;
                     error!(key = %mask_key(&k), "Failed to read response body: {}", e);
+                    failure_log::write_failure(
+                        method.as_str(),
+                        &url,
+                        &url,
+                        &model,
+                        &k,
+                        None,
+                        "body_read_error",
+                        &e.to_string(),
+                        "",
+                        attempt,
+                        next_req_id(),
+                        Some("body_read"),
+                    );
                     return Err(warp::reject::custom(BadGateway {
                         msg: "Failed to read response body".into(),
                     }));
@@ -381,6 +441,7 @@ impl Proxy {
         is_streaming: bool,
         model: &str,
         is_last_attempt: bool,
+        attempt: u32,
     ) -> Result<AttemptResponse, AttemptError> {
         let key_str = key_handle.key().await;
         let req_builder = self.build_upstream_request(url, method, headers, request_body, &key_str);
@@ -497,6 +558,60 @@ impl Proxy {
         }
 
         let body_bytes = resp.bytes().await.map_err(AttemptError::BodyRead)?;
+
+        // ── Structured failure log (failure.log JSONL) ───────────────────
+        // Single hook covering all non-2xx upstream outcomes. Key facts we
+        // want surfaced for diagnosis: status, model (when present), masked
+        // key, upstream URL, retry attempt, and a short body excerpt that
+        // lets us classify NVIDIA's "Function 'uuid': Not found for account
+        // 'xxxx'" 404s, rate-limit JSON, or empty/error bodies.
+        if !status.is_success() {
+            let body_excerpt = {
+                let s = std::str::from_utf8(&body_bytes).unwrap_or("");
+                // Take first 512 chars; bodies are short error JSON.
+                s.chars().take(512).collect::<String>()
+            };
+            let (function_id, account_id) =
+                failure_log::extract_nvidia_function_detail(&body_excerpt);
+            let category = if status.is_client_error() {
+                "upstream_4xx"
+            } else if status.is_server_error() {
+                "upstream_5xx"
+            } else {
+                "upstream_other"
+            };
+            // detail: include function_id / account_id when present so jq
+            // queries can group by them without re-parsing the body.
+            let detail = if !function_id.is_empty() || !account_id.is_empty() {
+                format!(
+                    "function_id={} account_id={}",
+                    function_id, account_id
+                )
+            } else {
+                String::new()
+            };
+            // endpoint = path portion of upstream URL (after base_url)
+            let endpoint = url
+                .find("//")
+                .and_then(|i| url[i + 2..].find('/').map(|j| i + 2 + j))
+                .map(|i| &url[i..])
+                .unwrap_or(url);
+            failure_log::write_failure(
+                method.as_str(),
+                endpoint,
+                url,
+                model,
+                &key_str,
+                Some(status.as_u16()),
+                category,
+                &detail,
+                &body_excerpt,
+                attempt,
+                next_req_id(),
+                None,
+            );
+        }
+
         let final_body = if is_responses && status.is_success() {
             let translated = responses_compat::translate_response(&body_bytes, model);
             Bytes::from(translated)
