@@ -35,6 +35,36 @@ fn request_error() -> &'static Counter {
     })
 }
 
+pub fn token_input() -> &'static Counter {
+    static TOKEN_INPUT: OnceLock<Counter> = OnceLock::new();
+    TOKEN_INPUT.get_or_init(|| {
+        register_counter!(
+            "proxy_tokens_input_total",
+            "累计输入 token 数 (prompt_tokens)"
+        ).unwrap()
+    })
+}
+
+pub fn token_output() -> &'static Counter {
+    static TOKEN_OUTPUT: OnceLock<Counter> = OnceLock::new();
+    TOKEN_OUTPUT.get_or_init(|| {
+        register_counter!(
+            "proxy_tokens_output_total",
+            "累计输出 token 数 (completion_tokens)"
+        ).unwrap()
+    })
+}
+
+pub fn token_total() -> &'static Counter {
+    static TOKEN_TOTAL: OnceLock<Counter> = OnceLock::new();
+    TOKEN_TOTAL.get_or_init(|| {
+        register_counter!(
+            "proxy_tokens_total",
+            "累计 token 数 (prompt + completion)"
+        ).unwrap()
+    })
+}
+
 fn request_latency() -> &'static Histogram {
     static REQUEST_LATENCY: OnceLock<Histogram> = OnceLock::new();
     REQUEST_LATENCY.get_or_init(|| {

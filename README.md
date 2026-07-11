@@ -73,6 +73,31 @@ A lightweight, high‑performance proxy written in Rust that fronts multiple NVI
 
 The proxy auto-manages `~/.codex/config.toml` on startup, eliminating the need for cc-switch as an intermediary.
 
+## Cursor Integration
+
+The proxy also supports writing a Cursor configuration file (`~/.cursor/config.json` on macOS/Linux or `%APPDATA%/Cursor/User/settings.json` on Windows). This is controlled via the `[cursor]` table in `config.toml`.
+
+### Configuration fields
+
+- `mode` – `"local"` to route through the proxy, `"official"` to use the official OpenAI endpoint directly.
+- `proxy_port` – Port on which the proxy listens (defaults to the same as `listen_addr`).
+- `api_key` – Dummy API key required by Cursor; the proxy substitutes a real key when forwarding requests.
+- `settings_path` – Path to the Cursor JSON settings file; `~` is expanded to the home directory.
+
+When the proxy starts, it calls `cursor_config::apply(&config.cursor)` which writes/updates the JSON file with `openai.baseUrl` and `openai.apiKey` fields, ensuring the file exists and is idempotent.
+
+Example `config.toml` snippet:
+
+```toml
+[cursor]
+mode = "local"
+proxy_port = 8888
+api_key = "cursor-dummy-key"
+settings_path = "~/.cursor/config.json"
+```
+
+The integration works on both Unix and Windows platforms.
+
 ### What it does
 
 1. **Generates `~/.codex/nvidia-proxy-model-catalog.json`** – model catalog with entries derived from Codex's `gpt-5.5` template (if available in `models_cache.json`) or a minimal fallback.
@@ -173,6 +198,14 @@ Codex CLI                    Proxy                      NVIDIA API
 
 Prometheus metrics are exposed at `observability.metrics_path` (default `/metrics`) when `observability.enable_metrics` is `true`.
 
+## Implementation Refactor (2026‑07‑11)
+
+- Introduced **`AppState`** to group shared runtime objects (metrics, key pool, proxy, health checker, stop signal, config).
+- Extracted tracing initialization into **`init_tracing`** for clearer start‑up ordering.
+- Moved route construction into **`build_routes`**, keeping `main` focused on orchestration.
+- Graceful shutdown now uses a single `Notify` and drops background task handles, avoiding deadlocks.
+- Added integration tests under **`tests/`** verifying health, metrics (enabled/disabled), and unknown‑path handling.
+
 - `proxy_requests_total` – total HTTP requests processed
 - `proxy_requests_success_total` – 2xx requests
 - `proxy_requests_errors_total` – non-2xx requests
@@ -180,6 +213,10 @@ Prometheus metrics are exposed at `observability.metrics_path` (default `/metric
 - `proxy_key_active` – number of active keys
 - `proxy_key_cooldown` – number of keys in cool-down
 - `proxy_key_disabled` – number of disabled keys
+
+- `proxy_tokens_input_total` – cumulative input token count (prompt tokens)
+- `proxy_tokens_output_total` – cumulative output token count (completion tokens)
+- `proxy_tokens_total` – cumulative total tokens (prompt + completion)
 
 ## API Endpoints
 

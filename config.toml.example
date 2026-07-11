@@ -53,3 +53,11 @@ bearer_token             = "proxy-managed"
 #   "z-ai/glm-5.2:GLM 5.2:1000000",
 #   "moonshotai/kimi-k2.6:Kimi K2.6:256000",
 # ]
+
+[cursor]
+# Cursor integration – writes `~/.cursor/config.json` (or Windows equivalent).
+mode = "local"
+proxy_port = 8888
+api_key = "cursor-dummy-key"
+settings_path = "~/.cursor/config.json"
+

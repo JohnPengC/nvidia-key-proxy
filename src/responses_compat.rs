@@ -155,9 +155,23 @@ pub fn translate_request(body: &Bytes) -> Result<(String, Vec<u8>), String> {
 
     chat_req["messages"] = Value::Array(messages);
 
-    // max_output_tokens → max_tokens
-    if let Some(max_tokens) = req.get("max_output_tokens") {
-        chat_req["max_tokens"] = max_tokens.clone();
+    // max_output_tokens → max_tokens with validation
+    if let Some(max_val) = req.get("max_output_tokens") {
+        // Ensure the value is a positive integer; upstream rejects non‑positive values.
+        let is_valid = match max_val {
+            // Integer numbers
+            serde_json::Value::Number(num) => num.as_i64().map_or(false, |v| v >= 1),
+            // Strings that parse as positive integers
+            serde_json::Value::String(s) => s.parse::<i64>().map_or(false, |v| v >= 1),
+            _ => false,
+        };
+        if !is_valid {
+            return Err(format!(
+                "responses_compat: invalid max_output_tokens value: {}",
+                max_val
+            ));
+        }
+        chat_req["max_tokens"] = max_val.clone();
     }
 
     // temperature, top_p, stop — passthrough

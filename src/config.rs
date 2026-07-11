@@ -4,8 +4,9 @@ use std::fmt;
 use std::fs;
 use std::net::SocketAddr;
 
-use crate::codex_config::CodexConfig;
 use crate::key_pool::mask_key;
+use crate::codex_config::CodexConfig;
+use crate::cursor_config::CursorConfig;
 
 #[derive(Deserialize, Clone)]
 pub struct Config {
@@ -18,6 +19,9 @@ pub struct Config {
     pub observability: ObservabilityConfig,
     #[serde(default)]
     pub codex: CodexConfig,
+    /// Optional Cursor configuration (mode, apiKey, etc.)
+    #[serde(default)]
+    pub cursor: Option<CursorConfig>,
     /// Optional request timeout in seconds. 0 disables the timeout entirely
     /// (recommended when proxying long-running streaming requests).
     #[serde(default = "default_request_timeout_seconds")]
@@ -162,6 +166,7 @@ impl Config {
                 log_level: "info".to_string(),
             },
             codex: crate::codex_config::CodexConfig::default(),
+            cursor: None,
             request_timeout_seconds: default_request_timeout_seconds(),
             retry: RetryConfig::default(),
         };

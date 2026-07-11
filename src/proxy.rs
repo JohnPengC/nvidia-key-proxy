@@ -2,6 +2,7 @@ use bytes::Bytes;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+
 use tracing::{error, info, warn};
 use warp::{self, Rejection, Reply};
 
@@ -167,6 +168,26 @@ impl Proxy {
             .map(|v| v.get("input").is_some() && v.get("messages").is_none())
             .unwrap_or(false);
         let is_responses = is_responses_path || body_is_responses_format;
+        // Validation for chat completions (non‑Responses) requests: ensure
+        // `max_tokens` is a positive integer when supplied.
+        if !is_responses {
+            if let Some(v) = &parsed_body {
+                if let Some(max_val) = v.get("max_tokens") {
+                    let is_valid = match max_val {
+                        serde_json::Value::Number(num) => num.as_i64().map_or(false, |n| n >= 1),
+                        serde_json::Value::String(s) => s.parse::<i64>().map_or(false, |n| n >= 1),
+                        _ => false,
+                    };
+                    if !is_valid {
+                        warn!("Invalid max_tokens value: {}", max_val);
+                        self.metrics.inc_error();
+                        return Err(warp::reject::custom(BadRequest {
+                            msg: "Invalid max_tokens (must be >= 1)".into(),
+                        }));
+                    }
+                }
+            }
+        }
 
         // Extract `model` once from the client's request body so it can be
         // propagated into translated Responses events (response.created /
@@ -558,6 +579,28 @@ impl Proxy {
         }
 
         let body_bytes = resp.bytes().await.map_err(AttemptError::BodyRead)?;
+
+        // Token statistics (prompt/completion/total) for successful Chat Completion responses.
+        // We only count when the request is a plain Chat Completion (not a Responses↔Chat translation).
+        if status.is_success() && !is_responses {
+            if let Ok(json_body) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+                if let Some(usage) = json_body.get("usage") {
+                    if let Some(prompt) = usage.get("prompt_tokens").and_then(|v| v.as_u64()) {
+                        crate::metrics::token_input().inc_by(prompt as f64);
+                    }
+                    if let Some(completion) = usage.get("completion_tokens").and_then(|v| v.as_u64()) {
+                        crate::metrics::token_output().inc_by(completion as f64);
+                    }
+                    if let (Some(p), Some(c)) = (
+                        usage.get("prompt_tokens").and_then(|v| v.as_u64()),
+                        usage.get("completion_tokens").and_then(|v| v.as_u64()),
+                    ) {
+                        crate::metrics::token_total().inc_by((p + c) as f64);
+                    }
+                }
+            }
+        }
+
 
         // ── Structured failure log (failure.log JSONL) ───────────────────
         // Single hook covering all non-2xx upstream outcomes. Key facts we
@@ -970,6 +1013,7 @@ mod proxy_integration_tests {
             },
             codex: CodexConfig::default(),
             request_timeout_seconds: request_timeout,
+            cursor: None,
             retry: RetryConfig {
                 max_retries,
                 backoff_base_ms: 100,

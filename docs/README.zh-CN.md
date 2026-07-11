@@ -73,6 +73,31 @@
 
 代理在启动时自动管理 `~/.codex/config.toml`，省去 cc-switch 作为中间层。
 
+## Cursor 集成
+
+代理同样支持写入 Cursor 的配置文件（Unix 系统为 `~/.cursor/config.json`，Windows 为 `%APPDATA%/Cursor/User/settings.json`），通过 `config.toml` 中的 `[cursor]` 表进行配置。
+
+### 配置字段
+
+- `mode` – `"local"` 表示走本地代理，`"official"` 表示直接使用官方 OpenAI 接口。
+- `proxy_port` – 代理监听的端口，默认与 `listen_addr` 相同。
+- `api_key` – Cursor 要求的占位 API Key，代理在转发请求时会替换为真实的 NVIDIA Key。
+- `settings_path` – Cursor JSON 设置文件路径，`~` 会展开为用户主目录。
+
+启动时，主程序会调用 `cursor_config::apply(&config.cursor)`，该函数保证文件存在且幂等地写入 `openai.baseUrl` 与 `openai.apiKey` 两个字段。
+
+示例 `config.toml` 片段：
+
+```toml
+[cursor]
+mode = "local"
+proxy_port = 8888
+api_key = "cursor-dummy-key"
+settings_path = "~/.cursor/config.json"
+```
+
+此集成在 Unix 与 Windows 上均可工作。
+
 ### 工作原理
 
 1. **生成 `~/.codex/nvidia-proxy-model-catalog.json`** — 模型目录，优先从 Codex 的 `gpt-5.5` 模板（`models_cache.json`）衍生，否则使用最小化 fallback。
@@ -181,6 +206,18 @@ Codex CLI                    代理                       NVIDIA API
 | `proxy_key_active` | 活跃 Key 数 |
 | `proxy_key_cooldown` | 冷却中 Key 数 |
 | `proxy_key_disabled` | 禁用 Key 数 |
+
+- `proxy_tokens_input_total` – 累计输入 token 数（prompt tokens）
+- `proxy_tokens_output_total` – 累计输出 token 数（completion tokens）
+- `proxy_tokens_total` – 累计 token 总数（prompt + completion）
+
+## 实现重构 (2026‑07‑11)
+
+- 引入 **`AppState`** 将共享运行时对象（metrics、key_pool、proxy、health_checker、stop_signal、config）统一管理。
+- 将 tracing 初始化抽离为 **`init_tracing`**，确保启动顺序更清晰。
+- 将路由构建抽象为 **`build_routes`**，`main` 只负责 orchestration（启动、后台任务、Graceful shutdown）。
+- 使用单一 `Notify` 实现优雅关闭，并在关机时直接 `drop` 背景任务句柄，避免死锁。
+- 在 `tests/` 目录新增了集成测试，覆盖健康接口、指标端点（启用/禁用）以及未知路径的 404 行为。
 
 ## API 端点
 
