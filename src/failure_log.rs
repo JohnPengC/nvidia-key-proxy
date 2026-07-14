@@ -95,8 +95,10 @@ pub fn write_failure(
         })
         .unwrap_or_default();
 
+    let error_time = format!("{:?}", SystemTime::now());
     let mut entry = json!({
         "ts": ts,
+        "error_time": error_time,
         "req_id": gen_req_id(req_counter),
         "method": method,
         "endpoint": endpoint,
