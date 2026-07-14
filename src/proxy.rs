@@ -540,9 +540,13 @@ impl Proxy {
                 warn!(
                     key = %mask_key(&key_str),
                     status = %status,
-                    "Upstream {} without Retry-After; not cooling key, passing through",
+                    "Upstream {} without Retry-After; decreasing weight, may disable after repeated failures",
                     status.as_u16()
                 );
+                // Record failure and potentially disable the key after threshold.
+                self.key_pool
+                    .mark_failure(&key_str, self.retry_config.auth_fail_threshold)
+                    .await;
             }
             self.metrics.inc_error();
         } else {
