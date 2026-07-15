@@ -663,7 +663,32 @@ impl Proxy {
             let translated = responses_compat::translate_response(&body_bytes, model);
             Bytes::from(translated)
         } else {
-            body_bytes
+            // For non-success responses, ensure error JSON fields have expected types.
+            // NVIDIA may return {"error":{"code":403,...}} where `code` is a number.
+            // Some clients (e.g., Go SDK) expect `code` as a string.
+            // We coerce numeric codes to strings to improve compatibility.
+            if let Ok(mut err_json) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+                if let Some(error_obj) = err_json.get_mut("error") {
+                    if let Some(code_val) = error_obj.get_mut("code") {
+                        if code_val.is_number() {
+                            if let Some(num) = code_val.as_i64() {
+                                *code_val = serde_json::Value::String(num.to_string());
+                            } else if let Some(u) = code_val.as_u64() {
+                                *code_val = serde_json::Value::String(u.to_string());
+                            }
+                        }
+                    }
+                    if let Ok(new_bytes) = serde_json::to_vec(&err_json) {
+                        Bytes::from(new_bytes)
+                    } else {
+                        body_bytes
+                    }
+                } else {
+                    body_bytes
+                }
+            } else {
+                body_bytes
+            }
         };
 
         let mut response_builder = warp::http::Response::builder().status(status);
