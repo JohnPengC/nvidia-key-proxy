@@ -664,25 +664,30 @@ impl Proxy {
             Bytes::from(translated)
         } else {
             // For non-success responses, ensure error JSON fields have expected types.
-            // NVIDIA may return {"error":{"code":403,...}} where `code` is a number.
-            // Some clients (e.g., Go SDK) expect `code` as a string.
-            // We coerce numeric codes to strings to improve compatibility.
-            if let Ok(mut err_json) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
-                if let Some(error_obj) = err_json.get_mut("error") {
-                    if let Some(code_val) = error_obj.get_mut("code") {
-                        if code_val.is_number() {
-                            if let Some(num) = code_val.as_i64() {
-                                *code_val = serde_json::Value::String(num.to_string());
-                            } else if let Some(u) = code_val.as_u64() {
-                                *code_val = serde_json::Value::String(u.to_string());
+            // NVIDIA may return {"error":{"code":403,...}} or {"code":403} where `code` is a number.
+            // Some Go clients expect `code` as a string. Convert numeric codes to strings.
+            if let Ok(mut json_val) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+                // Helper closure to convert numeric `code` to string in a mutable JSON value.
+                fn coerce_code(v: &mut serde_json::Value) {
+                    if let Some(code) = v.get_mut("code") {
+                        if code.is_number() {
+                            if let Some(i) = code.as_i64() {
+                                *code = serde_json::Value::String(i.to_string());
+                            } else if let Some(u) = code.as_u64() {
+                                *code = serde_json::Value::String(u.to_string());
                             }
                         }
                     }
-                    if let Ok(new_bytes) = serde_json::to_vec(&err_json) {
-                        Bytes::from(new_bytes)
-                    } else {
-                        body_bytes
-                    }
+                }
+                // Top-level code
+                coerce_code(&mut json_val);
+                // Nested under "error"
+                if let Some(err_obj) = json_val.get_mut("error") {
+                    coerce_code(err_obj);
+                }
+                // Serialize back to bytes; if fails, fall back to original body.
+                if let Ok(new_bytes) = serde_json::to_vec(&json_val) {
+                    Bytes::from(new_bytes)
                 } else {
                     body_bytes
                 }
