@@ -155,6 +155,35 @@ fn coerce_sse_chunk(chunk: &Bytes) -> Bytes {
     }
 }
 
+/// Build a compact, stable summary of the request body for logging.
+/// Captures the fields most likely to correlate with upstream failures:
+/// model, number of messages, whether streaming, and the presence of
+/// parameters like reasoning_effort / temperature / max_tokens. The summary
+/// is a JSON string so `jq` can filter on it directly.
+fn body_summary(parsed_body: &Option<serde_json::Value>) -> String {
+    let mut summary = serde_json::Map::new();
+    if let Some(v) = parsed_body {
+        if let Some(m) = v.get("model").and_then(|x| x.as_str()) {
+            summary.insert("model".to_string(), serde_json::Value::String(m.to_string()));
+        }
+        if let Some(messages) = v.get("messages").and_then(|x| x.as_array()) {
+            summary.insert(
+                "messages".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(messages.len())),
+            );
+        }
+        if let Some(stream) = v.get("stream").and_then(|x| x.as_bool()) {
+            summary.insert("stream".to_string(), serde_json::Value::Bool(stream));
+        }
+        for field in ["reasoning_effort", "temperature", "max_tokens", "top_p"] {
+            if v.get(field).is_some() {
+                summary.insert(field.to_string(), serde_json::Value::Bool(true));
+            }
+        }
+    }
+    serde_json::Value::Object(summary).to_string()
+}
+
 impl Proxy {
     pub fn new(
         base_url: String,
@@ -311,8 +340,14 @@ impl Proxy {
             }
         };
 
+        // Generate a single correlation id for this client request. All
+        // upstream attempts (including retries) will share this id so we can
+        // follow the retry chain in failure.log and tracing.
+        let client_req_id = format!("r{}", next_req_id());
+
         // Parse the body once for validation and metadata extraction.
         let parsed_body: Option<serde_json::Value> = serde_json::from_slice(&body).ok();
+        let body_summary = body_summary(&parsed_body);
 
         // Validate `max_tokens` for chat completions: must be a positive
         // integer when supplied. NVIDIA rejects non-positive values with a
@@ -325,7 +360,7 @@ impl Proxy {
                     _ => false,
                 };
                 if !is_valid {
-                    warn!("Invalid max_tokens value: {}", max_val);
+                    warn!(client_req_id = %client_req_id, "Invalid max_tokens value: {}", max_val);
                     self.metrics.inc_error();
                     key_handle.dec_in_flight();
                     return Err(warp::reject::custom(BadRequest {
@@ -359,7 +394,7 @@ impl Proxy {
         let mut url = self.base_url.clone();
         url.push_str(&upstream_path);
 
-        info!("Proxying request to: {} {}", method.as_str(), url);
+        info!(client_req_id = %client_req_id, body_summary = %body_summary, "Proxying request to: {} {}", method.as_str(), url);
 
         // --- Upstream attempt loop with exponential backoff retry ---
         //
@@ -383,6 +418,8 @@ impl Proxy {
                 &request_body,
                 is_streaming,
                 &model,
+                &body_summary,
+                &client_req_id,
                 is_last_attempt,
                 attempt,
             );
@@ -413,6 +450,12 @@ impl Proxy {
                 Ok(AttemptResponse::Done(resp)) => {
                     key_handle.dec_in_flight();
                     self.metrics.observe_latency(start.elapsed().as_secs_f64());
+                    info!(
+                        client_req_id = %client_req_id,
+                        total_attempts = attempt + 1,
+                        elapsed_ms = start.elapsed().as_millis(),
+                        "Request completed successfully"
+                    );
                     return Ok(resp);
                 }
                 Ok(AttemptResponse::Retry) => {
@@ -439,10 +482,14 @@ impl Proxy {
                             if will_retry_again {
                                 self.backoff_sleep(attempt).await;
                             }
-                            warn!(attempt, "Retrying after upstream 401 with a different key");
+                            warn!(
+                                client_req_id = %client_req_id,
+                                attempt = attempt,
+                                "Retrying after upstream 401 with a different key"
+                            );
                             continue;
                         }
-                        warn!("No other keys available; passing 401 through");
+                        warn!(client_req_id = %client_req_id, attempt = attempt, "No other keys available; passing 401 through");
                     }
                     // Defensive fallback (helper should have returned Done on last attempt).
                     key_handle.dec_in_flight();
@@ -467,8 +514,11 @@ impl Proxy {
                         "network_error",
                         &e.to_string(),
                         "",
+                        &body_summary,
                         attempt,
+                        Some("network"),
                         next_req_id(),
+                        &client_req_id,
                         Some("network"),
                     );
                     self.key_pool.mark_bad(&k, None).await;
@@ -483,7 +533,7 @@ impl Proxy {
                             if !got_token {
                                 next.dec_in_flight();
                                 self.metrics.inc_key_switch_token_starvation();
-                                warn!("Token starved on retry key after network error");
+                                warn!(client_req_id = %client_req_id, attempt = attempt, "Token starved on retry key after network error");
                                 self.metrics.inc_error();
                                 return Err(warp::reject::custom(BadGateway {
                                     msg: "Upstream request failed".into(),
@@ -493,7 +543,11 @@ impl Proxy {
                             if will_retry_again {
                                 self.backoff_sleep(attempt).await;
                             }
-                            warn!(attempt, "Retrying upstream send with a different key");
+                            warn!(
+                                client_req_id = %client_req_id,
+                                attempt = attempt,
+                                "Retrying upstream send with a different key"
+                            );
                             continue;
                         }
                     }
@@ -519,8 +573,11 @@ impl Proxy {
                             self.request_timeout_secs
                         ),
                         "",
+                        &body_summary,
                         attempt,
+                        Some("timeout"),
                         next_req_id(),
+                        &client_req_id,
                         Some("timeout"),
                     );
                     if attempt < self.retry_config.max_retries {
@@ -534,7 +591,7 @@ impl Proxy {
                             if !got_token {
                                 next.dec_in_flight();
                                 self.metrics.inc_key_switch_token_starvation();
-                                warn!("Token starved on retry key after timeout");
+                                warn!(client_req_id = %client_req_id, attempt = attempt, "Token starved on retry key after timeout");
                                 self.metrics.inc_error();
                                 return Err(warp::reject::custom(BadGateway {
                                     msg: "Upstream request timed out".into(),
@@ -545,7 +602,8 @@ impl Proxy {
                                 self.backoff_sleep(attempt).await;
                             }
                             warn!(
-                                attempt,
+                                client_req_id = %client_req_id,
+                                attempt = attempt,
                                 "Retrying after upstream timeout with a different key"
                             );
                             continue;
@@ -570,8 +628,11 @@ impl Proxy {
                         "body_read_error",
                         &e.to_string(),
                         "",
+                        &body_summary,
                         attempt,
+                        Some("body_read"),
                         next_req_id(),
+                        &client_req_id,
                         Some("body_read"),
                     );
                     key_handle.dec_in_flight();
@@ -613,22 +674,43 @@ impl Proxy {
         request_body: &bytes::Bytes,
         is_streaming: bool,
         model: &str,
+        body_summary: &str,
+        client_req_id: &str,
         is_last_attempt: bool,
         attempt: u32,
     ) -> Result<AttemptResponse, AttemptError> {
         let key_str = key_handle.key().await;
+        let key_hash = {
+            let addr = key_handle as *const crate::key_pool::KeyStateHandle as usize;
+            addr as u64
+        };
+        info!(
+            client_req_id = %client_req_id,
+            attempt = attempt,
+            key = %mask_key(&key_str),
+            key_hash = key_hash,
+            body_summary = %body_summary,
+            "upstream attempt start"
+        );
         let req_builder = self.build_upstream_request(url, method, headers, request_body, &key_str);
         let resp = req_builder.send().await.map_err(AttemptError::Network)?;
 
         let status = resp.status();
-        info!(status = %status, url = %url, "Upstream response");
-
         let content_type = resp
             .headers()
             .get(req_header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
+        info!(
+            client_req_id = %client_req_id,
+            attempt = attempt,
+            status = %status,
+            content_type = %content_type,
+            url = %url,
+            "Upstream response"
+        );
+
         let is_sse = content_type.contains("text/event-stream");
 
         // Clone headers before consuming the body
@@ -811,8 +893,11 @@ impl Proxy {
                 category,
                 &detail,
                 &body_excerpt,
+                body_summary,
                 attempt,
+                None,
                 next_req_id(),
+                client_req_id,
                 None,
             );
         }

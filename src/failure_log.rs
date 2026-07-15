@@ -8,8 +8,9 @@
 //! this is a separate, failure-only channel.
 //!
 //! Fields kept stable across versions:
-//!   ts, req_id, endpoint, method, model, key, status, category,
-//!   detail, body_excerpt, upstream_url, retry_attempt, error_kind
+//!   ts, req_id, client_req_id, endpoint, method, model, key, status,
+//!   category, detail, body_excerpt, body_summary, upstream_url,
+//!   retry_attempt, retry_reason, error_kind
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -66,8 +67,11 @@ pub fn write_failure(
     category: &str,
     detail: &str,
     body_excerpt: &str,
+    body_summary: &str,
     retry_attempt: u32,
+    retry_reason: Option<&str>,
     req_counter: u64,
+    client_req_id: &str,
     error_kind: Option<&str>,
 ) {
     // Test/CI opt-out: when `FAILURE_LOG_DISABLE` is set (any value), writes
@@ -91,6 +95,7 @@ pub fn write_failure(
         "ts": ts,
         "error_time": error_time,
         "req_id": gen_req_id(req_counter),
+        "client_req_id": client_req_id,
         "method": method,
         "endpoint": endpoint,
         "upstream_url": upstream_url,
@@ -103,6 +108,12 @@ pub fn write_failure(
     });
     if !body_excerpt.is_empty() {
         entry["body_excerpt"] = Value::String(body_excerpt.to_string());
+    }
+    if !body_summary.is_empty() {
+        entry["body_summary"] = Value::String(body_summary.to_string());
+    }
+    if let Some(k) = retry_reason {
+        entry["retry_reason"] = Value::String(k.to_string());
     }
     if let Some(k) = error_kind {
         entry["error_kind"] = Value::String(k.to_string());
