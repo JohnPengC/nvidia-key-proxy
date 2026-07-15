@@ -45,7 +45,7 @@ pub enum KeyState {
 pub struct InnerKeyState {
     pub key: Arc<String>,
     pub state: KeyState,
-    pub weight: u32, // used for weighted random selection
+    pub weight: u32, // penalty multiplier for score-based selection
     pub fail_count: u32,
     pub last_success: Option<Instant>,
     pub bucket: TokenBucket,
@@ -55,6 +55,10 @@ pub struct InnerKeyState {
 #[derive(Debug, Clone)]
 pub struct KeyStateHandle {
     pub(crate) inner: Arc<RwLock<InnerKeyState>>,
+    /// How many requests currently hold this key (acquired but not yet
+    /// returned / released). Kept outside `inner` so we can update it
+    /// synchronously without ever locking the async RwLock.
+    pub(crate) in_flight: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl KeyStateHandle {
@@ -118,16 +122,38 @@ impl KeyStateHandle {
         guard.last_success = Some(Instant::now());
     }
 
-    /// Consume one token from the key's bucket; waits until a token is available.
-    ///
-    /// The bucket lives inside `InnerKeyState` and is accessed through its own
-    /// internal `tokio::Mutex`. We hold the outer read lock for the duration of
-    /// the await — this is safe because no other path takes the outer read
-    /// lock and then writes the *bucket*, and the bucket's own Mutex serializes
-    /// access. The outer RwLock is never poisoned by tokio.
-    pub async fn consume_token(&self) {
+    // ── in-flight tracking ──────────────────────────────────────────
+
+    pub fn inc_in_flight(&self) {
+        self.in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    pub fn dec_in_flight(&self) {
+        self.in_flight
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    pub fn in_flight(&self) -> u32 {
+        self.in_flight.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Try to consume one token from the key's bucket with a deadline.
+    /// Returns `true` when the token was consumed before the deadline,
+    /// `false` when the deadline elapsed without success. The caller should
+    /// drop this key handle and acquire a different one on `false`.
+    pub async fn try_consume_token(&self, timeout_ms: u64) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
         let guard = self.inner.read().await;
-        let _ = guard.bucket.consume(1.0).await;
+        guard
+            .bucket
+            .consume_with_timeout(1.0, deadline)
+            .await
+            .is_ok()
+    }
+
+    /// Available tokens in this key's bucket (for score calculation).
+    pub async fn available_tokens(&self) -> f64 {
+        let guard = self.inner.read().await;
+        guard.bucket.available_tokens().await
     }
 }
 
@@ -141,6 +167,13 @@ pub struct TokenBucket {
     last_refill: Mutex<Instant>,
 }
 
+/// Outcome of a non-blocking consume attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsumeError {
+    /// Bucket has fewer tokens than requested right now.
+    NotEnough,
+}
+
 impl TokenBucket {
     pub fn new(capacity: u32, refill_per_sec: f64) -> Self {
         let cap = capacity as f64;
@@ -152,7 +185,108 @@ impl TokenBucket {
         }
     }
 
+    /// Refill the bucket proportionally to elapsed time. Must be called with
+    /// both mutexes held.
+    fn refill_locked(&self, toks: &mut f64, last: &mut Instant) {
+        let now = Instant::now();
+        let elapsed = now.duration_since(*last).as_secs_f64();
+        if elapsed > 0.0 && self.refill_per_sec > 0.0 {
+            *toks = (*toks + elapsed * self.refill_per_sec).min(self.capacity);
+            *last = now;
+        }
+    }
+
+    /// Non-blocking snapshot of the current available tokens (after a refill
+    /// pass). Returns `capacity` if the refill rate is zero (bucket stays full).
+    pub async fn available_tokens(&self) -> f64 {
+        if self.refill_per_sec <= 0.0 {
+            return self.capacity;
+        }
+        let mut toks = self.tokens.lock().await;
+        let mut last = self.last_refill.lock().await;
+        self.refill_locked(&mut toks, &mut last);
+        *toks
+    }
+
+    /// Try to consume `tokens` **without blocking**. Returns `Ok(())` if the
+    /// bucket had enough tokens (they are deducted atomically with the refill
+    /// pass). Returns `Err(NotEnough)` otherwise — caller should either wait
+    /// or switch to another key.
+    pub async fn try_consume(&self, tokens: f64) -> Result<(), ConsumeError> {
+        if tokens <= 0.0 {
+            return Ok(());
+        }
+        if self.refill_per_sec <= 0.0 {
+            // No refill — permanent bucket; consume from the initial capacity.
+        }
+        let mut toks = self.tokens.lock().await;
+        let mut last = self.last_refill.lock().await;
+        self.refill_locked(&mut toks, &mut last);
+        if *toks >= tokens {
+            *toks -= tokens;
+            return Ok(());
+        }
+        Err(ConsumeError::NotEnough)
+    }
+
+    /// Consume `tokens`, waiting at most until `deadline`. Returns `Ok(())`
+    /// on success, `Err(ConsumeError::NotEnough)` if the deadline elapsed
+    /// before enough tokens accumulated.
+    pub async fn consume_with_timeout(
+        &self,
+        tokens: f64,
+        deadline: Instant,
+    ) -> Result<(), ConsumeError> {
+        if tokens <= 0.0 {
+            return Ok(());
+        }
+        if self.refill_per_sec <= 0.0 {
+            // No refill: try once and bail.
+            return self.try_consume(tokens).await;
+        }
+        loop {
+            // Fast path: refill + check.
+            {
+                let mut toks = self.tokens.lock().await;
+                let mut last = self.last_refill.lock().await;
+                self.refill_locked(&mut toks, &mut last);
+                if *toks >= tokens {
+                    *toks -= tokens;
+                    return Ok(());
+                }
+                let need = tokens - *toks;
+                drop((toks, last));
+                // How long until we'd have enough if nobody else consumes?
+                let wait_secs = need / self.refill_per_sec;
+                let now = Instant::now();
+                let target = now + Duration::from_secs_f64(wait_secs);
+                if target > deadline {
+                    // Would exceed the deadline — don't bother sleeping the
+                    // full interval; sleep until deadline then do a final
+                    // check (another consumer may have left tokens).
+                    if deadline > now {
+                        tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+                    }
+                    // Final attempt.
+                    let mut toks = self.tokens.lock().await;
+                    let mut last = self.last_refill.lock().await;
+                    self.refill_locked(&mut toks, &mut last);
+                    if *toks >= tokens {
+                        *toks -= tokens;
+                        return Ok(());
+                    }
+                    return Err(ConsumeError::NotEnough);
+                }
+                // Sleep until we expect enough, then loop to re-check under lock.
+                tokio::time::sleep_until(tokio::time::Instant::from_std(target)).await;
+            }
+        }
+    }
+
     /// Attempt to consume `tokens` tokens, waiting until enough are available.
+    /// Retained for backwards compatibility with tests; production code should
+    /// prefer `try_consume` / `consume_with_timeout` to avoid unbounded waits.
+    #[deprecated = "使用 try_consume 或 consume_with_timeout 以支持超时换 key"]
     pub async fn consume(&self, tokens: f64) -> Result<(), ()> {
         if tokens <= 0.0 {
             return Ok(());
@@ -235,6 +369,7 @@ impl KeyPool {
                     last_success: None,
                     bucket,
                 })),
+                in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             };
             inner.insert(key_str.clone(), handle);
         }
@@ -246,45 +381,68 @@ impl KeyPool {
         }
     }
 
-    /// Returns a handle to a randomly selected active key based on weight.
-    /// Returns None if no active keys.
+    /// Acquires the best key via a score-based selection. After acquiring,
+    /// the caller **must** call `handle.dec_in_flight()` when the request
+    /// is complete (success or failure).
+    ///
+    /// The score favours keys with more available tokens and fewer in-flight
+    /// requests. Multi-key ties are broken randomly. Keys with `weight` < 1
+    /// (penalised via `mark_failure`) see a proportional score penalty.
+    ///
+    /// Returns `None` when no active key exists.
     pub async fn acquire(&self) -> Option<KeyStateHandle> {
-        // Snapshot the handles first so we don't hold the outer map lock across
-        // multiple inner-lock awaits. Staleness is acceptable for load-balancing.
         let handles: Vec<KeyStateHandle> = {
             let read_guard = self.inner.read().await;
             read_guard.values().cloned().collect()
         };
 
-        let mut active: Vec<(KeyStateHandle, u32)> = Vec::new();
+        // ── Collect active keys with computed scores ────────────────────
+        struct Candidate {
+            handle: KeyStateHandle,
+            score: f64,
+        }
+        const IN_FLIGHT_PENALTY: f64 = 0.15;
+        let mut candidates: Vec<Candidate> = Vec::new();
         for handle in handles {
             let guard = handle.inner.read().await;
             let is_active = matches!(guard.state, KeyState::Active);
-            let w = guard.weight;
+            if !is_active {
+                continue;
+            }
+            // Compute score inside the read guard to minimise lock contention.
+            let available = guard.bucket.available_tokens().await;
+            let capacity = guard.bucket.capacity;
+            let in_flight = handle.in_flight.load(std::sync::atomic::Ordering::Relaxed) as f64;
+            let w = guard.weight as f64;
             drop(guard);
-            if is_active && w > 0 {
-                active.push((handle, w));
-            }
+
+            let token_ratio = if capacity > 0.0 {
+                available / capacity
+            } else {
+                0.0
+            };
+            let score = token_ratio - in_flight * IN_FLIGHT_PENALTY * (1.0 / w.max(1.0));
+            candidates.push(Candidate { handle, score });
         }
-        if active.is_empty() {
-            None
+        if candidates.is_empty() {
+            return None;
+        }
+
+        // ── Top-1 with random tie-break ─────────────────────────────────
+        candidates.sort_by(|a, b| b.score.total_cmp(&a.score));
+        let best_score = candidates[0].score;
+        let top_n = candidates
+            .iter()
+            .take_while(|c| c.score == best_score)
+            .count();
+        let idx = if top_n > 1 {
+            fastrand::usize(..top_n)
         } else {
-            // Weighted random selection
-            let total_weight: u32 = active.iter().map(|(_, w)| w).sum();
-            if total_weight == 0 {
-                return active.first().map(|(h, _)| h.clone());
-            }
-            let mut rand_val: u32 = fastrand::u32(..total_weight);
-            let mut result: Option<KeyStateHandle> = None;
-            for (handle, weight) in &active {
-                if rand_val < *weight {
-                    result = Some(handle.clone());
-                    break;
-                }
-                rand_val -= *weight;
-            }
-            result.or_else(|| active.first().map(|(h, _)| h.clone()))
-        }
+            0
+        };
+        let chosen = &candidates[idx].handle;
+        chosen.inc_in_flight();
+        Some(chosen.clone())
     }
 
     /// Get all keys currently in Cooling state (for bad key recovery).
@@ -530,6 +688,7 @@ mod retry_state_machine_tests {
             rate_limiter: RateLimiterConfig {
                 qps_per_key: 100.0,
                 burst: 100,
+                token_wait_ms: 0,
             },
             cooldown: CooldownConfig {
                 base_seconds: 1,
@@ -654,5 +813,147 @@ mod mask_key_tests {
         let key = "ключ-для-теста-12345";
         let masked = mask_key(key);
         assert!(masked.contains("***"), "masked={}", masked);
+    }
+}
+
+#[cfg(test)]
+mod score_selection_tests {
+    use super::*;
+    use crate::config::{
+        CooldownConfig, HealthCheckConfig, ObservabilityConfig, RateLimiterConfig,
+    };
+
+    fn build_pool_with_keys(keys: &[&str], qps: f64, burst: u64) -> KeyPool {
+        let cfg = Config {
+            listen_addr: "0.0.0.0:8888".to_string(),
+            base_url: "https://example.test".to_string(),
+            keys: keys.iter().map(|s| s.to_string()).collect(),
+            rate_limiter: RateLimiterConfig {
+                qps_per_key: qps,
+                burst,
+                token_wait_ms: 0,
+            },
+            cooldown: CooldownConfig {
+                base_seconds: 1,
+                max_seconds: 2,
+            },
+            health_check: HealthCheckConfig {
+                interval_seconds: 1,
+                timeout_seconds: 1,
+                max_consecutive_failures: 3,
+            },
+            observability: ObservabilityConfig {
+                enable_metrics: false,
+                metrics_path: "/metrics".to_string(),
+                log_level: "info".to_string(),
+            },
+            request_timeout_seconds: 0,
+            retry: crate::config::RetryConfig::default(),
+        };
+        let metrics = Arc::new(Metrics::new());
+        KeyPool::new(&cfg, metrics)
+    }
+
+    #[tokio::test]
+    async fn acquire_returns_some_when_active_key_exists() {
+        let pool = build_pool_with_keys(&["k1"], 100.0, 100);
+        let h = pool.acquire().await;
+        assert!(h.is_some(), "active key must be acquired");
+        if let Some(h) = h {
+            h.dec_in_flight();
+        }
+    }
+
+    #[tokio::test]
+    async fn acquire_returns_none_when_all_keys_disabled() {
+        let pool = build_pool_with_keys(&["k1"], 100.0, 100);
+        pool.mark_failure("k1", 1).await; // single failure with threshold 1 → disable
+        let h = pool.acquire().await;
+        assert!(h.is_none(), "no active key should yield None");
+    }
+
+    #[tokio::test]
+    async fn acquire_increments_in_flight_and_release_decrements() {
+        let pool = build_pool_with_keys(&["k1"], 100.0, 100);
+        let handle = pool.acquire().await.expect("key acquired");
+        let handle_ref = &handle;
+        let pool_ref = &pool;
+        let h_inner = pool_ref.inner.read().await.get("k1").cloned().unwrap();
+        assert_eq!(h_inner.in_flight(), 1, "acquire must inc in_flight");
+        handle_ref.dec_in_flight();
+        assert_eq!(h_inner.in_flight(), 0, "dec_in_flight must restore");
+    }
+
+    #[tokio::test]
+    async fn try_consume_token_succeeds_on_full_bucket() {
+        let pool = build_pool_with_keys(&["k1"], 100.0, 10);
+        let handle = pool.acquire().await.expect("key acquired");
+        // bucket starts full (burst=10), one consume must succeed immediately.
+        let got = handle.try_consume_token(50).await;
+        assert!(got, "token must be consumed from a full bucket");
+        handle.dec_in_flight();
+    }
+
+    #[tokio::test]
+    async fn try_consume_token_times_out_when_bucket_empty_and_zero_qps() {
+        // qps=0 means no refill — after draining, no token can arrive.
+        let pool = build_pool_with_keys(&["k1"], 0.0, 1);
+        let handle = pool.acquire().await.expect("key acquired");
+        // Drain the one token.
+        assert!(handle.try_consume_token(0).await, "first consume ok");
+        // Second consume with short timeout must return false (no refill).
+        let got = handle.try_consume_token(10).await;
+        assert!(!got, "must time out when bucket stays empty");
+        handle.dec_in_flight();
+    }
+
+    /// Score-based selection: a key with a fuller bucket must be picked over
+    /// one whose bucket has been drained. We verify by draining k2 first,
+    /// then calling `acquire` repeatedly and asserting k1 is chosen.
+    #[tokio::test]
+    async fn acquire_prefers_key_with_more_tokens() {
+        let pool = build_pool_with_keys(&["k1", "k2"], 0.0, 10);
+        // Drain k2 to zero so its score is strictly lower than k1's.
+        let h2 = pool
+            .inner
+            .read()
+            .await
+            .get("k2")
+            .cloned()
+            .expect("k2 exists");
+        for _ in 0..10 {
+            // Directly consume tokens without going through inc_in_flight.
+            let got = h2.try_consume_token(0).await;
+            assert!(got, "drain k2");
+        }
+        // Now k2 has 0 tokens, k1 has 10. acquire must pick k1.
+        let h = pool.acquire().await.expect("active key exists");
+        let k = h.key().await;
+        assert_eq!(
+            k, "k1",
+            "score-based selection must prefer k1 (fuller bucket)"
+        );
+        h.dec_in_flight();
+    }
+
+    /// `mark_bad` must transition a key from Active to Cooling, so subsequent
+    /// `acquire()` skips it. This mirrors the 403 "Authorization failed"
+    /// cooldown path implemented in `process_upstream_attempt`.
+    #[tokio::test]
+    async fn mark_bad_puts_key_into_cooling() {
+        let pool = build_pool_with_keys(&["k1"], 100.0, 10);
+        pool.mark_bad("k1", None).await;
+
+        let h = pool.inner.read().await.get("k1").cloned().unwrap();
+        let g = h.inner.read().await;
+        assert!(
+            matches!(g.state, KeyState::Cooling { .. }),
+            "mark_bad must put key into Cooling state"
+        );
+        drop(g);
+
+        // With only one key now in Cooling, acquire must return None.
+        let acquire = pool.acquire().await;
+        assert!(acquire.is_none(), "Cooling key must not be acquireable");
     }
 }

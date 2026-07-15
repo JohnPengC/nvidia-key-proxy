@@ -49,6 +49,7 @@ impl AppState {
             metrics.clone(),
             request_timeout,
             retry_config,
+            config.rate_limiter.token_wait_ms,
         );
         let health_checker = Arc::new(HealthChecker::new(
             key_pool.clone(),
@@ -87,13 +88,24 @@ pub fn init_tracing(config: &Config) {
 }
 
 /// Build all warp routes using the shared `AppState`.
-pub fn build_routes(state: &AppState) -> impl Filter<Extract = impl Reply, Error = Rejection> + Clone {
+pub fn build_routes(
+    state: &AppState,
+) -> impl Filter<Extract = impl Reply, Error = Rejection> + Clone {
     let health_route = warp::path!("health")
         .and(warp::get())
         .map(|| warp::http::Response::builder().status(204).body(""));
 
     let proxy_route = warp::path::full()
-        .map(|p: warp::path::FullPath| p.as_str().to_string())
+        .and_then(|p: warp::path::FullPath| {
+            let path = p.as_str().to_string();
+            async move {
+                if path.starts_with("/v1/") || path == "/v1" {
+                    Ok(path)
+                } else {
+                    Err(warp::reject::not_found())
+                }
+            }
+        })
         .and(warp::method())
         .and(warp::header::headers_cloned())
         .and(warp::body::bytes())
@@ -102,7 +114,11 @@ pub fn build_routes(state: &AppState) -> impl Filter<Extract = impl Reply, Error
             let proxy = state.proxy.clone();
             move |path: String, method, headers, body, remote| {
                 let proxy = proxy.clone();
-                async move { proxy.handle_request(path, method, headers, body, remote).await }
+                async move {
+                    proxy
+                        .handle_request(path, method, headers, body, remote)
+                        .await
+                }
             }
         });
 

@@ -53,15 +53,9 @@ fn gen_req_id(counter: u64) -> String {
 /// Internal entry point. `category` is a short string tag the caller picks
 /// from the set below; everything else is derived from the call site.
 ///
-/// Categories (kept stable):
-///   upstream_4xx         — upstream returned 4xx (404/403/401/400/…)
-///   upstream_5xx         — upstream returned 5xx
-///   upstream_other       — upstream returned an unexpected non-2xx status
-///   network_error        — reqwest send failed (DNS / connect / TLS / …)
-///   timeout              — upstream request exceeded request_timeout_secs
-///   body_read_error      — resp.bytes() failed mid-response
-///   bad_request          — client sent a body we couldn't translate
-///   bad_gateway_internal — we couldn't build a response / internal panic
+/// Kept as positional arguments on purpose: each call site already has all
+/// fields in scope and a struct would just move the parameter list elsewhere.
+#[allow(clippy::too_many_arguments)]
 pub fn write_failure(
     method: &str,
     endpoint: &str,
@@ -76,6 +70,12 @@ pub fn write_failure(
     req_counter: u64,
     error_kind: Option<&str>,
 ) {
+    // Test/CI opt-out: when `FAILURE_LOG_DISABLE` is set (any value), writes
+    // are skipped so integration tests don't pollute the on-disk failure.log
+    // used for production diagnosis. Production leaves this unset.
+    if std::env::var("FAILURE_LOG_DISABLE").is_ok() {
+        return;
+    }
     ensure_open();
     let mut guard = FAILURE_FILE.lock().unwrap();
     let file = match guard.as_mut() {

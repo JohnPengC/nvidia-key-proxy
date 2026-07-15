@@ -35,6 +35,9 @@ pub struct Proxy {
     request_timeout_secs: u64,
     /// Retry/upstream-error policy (exponential backoff + key-disable threshold).
     retry_config: crate::config::RetryConfig,
+    /// Max milliseconds to wait on a single key's token bucket before
+    /// switching to another key. 0 disables the timeout entirely.
+    token_wait_ms: u64,
 }
 
 /// Outcome of a single upstream attempt. `Retry` is used only for 401 without
@@ -62,6 +65,7 @@ impl Proxy {
         metrics: Arc<Metrics>,
         request_timeout_secs: u64,
         retry_config: crate::config::RetryConfig,
+        token_wait_ms: u64,
     ) -> Self {
         let client = reqwest::Client::builder()
             .pool_idle_timeout(Duration::from_secs(90))
@@ -82,6 +86,7 @@ impl Proxy {
             client,
             request_timeout_secs,
             retry_config,
+            token_wait_ms,
         }
     }
 
@@ -138,19 +143,76 @@ impl Proxy {
         let start = std::time::Instant::now();
         self.metrics.inc_request();
 
-        // Acquire a key
-        let mut key_handle = match self.key_pool.acquire().await {
+        // ── Acquire a key with token-starvation switch loop ─────────────
+        let max_switches = self.retry_config.max_retries as usize;
+        let token_timeout = self.token_wait_ms;
+        let mut tried_key_hashes: Vec<u64> = Vec::new();
+        let mut key_handle: Option<crate::key_pool::KeyStateHandle> = None;
+        let mut switch_count: u32 = 0;
+
+        for _attempt in 0..=max_switches {
+            // Acquire (score-based top-1)
+            let candidate = match self.key_pool.acquire().await {
+                Some(k) => k,
+                None => {
+                    // Release any previously held key's in_flight before
+                    // returning SERVICE_UNAVAILABLE.
+                    if let Some(prev) = key_handle.take() {
+                        prev.dec_in_flight();
+                    }
+                    self.metrics.inc_error();
+                    return Err(warp::reject::custom(ServiceUnavailable {
+                        msg: "No available API keys".into(),
+                    }));
+                }
+            };
+
+            // Avoid re-trying the same key (identified by pointer hash).
+            let key_hash = {
+                let addr = &candidate as *const crate::key_pool::KeyStateHandle as usize;
+                addr as u64
+            };
+            if tried_key_hashes.contains(&key_hash) {
+                // This key was already tried; release it and loop for next.
+                candidate.dec_in_flight();
+                continue;
+            }
+            tried_key_hashes.push(key_hash);
+
+            // Drop any previous handle before taking the new one.
+            if let Some(prev) = key_handle.take() {
+                prev.dec_in_flight();
+            }
+
+            // Try to consume a token with deadline.
+            let got_token = candidate.try_consume_token(token_timeout).await;
+            if !got_token {
+                // Token starved — switch to another key.
+                candidate.dec_in_flight();
+                self.metrics.inc_key_switch_token_starvation();
+                switch_count += 1;
+                if switch_count <= max_switches as u32 {
+                    tracing::warn!(
+                        switch = switch_count,
+                        "Token starved on current key; switching to another"
+                    );
+                }
+                continue; // loop to try next key
+            }
+
+            key_handle = Some(candidate);
+            break;
+        }
+
+        let mut key_handle = match key_handle {
             Some(k) => k,
             None => {
                 self.metrics.inc_error();
                 return Err(warp::reject::custom(ServiceUnavailable {
-                    msg: "No available API keys".into(),
+                    msg: "No available API keys (all tried keys were token-starved)".into(),
                 }));
             }
         };
-
-        // Consume a token (rate limit)
-        key_handle.consume_token().await;
 
         // Parse the body once for validation and metadata extraction.
         let parsed_body: Option<serde_json::Value> = serde_json::from_slice(&body).ok();
@@ -168,6 +230,7 @@ impl Proxy {
                 if !is_valid {
                     warn!("Invalid max_tokens value: {}", max_val);
                     self.metrics.inc_error();
+                    key_handle.dec_in_flight();
                     return Err(warp::reject::custom(BadRequest {
                         msg: "Invalid max_tokens (must be >= 1)".into(),
                     }));
@@ -251,6 +314,7 @@ impl Proxy {
 
             match result {
                 Ok(AttemptResponse::Done(resp)) => {
+                    key_handle.dec_in_flight();
                     self.metrics.observe_latency(start.elapsed().as_secs_f64());
                     return Ok(resp);
                 }
@@ -260,8 +324,20 @@ impl Proxy {
                         if let Some(next) = self.key_pool.acquire().await {
                             let will_retry_again = attempt + 1 < self.retry_config.max_retries;
                             self.metrics.inc_retry_attempt_failure();
-                            key_handle = next;
-                            key_handle.consume_token().await;
+                            // Release the current handle before switching.
+                            key_handle.dec_in_flight();
+                            let got_backup = next.try_consume_token(self.token_wait_ms).await;
+                            key_handle = next.clone();
+                            let got_token = got_backup;
+                            if !got_token {
+                                next.dec_in_flight();
+                                self.metrics.inc_key_switch_token_starvation();
+                                warn!("Token starved on retry key; giving up");
+                                self.metrics.inc_error();
+                                return Err(warp::reject::custom(BadGateway {
+                                    msg: "Upstream 401".into(),
+                                }));
+                            }
                             attempt += 1;
                             if will_retry_again {
                                 self.backoff_sleep(attempt).await;
@@ -272,6 +348,7 @@ impl Proxy {
                         warn!("No other keys available; passing 401 through");
                     }
                     // Defensive fallback (helper should have returned Done on last attempt).
+                    key_handle.dec_in_flight();
                     self.metrics.inc_error();
                     return Err(warp::reject::custom(BadGateway {
                         msg: "Upstream 401".into(),
@@ -302,8 +379,19 @@ impl Proxy {
                         if let Some(next) = self.key_pool.acquire().await {
                             let will_retry_again = attempt + 1 < self.retry_config.max_retries;
                             self.metrics.inc_retry_attempt_failure();
-                            key_handle = next;
-                            key_handle.consume_token().await;
+                            key_handle.dec_in_flight();
+                            let got_backup = next.try_consume_token(self.token_wait_ms).await;
+                            key_handle = next.clone();
+                            let got_token = got_backup;
+                            if !got_token {
+                                next.dec_in_flight();
+                                self.metrics.inc_key_switch_token_starvation();
+                                warn!("Token starved on retry key after network error");
+                                self.metrics.inc_error();
+                                return Err(warp::reject::custom(BadGateway {
+                                    msg: "Upstream request failed".into(),
+                                }));
+                            }
                             attempt += 1;
                             if will_retry_again {
                                 self.backoff_sleep(attempt).await;
@@ -312,6 +400,7 @@ impl Proxy {
                             continue;
                         }
                     }
+                    key_handle.dec_in_flight();
                     self.metrics.inc_error();
                     return Err(warp::reject::custom(BadGateway {
                         msg: "Upstream request failed".into(),
@@ -341,8 +430,19 @@ impl Proxy {
                         if let Some(next) = self.key_pool.acquire().await {
                             let will_retry_again = attempt + 1 < self.retry_config.max_retries;
                             self.metrics.inc_retry_attempt_failure();
-                            key_handle = next;
-                            key_handle.consume_token().await;
+                            key_handle.dec_in_flight();
+                            let got_backup = next.try_consume_token(self.token_wait_ms).await;
+                            key_handle = next.clone();
+                            let got_token = got_backup;
+                            if !got_token {
+                                next.dec_in_flight();
+                                self.metrics.inc_key_switch_token_starvation();
+                                warn!("Token starved on retry key after timeout");
+                                self.metrics.inc_error();
+                                return Err(warp::reject::custom(BadGateway {
+                                    msg: "Upstream request timed out".into(),
+                                }));
+                            }
                             attempt += 1;
                             if will_retry_again {
                                 self.backoff_sleep(attempt).await;
@@ -354,6 +454,7 @@ impl Proxy {
                             continue;
                         }
                     }
+                    key_handle.dec_in_flight();
                     self.metrics.inc_error();
                     return Err(warp::reject::custom(BadGateway {
                         msg: "Upstream request timed out".into(),
@@ -376,11 +477,15 @@ impl Proxy {
                         next_req_id(),
                         Some("body_read"),
                     );
+                    key_handle.dec_in_flight();
                     return Err(warp::reject::custom(BadGateway {
                         msg: "Failed to read response body".into(),
                     }));
                 }
-                Err(AttemptError::Fatal(r)) => return Err(r),
+                Err(AttemptError::Fatal(r)) => {
+                    key_handle.dec_in_flight();
+                    return Err(r);
+                }
             }
         }
     }
@@ -429,17 +534,44 @@ impl Proxy {
             .to_string();
         let is_sse = content_type.contains("text/event-stream");
 
+        // Clone headers before consuming the body
+        let resp_headers: Vec<(String, Vec<u8>)> = resp
+            .headers()
+            .iter()
+            .map(|(k, v)| (k.as_str().to_string(), v.as_bytes().to_vec()))
+            .collect();
+
+        // Passthrough streaming: when the client asked for `stream` and
+        // upstream responded with SSE, forward the upstream stream
+        // verbatim without buffering.
+        if is_streaming && is_sse && status.is_success() {
+            let resp = self
+                .handle_passthrough_stream(resp, resp_headers, status)
+                .await
+                .map_err(AttemptError::Fatal)?;
+            return Ok(AttemptResponse::Done(resp));
+        }
+
+        // Buffer the body once. All non-SSE paths (success, 4xx, 5xx) use
+        // this owned `body_bytes` for classification, failure logging, and
+        // the final response body.
+        let body_bytes = resp.bytes().await.map_err(AttemptError::BodyRead)?;
+
+        // `resp.headers()` is no longer accessible after `resp.bytes()`
+        // consumed `resp`; resolve Retry-After from the cloned `resp_headers`
+        // snapshot once, here, for all 401/429/403 branches to reuse.
+        let retry_after: Option<u64> = resp_headers
+            .iter()
+            .find(|(k, _)| k == req_header::RETRY_AFTER.as_str())
+            .and_then(|(_, v)| std::str::from_utf8(v).ok())
+            .and_then(|s| s.parse::<u64>().ok());
+
         if status.is_success() {
             self.key_pool.mark_good(&key_str).await;
             self.metrics.inc_success();
         } else if status == reqwest::StatusCode::UNAUTHORIZED {
             // 401 is the only status we retry: it's the clearest
             // "this specific key is rejected" signal.
-            let retry_after = resp
-                .headers()
-                .get(req_header::RETRY_AFTER)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok());
             if let Some(ra) = retry_after {
                 warn!(
                     key = %mask_key(&key_str),
@@ -472,11 +604,6 @@ impl Proxy {
             // 429 and 403 are deterministic upstream decisions
             // (rate limit / forbidden). Honor Retry-After if present, else
             // surface the response as-is.
-            let retry_after = resp
-                .headers()
-                .get(req_header::RETRY_AFTER)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok());
             if let Some(ra) = retry_after {
                 warn!(
                     key = %mask_key(&key_str),
@@ -487,42 +614,39 @@ impl Proxy {
                 );
                 self.key_pool.mark_bad(&key_str, Some(ra)).await;
             } else {
-                warn!(
-                    key = %mask_key(&key_str),
-                    status = %status,
-                    "Upstream {} without Retry-After; decreasing weight, may disable after repeated failures",
-                    status.as_u16()
-                );
-                // Record failure and potentially disable the key after threshold.
-                self.key_pool
-                    .mark_failure(&key_str, self.retry_config.auth_fail_threshold)
-                    .await;
+                // 403 "Authorization failed" is an account/region-level ban,
+                // not a transient hiccup — cool the key immediately rather
+                // than waiting for `auth_fail_threshold` failures to accrue.
+                // 429 without Retry-After, and other 403 variants, still use
+                // `mark_failure` (decrease weight, disable after threshold).
+                let body_str = std::str::from_utf8(&body_bytes).unwrap_or("");
+                let is_auth_ban = status == reqwest::StatusCode::FORBIDDEN
+                    && body_str.contains("Authorization failed");
+                if is_auth_ban {
+                    warn!(
+                        key = %mask_key(&key_str),
+                        "Upstream 403 Authorization failed; immediate cooldown"
+                    );
+                    self.key_pool.mark_bad(&key_str, None).await;
+                    self.metrics.inc_key_403_auth_cooldown();
+                } else {
+                    warn!(
+                        key = %mask_key(&key_str),
+                        status = %status,
+                        "Upstream {} without Retry-After; decreasing weight, may disable after repeated failures",
+                        status.as_u16()
+                    );
+                    // Record failure and potentially disable the key after threshold.
+                    self.key_pool
+                        .mark_failure(&key_str, self.retry_config.auth_fail_threshold)
+                        .await;
+                }
             }
             self.metrics.inc_error();
         } else {
             // Other 4xx/5xx: surface as-is, no key penalty.
             self.metrics.inc_error();
         }
-
-        // Clone headers before consuming the body
-        let resp_headers: Vec<(String, Vec<u8>)> = resp
-            .headers()
-            .iter()
-            .map(|(k, v)| (k.as_str().to_string(), v.as_bytes().to_vec()))
-            .collect();
-
-        // Passthrough streaming: when the client asked for `stream` and
-        // upstream responded with SSE, forward the upstream stream
-        // verbatim without buffering.
-        if is_streaming && is_sse && status.is_success() {
-            let resp = self
-                .handle_passthrough_stream(resp, resp_headers, status)
-                .await
-                .map_err(AttemptError::Fatal)?;
-            return Ok(AttemptResponse::Done(resp));
-        }
-
-        let body_bytes = resp.bytes().await.map_err(AttemptError::BodyRead)?;
 
         // Token statistics (prompt/completion/total) for successful Chat Completion responses.
         if status.is_success() {
@@ -531,7 +655,9 @@ impl Proxy {
                     if let Some(prompt) = usage.get("prompt_tokens").and_then(|v| v.as_u64()) {
                         crate::metrics::token_input().inc_by(prompt as f64);
                     }
-                    if let Some(completion) = usage.get("completion_tokens").and_then(|v| v.as_u64()) {
+                    if let Some(completion) =
+                        usage.get("completion_tokens").and_then(|v| v.as_u64())
+                    {
                         crate::metrics::token_output().inc_by(completion as f64);
                     }
                     if let (Some(p), Some(c)) = (
@@ -543,7 +669,6 @@ impl Proxy {
                 }
             }
         }
-
 
         // ── Structured failure log (failure.log JSONL) ───────────────────
         // Single hook covering all non-2xx upstream outcomes. Key facts we
@@ -569,10 +694,7 @@ impl Proxy {
             // detail: include function_id / account_id when present so jq
             // queries can group by them without re-parsing the body.
             let detail = if !function_id.is_empty() || !account_id.is_empty() {
-                format!(
-                    "function_id={} account_id={}",
-                    function_id, account_id
-                )
+                format!("function_id={} account_id={}", function_id, account_id)
             } else {
                 String::new()
             };
@@ -601,15 +723,15 @@ impl Proxy {
         // For non-success responses, ensure error JSON fields have expected types.
         // NVIDIA may return {"error":{"code":403,...}} or {"code":403} where `code` is a number.
         // Some Go clients expect `code` as a string. Convert numeric codes to strings.
-        let final_body = if let Ok(mut json_val) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+        let final_body = if let Ok(mut json_val) =
+            serde_json::from_slice::<serde_json::Value>(&body_bytes)
+        {
             fn coerce_code(v: &mut serde_json::Value) {
                 match v {
                     serde_json::Value::Object(map) => {
                         if let Some(code) = map.get_mut("code") {
                             if code.is_i64() || code.is_u64() {
-                                let n = code
-                                    .as_i64()
-                                    .or_else(|| code.as_u64().map(|x| x as i64));
+                                let n = code.as_i64().or_else(|| code.as_u64().map(|x| x as i64));
                                 if let Some(n) = n {
                                     *code = serde_json::Value::String(n.to_string());
                                 } else if let Some(f) = code.as_f64() {
@@ -778,7 +900,18 @@ mod proxy_integration_tests {
     use crate::metrics::Metrics;
     use crate::proxy::Proxy;
 
+    // Process-global guard: set once so no integration test in this module
+    // writes to the on-disk failure.log used for production diagnosis.
+    static DISABLE_FAILURE_LOG: std::sync::Once = std::sync::Once::new();
+
     fn test_config(base_url: &str, max_retries: u32, request_timeout: u64) -> Config {
+        DISABLE_FAILURE_LOG.call_once(|| {
+            // SAFETY: tests in this module run in a single process; the env
+            // var is process-global and only guards failure-log writes.
+            unsafe {
+                std::env::set_var("FAILURE_LOG_DISABLE", "1");
+            }
+        });
         Config {
             listen_addr: "127.0.0.1:0".to_string(),
             base_url: base_url.to_string(),
@@ -786,6 +919,7 @@ mod proxy_integration_tests {
             rate_limiter: RateLimiterConfig {
                 qps_per_key: 1000.0,
                 burst: 1000,
+                token_wait_ms: 0,
             },
             cooldown: CooldownConfig {
                 base_seconds: 1,
@@ -820,6 +954,7 @@ mod proxy_integration_tests {
             metrics,
             config.request_timeout_seconds,
             config.retry.clone(),
+            config.rate_limiter.token_wait_ms,
         );
 
         let proxy_route = warp::path::full()

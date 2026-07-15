@@ -52,6 +52,15 @@ impl fmt::Debug for Config {
 pub struct RateLimiterConfig {
     pub qps_per_key: f64,
     pub burst: u64,
+    /// Maximum milliseconds to wait on a single key's token bucket before
+    /// switching to another key (default 200). 0 disables switching — the
+    /// existing unbounded-wait behaviour is preserved.
+    #[serde(default = "default_token_wait_ms")]
+    pub token_wait_ms: u64,
+}
+
+fn default_token_wait_ms() -> u64 {
+    200
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -142,6 +151,7 @@ impl Config {
             rate_limiter: RateLimiterConfig {
                 qps_per_key: 0.65,
                 burst: 8,
+                token_wait_ms: 0,
             },
             cooldown: CooldownConfig {
                 base_seconds: 60,
@@ -222,6 +232,11 @@ impl Config {
                 "rate_limiter_burst" => {
                     if let Ok(v) = value.parse::<u64>() {
                         config.rate_limiter.burst = v;
+                    }
+                }
+                "rate_limiter_token_wait_ms" => {
+                    if let Ok(v) = value.parse::<u64>() {
+                        config.rate_limiter.token_wait_ms = v;
                     }
                 }
                 "cooldown_base_seconds" => {

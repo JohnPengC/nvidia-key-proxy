@@ -41,7 +41,8 @@ pub fn token_input() -> &'static Counter {
         register_counter!(
             "proxy_tokens_input_total",
             "累计输入 token 数 (prompt_tokens)"
-        ).unwrap()
+        )
+        .unwrap()
     })
 }
 
@@ -51,17 +52,15 @@ pub fn token_output() -> &'static Counter {
         register_counter!(
             "proxy_tokens_output_total",
             "累计输出 token 数 (completion_tokens)"
-        ).unwrap()
+        )
+        .unwrap()
     })
 }
 
 pub fn token_total() -> &'static Counter {
     static TOKEN_TOTAL: OnceLock<Counter> = OnceLock::new();
     TOKEN_TOTAL.get_or_init(|| {
-        register_counter!(
-            "proxy_tokens_total",
-            "累计 token 数 (prompt + completion)"
-        ).unwrap()
+        register_counter!("proxy_tokens_total", "累计 token 数 (prompt + completion)").unwrap()
     })
 }
 
@@ -121,9 +120,39 @@ fn key_disabled() -> &'static Gauge {
     })
 }
 
+// ── New metrics for token-starvation switch and 403 immediate cooldown ──
+
+pub fn key_switch_token_starvation() -> &'static Counter {
+    static KSW: OnceLock<Counter> = OnceLock::new();
+    KSW.get_or_init(|| {
+        register_counter!(
+            "proxy_key_switch_token_starvation_total",
+            "Number of times a request switched to another key because the first key's token bucket was empty"
+        )
+        .unwrap()
+    })
+}
+
+pub fn key_403_auth_cooldown() -> &'static Counter {
+    static K403: OnceLock<Counter> = OnceLock::new();
+    K403.get_or_init(|| {
+        register_counter!(
+            "proxy_key_403_auth_cooldown_total",
+            "Number of times a 403 Authorization failed triggered immediate key cooldown"
+        )
+        .unwrap()
+    })
+}
+
 #[derive(Clone)]
 pub struct Metrics {
     _private: (),
+}
+
+impl Default for Metrics {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Metrics {
@@ -149,6 +178,14 @@ impl Metrics {
 
     pub fn observe_latency(&self, seconds: f64) {
         request_latency().observe(seconds);
+    }
+
+    pub fn inc_key_switch_token_starvation(&self) {
+        key_switch_token_starvation().inc();
+    }
+
+    pub fn inc_key_403_auth_cooldown(&self) {
+        key_403_auth_cooldown().inc();
     }
 
     /// Expose metrics in Prometheus text format.
