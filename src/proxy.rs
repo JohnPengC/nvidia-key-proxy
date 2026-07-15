@@ -58,6 +58,103 @@ enum AttemptError {
 }
 impl warp::reject::Reject for AttemptError {}
 
+/// Recursively coerce any numeric `code` field inside a JSON value to a
+/// string. NVIDIA returns `{"error":{"code":503,...}}` where `code` is a
+/// number, but OpenAI's schema (and Go clients like Cursor) expect
+/// `code` to be a string. This walks objects and arrays in place.
+fn coerce_error_code_json(v: &mut serde_json::Value) {
+    match v {
+        serde_json::Value::Object(map) => {
+            if let Some(code) = map.get_mut("code") {
+                if code.is_i64() || code.is_u64() {
+                    let n = code.as_i64().or_else(|| code.as_u64().map(|x| x as i64));
+                    if let Some(n) = n {
+                        *code = serde_json::Value::String(n.to_string());
+                    } else if let Some(f) = code.as_f64() {
+                        *code = serde_json::Value::String(f.to_string());
+                    }
+                }
+            }
+            for (_, child) in map.iter_mut() {
+                coerce_error_code_json(child);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for item in arr.iter_mut() {
+                coerce_error_code_json(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Coerce a complete JSON body in place. Returns a new Bytes whose
+/// `error.code` (if present and numeric) has been converted to a string;
+/// if the body isn't valid JSON or re-serialization fails, the original
+/// bytes are returned untouched.
+fn coerce_json_body(body: &Bytes) -> Bytes {
+    match serde_json::from_slice::<serde_json::Value>(body) {
+        Ok(mut v) => {
+            coerce_error_code_json(&mut v);
+            serde_json::to_vec(&v).map(Bytes::from).unwrap_or_else(|_| body.clone())
+        }
+        Err(_) => body.clone(),
+    }
+}
+
+/// Coerce `error.code` inside an SSE chunk. SSE events are line-oriented
+/// (`data: <json>\n\n`); we process each `data:` line by parsing its JSON
+/// payload, coercing, and re-serializing. Lines that aren't `data:` lines,
+/// or whose payload isn't valid JSON, are passed through unmodified.
+///
+/// This operates on a single chunk without cross-chunk state. A `data:`
+/// line split across chunk boundaries will fail JSON parse for the partial
+/// payload and be forwarded as-is; in practice NVIDIA's error events are
+/// short and arrive in a single chunk.
+fn coerce_sse_chunk(chunk: &Bytes) -> Bytes {
+    // Fast path: the vast majority of streaming chunks are token deltas
+    // without a `code` field. Skip the per-line JSON parse entirely when
+    // the chunk provably has no `"code"` substring.
+    let text = match std::str::from_utf8(chunk) {
+        Ok(s) => s,
+        Err(_) => return chunk.clone(),
+    };
+    if !text.contains("\"code\"") {
+        return chunk.clone();
+    }
+    let mut changed = false;
+    let mut out = String::with_capacity(chunk.len());
+
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim_end_matches('\n');
+        let trimmed = trimmed.trim_end_matches('\r');
+        if let Some(payload) = trimmed.strip_prefix("data:") {
+            let json_str = payload.trim_start();
+            if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(json_str) {
+                let before = serde_json::to_string(&v).unwrap_or_default();
+                coerce_error_code_json(&mut v);
+                let after = serde_json::to_string(&v).unwrap_or_default();
+                if before != after {
+                    out.push_str("data: ");
+                    out.push_str(&after);
+                    if line.ends_with('\n') {
+                        out.push('\n');
+                    }
+                    changed = true;
+                    continue;
+                }
+            }
+        }
+        out.push_str(line);
+    }
+
+    if changed {
+        Bytes::from(out)
+    } else {
+        chunk.clone()
+    }
+}
+
 impl Proxy {
     pub fn new(
         base_url: String,
@@ -720,46 +817,12 @@ impl Proxy {
             );
         }
 
-        // For non-success responses, ensure error JSON fields have expected types.
-        // NVIDIA may return {"error":{"code":403,...}} or {"code":403} where `code` is a number.
-        // Some Go clients expect `code` as a string. Convert numeric codes to strings.
-        let final_body = if let Ok(mut json_val) =
-            serde_json::from_slice::<serde_json::Value>(&body_bytes)
-        {
-            fn coerce_code(v: &mut serde_json::Value) {
-                match v {
-                    serde_json::Value::Object(map) => {
-                        if let Some(code) = map.get_mut("code") {
-                            if code.is_i64() || code.is_u64() {
-                                let n = code.as_i64().or_else(|| code.as_u64().map(|x| x as i64));
-                                if let Some(n) = n {
-                                    *code = serde_json::Value::String(n.to_string());
-                                } else if let Some(f) = code.as_f64() {
-                                    *code = serde_json::Value::String(f.to_string());
-                                }
-                            }
-                        }
-                        for (_, child) in map.iter_mut() {
-                            coerce_code(child);
-                        }
-                    }
-                    serde_json::Value::Array(arr) => {
-                        for item in arr.iter_mut() {
-                            coerce_code(item);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            coerce_code(&mut json_val);
-            if let Ok(new_bytes) = serde_json::to_vec(&json_val) {
-                Bytes::from(new_bytes)
-            } else {
-                body_bytes
-            }
-        } else {
-            body_bytes
-        };
+        // Normalize numeric `error.code` to a string. NVIDIA returns
+        // {"error":{"code":503,...}} (number), but OpenAI's schema and Go
+        // clients like Cursor expect `code` as a string. Applied
+        // unconditionally to every buffered body — success responses
+        // without a `code` field are a no-op.
+        let final_body = coerce_json_body(&body_bytes);
 
         let mut response_builder = warp::http::Response::builder().status(status);
 
@@ -772,7 +835,8 @@ impl Proxy {
                 | "te"
                 | "trailers"
                 | "transfer-encoding"
-                | "upgrade" => continue,
+                | "upgrade"
+                | "content-length" => continue,
                 _ => {}
             }
             if let Ok(hv) = warp::http::HeaderValue::from_bytes(&value) {
@@ -797,7 +861,10 @@ impl Proxy {
     }
 
     /// Handle passthrough streaming: forward the upstream SSE/byte stream
-    /// verbatim to the client. No translation, no buffering.
+    /// to the client. Each chunk passes through `coerce_sse_chunk` which
+    /// rewrites numeric `error.code` values to strings in `data:` lines;
+    /// non-`data:` bytes and chunks without a `code` field are forwarded
+    /// verbatim.
     async fn handle_passthrough_stream(
         &self,
         resp: reqwest::Response,
@@ -807,7 +874,7 @@ impl Proxy {
         let upstream = resp.bytes_stream();
         let forwarded: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> =
             Box::pin(upstream.map(|r| {
-                r.map_err(|e| {
+                r.map(|chunk| coerce_sse_chunk(&chunk)).map_err(|e| {
                     warn!("Passthrough stream read error: {}", e);
                     std::io::Error::other(e.to_string())
                 })
@@ -823,7 +890,8 @@ impl Proxy {
                 | "te"
                 | "trailers"
                 | "transfer-encoding"
-                | "upgrade" => continue,
+                | "upgrade"
+                | "content-length" => continue,
                 _ => {}
             }
             if let Ok(hv) = warp::http::HeaderValue::from_bytes(&value) {
@@ -1092,5 +1160,155 @@ mod proxy_integration_tests {
             .unwrap();
 
         assert_eq!(resp.status(), 502);
+    }
+
+    /// 上游返回 503 且 `error.code` 为数字（NVIDIA 真实形态），非流式。
+    /// 验证代理出口 body 里 `error.code` 被转成字符串。
+    #[tokio::test]
+    async fn numeric_error_code_coerced_non_streaming() {
+        let mock_server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(503).set_body_json(serde_json::json!({
+                    "error": {
+                        "message": "ResourceExhausted: All workers are busy, please retry later",
+                        "type": "Service Unavailable",
+                        "code": 503
+                    }
+                })),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let addr = start_proxy(test_config(&mock_server.uri(), 0, 60)).await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://{}/v1/chat/completions", addr))
+            .header("content-type", "application/json")
+            .body(r#"{"model":"m","stream":false,"messages":[]}"#)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 503);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let code = body
+            .get("error")
+            .and_then(|e| e.get("code"))
+            .expect("error.code present");
+        assert!(
+            code.is_string(),
+            "error.code should be a string after coercion, got: {:?}",
+            code
+        );
+        assert_eq!(code.as_str(), Some("503"));
+    }
+
+    /// 上游返回 503 + 数字 code，但客户端请求 `stream:true`。
+    /// 上游错误不是 SSE 格式，代理走缓冲路径，coerce 必须生效。
+    #[tokio::test]
+    async fn numeric_error_code_coerced_streaming_non_sse_error() {
+        let mock_server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(503)
+                    .insert_header("content-type", "application/json")
+                    .set_body_json(serde_json::json!({
+                        "error": {
+                            "message": "ResourceExhausted",
+                            "type": "Service Unavailable",
+                            "code": 503
+                        }
+                    })),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let addr = start_proxy(test_config(&mock_server.uri(), 0, 60)).await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://{}/v1/chat/completions", addr))
+            .header("content-type", "application/json")
+            .body(r#"{"model":"m","stream":true,"messages":[]}"#)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 503);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let code = body
+            .get("error")
+            .and_then(|e| e.get("code"))
+            .expect("error.code present");
+        assert!(
+            code.is_string(),
+            "streaming + non-SSE error: error.code should be string, got: {:?}",
+            code
+        );
+        assert_eq!(code.as_str(), Some("503"));
+    }
+
+    /// 客户端请求 `stream:true`，上游返回 200 + SSE，但在流中途发 error event，
+    /// error event 的 data 里 `error.code` 是数字。
+    /// 这条路径走 `handle_passthrough_stream` → `coerce_sse_chunk`，
+    /// 数字 `code` 必须被逐行 coerce 成字符串。
+    #[test]
+    fn coerce_sse_chunk_turns_numeric_code_into_string() {
+        let sse_error = "data: {\"error\":{\"message\":\"x\",\"code\":400}}\n\n";
+        let coerced = super::coerce_sse_chunk(
+            &bytes::Bytes::from_static(sse_error.as_bytes()),
+        );
+        let coerced_str = std::str::from_utf8(&coerced).unwrap();
+        assert!(
+            coerced_str.contains("\"code\":\"400\""),
+            "coerce_sse_chunk should coerce numeric code to string, got: {}",
+            coerced_str
+        );
+        assert!(
+            !coerced_str.contains("\"code\":400"),
+            "no raw numeric code should remain, got: {}",
+            coerced_str
+        );
+    }
+
+    #[tokio::test]
+    async fn numeric_error_code_in_sse_stream_is_coerced() {
+        let sse_error = "data: {\"error\":{\"message\":\"x\",\"code\":400}}\n\n";
+
+        let mock_server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(sse_error, "text/event-stream"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let addr = start_proxy(test_config(&mock_server.uri(), 0, 60)).await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://{}/v1/chat/completions", addr))
+            .header("content-type", "application/json")
+            .body(r#"{"model":"m","stream":true,"messages":[]}"#)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 200);
+        let body = resp.text().await.unwrap();
+        assert!(
+            body.contains("\"code\":\"400\""),
+            "SSE error event should have numeric code coerced to string, got: {}",
+            body
+        );
+        assert!(
+            !body.contains("\"code\":400"),
+            "no raw numeric code should remain in SSE output, got: {}",
+            body
+        );
     }
 }
