@@ -545,7 +545,6 @@ mod retry_state_machine_tests {
                 metrics_path: "/metrics".to_string(),
                 log_level: "info".to_string(),
             },
-            codex: crate::codex_config::CodexConfig::default(),
             request_timeout_seconds: 0,
             retry: crate::config::RetryConfig::default(),
         };

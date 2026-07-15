@@ -1,4 +1,4 @@
-use nvidia_app::*; // assuming crate name is nvidia_app
+use nvidia_key_proxy::*;
 use warp::test::request;
 
 fn test_config() -> Config {
@@ -10,8 +10,6 @@ fn test_config() -> Config {
         cooldown: CooldownConfig { base_seconds: 1, max_seconds: 10 },
         health_check: HealthCheckConfig { interval_seconds: 30, timeout_seconds: 5, max_consecutive_failures: 3 },
         observability: ObservabilityConfig { enable_metrics: true, metrics_path: "/metrics".to_string(), log_level: "info".to_string() },
-        codex: CodexConfig::default(),
-        cursor: None,
         request_timeout_seconds: 60,
         retry: RetryConfig::default(),
     }

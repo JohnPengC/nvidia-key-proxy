@@ -5,8 +5,6 @@ use std::fs;
 use std::net::SocketAddr;
 
 use crate::key_pool::mask_key;
-use crate::codex_config::CodexConfig;
-use crate::cursor_config::CursorConfig;
 
 #[derive(Deserialize, Clone)]
 pub struct Config {
@@ -17,11 +15,6 @@ pub struct Config {
     pub cooldown: CooldownConfig,
     pub health_check: HealthCheckConfig,
     pub observability: ObservabilityConfig,
-    #[serde(default)]
-    pub codex: CodexConfig,
-    /// Optional Cursor configuration (mode, apiKey, etc.)
-    #[serde(default)]
-    pub cursor: Option<CursorConfig>,
     /// Optional request timeout in seconds. 0 disables the timeout entirely
     /// (recommended when proxying long-running streaming requests).
     #[serde(default = "default_request_timeout_seconds")]
@@ -49,7 +42,6 @@ impl fmt::Debug for Config {
             .field("cooldown", &self.cooldown)
             .field("health_check", &self.health_check)
             .field("observability", &self.observability)
-            .field("codex", &self.codex.enabled)
             .field("request_timeout_seconds", &self.request_timeout_seconds)
             .field("retry", &self.retry)
             .finish()
@@ -165,8 +157,6 @@ impl Config {
                 metrics_path: "/metrics".to_string(),
                 log_level: "info".to_string(),
             },
-            codex: crate::codex_config::CodexConfig::default(),
-            cursor: None,
             request_timeout_seconds: default_request_timeout_seconds(),
             retry: RetryConfig::default(),
         };
@@ -186,7 +176,6 @@ impl Config {
             config.cooldown = toml_config.cooldown;
             config.health_check = toml_config.health_check;
             config.observability = toml_config.observability;
-            config.codex = toml_config.codex;
             config.request_timeout_seconds = toml_config.request_timeout_seconds;
             config.retry = toml_config.retry;
         }

@@ -18,6 +18,7 @@ fastrand = "2.0"
 bytes = "1"
 serde_json = "1"
 toml_edit = "0.22"
+chrono = "0.4"
 
 [dev-dependencies]
 wiremock = "0.5"

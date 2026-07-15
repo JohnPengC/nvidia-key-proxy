@@ -9,7 +9,6 @@ use warp::{self, Rejection, Reply};
 use crate::failure_log;
 use crate::key_pool::{mask_key, KeyPool};
 use crate::metrics::Metrics;
-use crate::responses_compat;
 use futures_util::{Stream, StreamExt};
 use reqwest::header::{self as req_header, HeaderValue as ReqHeaderValue};
 use std::pin::Pin;
@@ -153,45 +152,30 @@ impl Proxy {
         // Consume a token (rate limit)
         key_handle.consume_token().await;
 
-        // Detect whether the request needs Responses → Chat Completions
-        // translation. We translate when EITHER:
-        //   1. The path hits /v1/responses (direct Responses API call), OR
-        //   2. The body is a Responses-style request (has `input`, no
-        //      `messages`) even when the client forwards to /v1/chat/completions
-        //      without translating the body (cc-switch issue #2806).
-        // In both cases we translate the request *and* the response, so the
-        // symmetry of translation is preserved.
+        // Parse the body once for validation and metadata extraction.
         let parsed_body: Option<serde_json::Value> = serde_json::from_slice(&body).ok();
-        let is_responses_path = responses_compat::is_responses_path(&path);
-        let body_is_responses_format = parsed_body
-            .as_ref()
-            .map(|v| v.get("input").is_some() && v.get("messages").is_none())
-            .unwrap_or(false);
-        let is_responses = is_responses_path || body_is_responses_format;
-        // Validation for chat completions (non‑Responses) requests: ensure
-        // `max_tokens` is a positive integer when supplied.
-        if !is_responses {
-            if let Some(v) = &parsed_body {
-                if let Some(max_val) = v.get("max_tokens") {
-                    let is_valid = match max_val {
-                        serde_json::Value::Number(num) => num.as_i64().map_or(false, |n| n >= 1),
-                        serde_json::Value::String(s) => s.parse::<i64>().map_or(false, |n| n >= 1),
-                        _ => false,
-                    };
-                    if !is_valid {
-                        warn!("Invalid max_tokens value: {}", max_val);
-                        self.metrics.inc_error();
-                        return Err(warp::reject::custom(BadRequest {
-                            msg: "Invalid max_tokens (must be >= 1)".into(),
-                        }));
-                    }
+
+        // Validate `max_tokens` for chat completions: must be a positive
+        // integer when supplied. NVIDIA rejects non-positive values with a
+        // 400 which wastes a request, so we short-circuit here.
+        if let Some(v) = &parsed_body {
+            if let Some(max_val) = v.get("max_tokens") {
+                let is_valid = match max_val {
+                    serde_json::Value::Number(num) => num.as_i64().is_some_and(|n| n >= 1),
+                    serde_json::Value::String(s) => s.parse::<i64>().is_ok_and(|n| n >= 1),
+                    _ => false,
+                };
+                if !is_valid {
+                    warn!("Invalid max_tokens value: {}", max_val);
+                    self.metrics.inc_error();
+                    return Err(warp::reject::custom(BadRequest {
+                        msg: "Invalid max_tokens (must be >= 1)".into(),
+                    }));
                 }
             }
         }
 
-        // Extract `model` once from the client's request body so it can be
-        // propagated into translated Responses events (response.created /
-        // response.completed).
+        // Extract `model` once from the client's request body for logging.
         let model = parsed_body
             .as_ref()
             .and_then(|v| {
@@ -201,53 +185,21 @@ impl Proxy {
             })
             .unwrap_or_default();
 
-        // Determine upstream path and request body.
-        let (upstream_path, request_body, is_streaming);
-
-        if is_responses {
-            let (_translated_path, translated_body) =
-                match responses_compat::translate_request(&body) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        warn!("Failed to translate Responses request: {}", e);
-                        self.metrics.inc_error();
-                        return Err(warp::reject::custom(BadRequest {
-                            msg: "Invalid Responses request body".into(),
-                        }));
-                    }
-                };
-            upstream_path = "/v1/chat/completions".to_string();
-            request_body = Bytes::from(translated_body);
-            // Codex's Responses API defaults to streaming.
-            is_streaming = parsed_body
-                .as_ref()
-                .and_then(|v| v.get("stream").and_then(|s| s.as_bool()))
-                .unwrap_or(true);
-        } else {
-            // Passthrough: use original path and body. Honor the client's
-            // `stream` field so chat-completions clients that ask for streaming
-            // get a streamed body (no `bytes().await` buffering).
-            upstream_path = path.clone();
-            request_body = body.clone();
-            is_streaming = parsed_body
-                .as_ref()
-                .and_then(|v| v.get("stream").and_then(|s| s.as_bool()))
-                .unwrap_or(false);
-        }
+        // Passthrough: use original path and body. Honor the client's
+        // `stream` field so chat-completions clients that ask for streaming
+        // get a streamed body (no `bytes().await` buffering).
+        let upstream_path = path.clone();
+        let request_body = body.clone();
+        let is_streaming = parsed_body
+            .as_ref()
+            .and_then(|v| v.get("stream").and_then(|s| s.as_bool()))
+            .unwrap_or(false);
 
         // Build upstream URL
         let mut url = self.base_url.clone();
         url.push_str(&upstream_path);
 
-        if is_responses {
-            info!(
-                "Responses API → Chat Completions: {} {}",
-                method.as_str(),
-                url
-            );
-        } else {
-            info!("Proxying request to: {} {}", method.as_str(), url);
-        }
+        info!("Proxying request to: {} {}", method.as_str(), url);
 
         // --- Upstream attempt loop with exponential backoff retry ---
         //
@@ -269,7 +221,6 @@ impl Proxy {
                 &url,
                 &headers,
                 &request_body,
-                is_responses,
                 is_streaming,
                 &model,
                 is_last_attempt,
@@ -458,7 +409,6 @@ impl Proxy {
         url: &str,
         headers: &warp::http::HeaderMap,
         request_body: &bytes::Bytes,
-        is_responses: bool,
         is_streaming: bool,
         model: &str,
         is_last_attempt: bool,
@@ -561,20 +511,10 @@ impl Proxy {
             .map(|(k, v)| (k.as_str().to_string(), v.as_bytes().to_vec()))
             .collect();
 
-        // Streaming SSE translation: only when we are translating a
-        // Responses API request (request + response).
-        if is_responses && is_sse && status.is_success() {
-            let resp = self
-                .handle_streaming_response(resp, resp_headers, status, model)
-                .await
-                .map_err(AttemptError::Fatal)?;
-            return Ok(AttemptResponse::Done(resp));
-        }
-
         // Passthrough streaming: when the client asked for `stream` and
         // upstream responded with SSE, forward the upstream stream
         // verbatim without buffering.
-        if !is_responses && is_streaming && is_sse && status.is_success() {
+        if is_streaming && is_sse && status.is_success() {
             let resp = self
                 .handle_passthrough_stream(resp, resp_headers, status)
                 .await
@@ -585,8 +525,7 @@ impl Proxy {
         let body_bytes = resp.bytes().await.map_err(AttemptError::BodyRead)?;
 
         // Token statistics (prompt/completion/total) for successful Chat Completion responses.
-        // We only count when the request is a plain Chat Completion (not a Responses↔Chat translation).
-        if status.is_success() && !is_responses {
+        if status.is_success() {
             if let Ok(json_body) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
                 if let Some(usage) = json_body.get("usage") {
                     if let Some(prompt) = usage.get("prompt_tokens").and_then(|v| v.as_u64()) {
@@ -659,41 +598,45 @@ impl Proxy {
             );
         }
 
-        let final_body = if is_responses && status.is_success() {
-            let translated = responses_compat::translate_response(&body_bytes, model);
-            Bytes::from(translated)
-        } else {
-            // For non-success responses, ensure error JSON fields have expected types.
-            // NVIDIA may return {"error":{"code":403,...}} or {"code":403} where `code` is a number.
-            // Some Go clients expect `code` as a string. Convert numeric codes to strings.
-            if let Ok(mut json_val) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
-                // Helper closure to convert numeric `code` to string in a mutable JSON value.
-                fn coerce_code(v: &mut serde_json::Value) {
-                    if let Some(code) = v.get_mut("code") {
-                        if code.is_number() {
-                            if let Some(i) = code.as_i64() {
-                                *code = serde_json::Value::String(i.to_string());
-                            } else if let Some(u) = code.as_u64() {
-                                *code = serde_json::Value::String(u.to_string());
+        // For non-success responses, ensure error JSON fields have expected types.
+        // NVIDIA may return {"error":{"code":403,...}} or {"code":403} where `code` is a number.
+        // Some Go clients expect `code` as a string. Convert numeric codes to strings.
+        let final_body = if let Ok(mut json_val) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+            fn coerce_code(v: &mut serde_json::Value) {
+                match v {
+                    serde_json::Value::Object(map) => {
+                        if let Some(code) = map.get_mut("code") {
+                            if code.is_i64() || code.is_u64() {
+                                let n = code
+                                    .as_i64()
+                                    .or_else(|| code.as_u64().map(|x| x as i64));
+                                if let Some(n) = n {
+                                    *code = serde_json::Value::String(n.to_string());
+                                } else if let Some(f) = code.as_f64() {
+                                    *code = serde_json::Value::String(f.to_string());
+                                }
                             }
                         }
+                        for (_, child) in map.iter_mut() {
+                            coerce_code(child);
+                        }
                     }
+                    serde_json::Value::Array(arr) => {
+                        for item in arr.iter_mut() {
+                            coerce_code(item);
+                        }
+                    }
+                    _ => {}
                 }
-                // Top-level code
-                coerce_code(&mut json_val);
-                // Nested under "error"
-                if let Some(err_obj) = json_val.get_mut("error") {
-                    coerce_code(err_obj);
-                }
-                // Serialize back to bytes; if fails, fall back to original body.
-                if let Ok(new_bytes) = serde_json::to_vec(&json_val) {
-                    Bytes::from(new_bytes)
-                } else {
-                    body_bytes
-                }
+            }
+            coerce_code(&mut json_val);
+            if let Ok(new_bytes) = serde_json::to_vec(&json_val) {
+                Bytes::from(new_bytes)
             } else {
                 body_bytes
             }
+        } else {
+            body_bytes
         };
 
         let mut response_builder = warp::http::Response::builder().status(status);
@@ -710,9 +653,6 @@ impl Proxy {
                 | "upgrade" => continue,
                 _ => {}
             }
-            if is_responses && status.is_success() && key == "content-type" {
-                continue;
-            }
             if let Ok(hv) = warp::http::HeaderValue::from_bytes(&value) {
                 if let Some(headers) = response_builder.headers_mut() {
                     let key_bytes = key.as_bytes().to_vec();
@@ -722,15 +662,6 @@ impl Proxy {
                         });
                     headers.append(hname, hv);
                 }
-            }
-        }
-
-        if is_responses && status.is_success() {
-            if let Some(headers) = response_builder.headers_mut() {
-                headers.insert(
-                    warp::http::header::CONTENT_TYPE,
-                    warp::http::HeaderValue::from_static("application/json"),
-                );
             }
         }
 
@@ -741,180 +672,6 @@ impl Proxy {
             }))
         })?;
         Ok(AttemptResponse::Done(resp))
-    }
-
-    /// Handle streaming SSE response: read NVIDIA chat completions SSE,
-    /// translate to Responses API SSE events, and stream them back to the
-    /// client as they are produced (no buffering).
-    ///
-    /// Returns a hyper::Body backed by `Body::wrap_stream`. If the upstream
-    /// stream errors mid-way, the response is truncated and we deliberately
-    /// do NOT emit `response.completed`, so Codex sees an unfinished response
-    /// rather than a silent success.
-    async fn handle_streaming_response(
-        &self,
-        resp: reqwest::Response,
-        resp_headers: Vec<(String, Vec<u8>)>,
-        status: warp::http::StatusCode,
-        model: &str,
-    ) -> Result<warp::http::Response<warp::hyper::Body>, Rejection> {
-        use std::collections::VecDeque;
-        use std::task::{Context, Poll};
-
-        // Build the upstream chunk stream once (bytes_stream() consumes the
-        // reqwest::Response by value) and store it inside our poll state.
-        let upstream = resp.bytes_stream();
-        let upstream: std::pin::Pin<
-            Box<dyn futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Send>,
-        > = Box::pin(upstream);
-
-        // `model` is captured by reference into the poll closure; clone it to a
-        // String so the stream is `'static` and `Send` without borrowing `&str`
-        // from the enclosing stack frame.
-        let model = model.to_string();
-
-        // Streaming state machine shared across polls.
-        struct St {
-            upstream: std::pin::Pin<
-                Box<dyn futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Send>,
-            >,
-            state: responses_compat::StreamState,
-            buffer: String,
-            pending: std::collections::VecDeque<Bytes>,
-            upstream_done: bool,
-        }
-
-        let mut st = St {
-            upstream,
-            state: responses_compat::StreamState::new(),
-            buffer: String::new(),
-            pending: VecDeque::new(),
-            upstream_done: false,
-        };
-
-        // poll_fn captures `st` and `model` by move; each poll drives the
-        // state machine and returns one translated event at a time.
-        let translated: std::pin::Pin<
-            Box<dyn futures_util::stream::Stream<Item = Result<Bytes, std::io::Error>> + Send>,
-        > = Box::pin(futures_util::stream::poll_fn(
-            move |cx: &mut Context<'_>| -> Poll<Option<Result<Bytes, std::io::Error>>> {
-                loop {
-                    // 1. Drain already-translated events.
-                    if let Some(ev) = st.pending.pop_front() {
-                        return Poll::Ready(Some(Ok(ev)));
-                    }
-
-                    // 2. Extract any complete SSE event from the buffer.
-                    while let Some(pos) = st.buffer.find("\n\n") {
-                        let event_block = st.buffer[..pos].to_string();
-                        st.buffer = st.buffer[pos + 2..].to_string();
-                        if let Some(data_line) =
-                            event_block.lines().find(|l| l.starts_with("data: "))
-                        {
-                            let data = &data_line[6..];
-                            let payload: &[u8] = if data == "[DONE]" {
-                                b"null"
-                            } else {
-                                data.as_bytes()
-                            };
-                            let events = responses_compat::translate_stream_chunk(
-                                payload,
-                                &mut st.state,
-                                &model,
-                            );
-                            for ev in events {
-                                st.pending.push_back(Bytes::from(ev));
-                            }
-                        }
-                        // Re-loop to drain the newly enqueued events.
-                        continue;
-                    }
-
-                    // 3. Need more bytes from upstream.
-                    if st.upstream_done {
-                        return Poll::Ready(None);
-                    }
-                    match st.upstream.poll_next_unpin(cx) {
-                        Poll::Pending => return Poll::Pending,
-                        Poll::Ready(None) => {
-                            // Upstream ended cleanly. Emit response.completed
-                            // if we haven't already, then signal end of stream.
-                            st.upstream_done = true;
-                            if !st.state.emitted_completed {
-                                let events = responses_compat::translate_stream_chunk(
-                                    b"null",
-                                    &mut st.state,
-                                    &model,
-                                );
-                                for ev in events {
-                                    st.pending.push_back(Bytes::from(ev));
-                                }
-                                continue;
-                            }
-                            return Poll::Ready(None);
-                        }
-                        Poll::Ready(Some(Ok(chunk))) => {
-                            st.buffer.push_str(&String::from_utf8_lossy(&chunk));
-                            continue;
-                        }
-                        Poll::Ready(Some(Err(e))) => {
-                            warn!("Stream read error: {}", e);
-                            // Upstream error mid-stream: truncate the response.
-                            // We deliberately do NOT emit `response.completed`
-                            // so the client can recognize this as an unfinished
-                            // response rather than a silent success.
-                            return Poll::Ready(None);
-                        }
-                    }
-                }
-            },
-        ));
-
-        // Build headers, then wrap the stream into a hyper body.
-        let mut response_builder = warp::http::Response::builder().status(status);
-        if let Some(headers) = response_builder.headers_mut() {
-            headers.insert(
-                warp::http::header::CONTENT_TYPE,
-                warp::http::HeaderValue::from_static("text/event-stream"),
-            );
-            headers.insert(
-                warp::http::header::CACHE_CONTROL,
-                warp::http::HeaderValue::from_static("no-cache"),
-            );
-        }
-        for (key, value) in resp_headers {
-            match key.as_str() {
-                "connection"
-                | "keep-alive"
-                | "proxy-authenticate"
-                | "proxy-authorization"
-                | "te"
-                | "trailers"
-                | "transfer-encoding"
-                | "upgrade"
-                | "content-type"
-                | "cache-control" => continue,
-                _ => {}
-            }
-            if let Ok(hv) = warp::http::HeaderValue::from_bytes(&value) {
-                if let Some(headers) = response_builder.headers_mut() {
-                    let key_bytes = key.as_bytes().to_vec();
-                    let hname =
-                        warp::http::HeaderName::from_bytes(&key_bytes).unwrap_or_else(|_| {
-                            warp::http::HeaderName::from_bytes(b"x-unknown").unwrap()
-                        });
-                    headers.append(hname, hv);
-                }
-            }
-        }
-
-        let body = warp::hyper::Body::wrap_stream(translated);
-        Ok(response_builder.body(body).unwrap_or_else(|_| {
-            warp::http::Response::builder()
-                .status(status)
-                .body(warp::hyper::Body::empty())
-                .unwrap()
-        }))
     }
 
     /// Handle passthrough streaming: forward the upstream SSE/byte stream
@@ -1013,7 +770,6 @@ mod proxy_integration_tests {
     use warp::{Filter, Rejection, Reply};
     use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
 
-    use crate::codex_config::CodexConfig;
     use crate::config::{
         Config, CooldownConfig, HealthCheckConfig, ObservabilityConfig, RateLimiterConfig,
         RetryConfig,
@@ -1045,9 +801,7 @@ mod proxy_integration_tests {
                 metrics_path: "/metrics".to_string(),
                 log_level: "info".to_string(),
             },
-            codex: CodexConfig::default(),
             request_timeout_seconds: request_timeout,
-            cursor: None,
             retry: RetryConfig {
                 max_retries,
                 backoff_base_ms: 100,

@@ -14,8 +14,8 @@
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
 
+use chrono::Local;
 use serde_json::{json, Value};
 
 use crate::key_pool::mask_key;
@@ -46,10 +46,7 @@ fn ensure_open() {
 /// counter. Not globally unique, but unique enough to correlate retries
 /// belonging to the same client request within one proxy lifetime.
 fn gen_req_id(counter: u64) -> String {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let secs = Local::now().timestamp();
     format!("r{:x}_{:x}", secs, counter)
 }
 
@@ -86,16 +83,10 @@ pub fn write_failure(
         None => return,
     };
 
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| {
-            let secs = d.as_secs();
-            let millis = d.subsec_millis();
-            format!("{}.{:03}", secs, millis)
-        })
-        .unwrap_or_default();
+    let now = Local::now();
+    let ts = now.format("%Y-%m-%d %H:%M:%S%.3f").to_string();
+    let error_time = ts.clone();
 
-    let error_time = format!("{:?}", SystemTime::now());
     let mut entry = json!({
         "ts": ts,
         "error_time": error_time,
