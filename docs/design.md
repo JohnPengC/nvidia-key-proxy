@@ -34,9 +34,7 @@ Key goals
                                     |
                                     +-- HealthChecker (startup + bad-key recovery)
                                     |
-                                    +-- ResponsesCompat (Responses ↔ Chat Completions)
-                                    |
-                                    +-- CodexConfig (auto-manage ~/.codex/)
+                                    +-- FailureLog (structured JSONL)
                                     |
                                     +-- Metrics / Tracing
 ```
@@ -48,9 +46,7 @@ Key goals
 | **Config** | Load `config.toml` / env / CLI. Implements custom `Debug` to mask API keys in logs. | `serde` + `toml` + `dotenvy` |
 | **KeyPool** | Hold `KeyState` (active, cooling, disabled). Provide `acquire()`, `mark_good()`, `mark_bad()`. | `DashMap`<br>`DashMap<KeyId, KeyState>` |
 | **TokenBucket** | Per‑key rate limiter (QPS + burst). | `async-tokenbucket` or custom using `tokio::time::Interval` |
-| **Proxy Handler** | Accept HTTP request → acquire key → wait for token → detect Responses API → translate or passthrough → forward → update key state → return response. | `warp` for server, `reqwest` client |
-| **ResponsesCompat** | Translate Responses API ↔ Chat Completions API (request body, non-streaming response, streaming SSE). | `serde_json` |
-| **CodexConfig** | Auto-manage `~/.codex/config.toml` + model catalog on startup. Removes conflicting cc-switch providers. | `serde_json` + manual TOML editing (Rust regex crate lacks lookahead) |
+| **Proxy Handler** | Accept HTTP request → acquire key → wait for token → forward → update key state → return response (streaming SSE passthrough). | `warp` for server, `reqwest` client |
 | **HealthChecker** | Startup probe + periodic bad-key recovery. Update state. | `tokio::task::spawn` loop |
 | **Observability** | Prometheus endpoint at `metrics_path` (default `/metrics`); tracing with `tracing`+`tracing-subscriber`. | `prometheus`, `tracing` |
 | **Graceful Shutdown** | Listen for SIGINT/SIGTERM, stop accepting new connections, drain ongoing requests. | `tokio::signal`, warp’s graceful shutdown |
@@ -112,12 +108,9 @@ enable_metrics = true
 metrics_path   = "/metrics"
 log_level      = "info"
 
-[codex]
-enabled                  = true
-default_model            = "z-ai/glm-5.2"
-model_reasoning_effort   = "high"
-disable_response_storage = true
-bearer_token             = "proxy-managed"
+# Request timeout in seconds. Set to 0 to disable (recommended for streaming).
+# Streaming requests bypass this timeout regardless.
+request_timeout_seconds = 60
 ```
 
 ### Building & Running
@@ -150,8 +143,8 @@ ENTRYPOINT ["/usr/local/bin/nvidia-key-proxy"]
 
 ### Testing Strategy
 
-* **Unit tests** – `KeyPool` state transitions, token‑bucket correctness, `codex_config` TOML section manipulation (remove/replace provider sections without regex lookahead).
-* **Integration tests** – spin up a mock NVIDIA server (using `warp`) that can return 200, 429, 500; assert proxy rotates keys, honors rate limits, honors cool‑down.
+* **Unit tests** – `KeyPool` state transitions, token‑bucket correctness, proxy retry / timeout behaviour.
+* **Integration tests** – spin up a mock NVIDIA server (using `warp`) that can return 200, 429, 500; assert proxy rotates keys, honors rate limits, honors cool‑down. Additional tests cover the health endpoint, metrics (enabled/disabled), and unknown-path 404 handling.
 * **Load test** – use `wrk` or `hey` against the proxy; verify metrics show distributed load and that no single key exceeds its QPS.
 * **Security audit** – ensure logs never contain full API keys (custom `Debug` impl on `Config` masks keys as `XXXX***XXXX`).
 

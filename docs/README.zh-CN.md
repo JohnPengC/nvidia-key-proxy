@@ -1,14 +1,12 @@
 # NVIDIA API Key 负载均衡代理
 
-一个用 Rust 编写的轻量级高性能代理，管理多个 NVIDIA API Key，内置 Codex CLI 集成。
+一个用 Rust 编写的轻量级高性能代理，管理多个 NVIDIA API Key，提供按 Key 限流、健康检查和 Prometheus 可观测性。
 
 ## 功能特性
 
 - **多 Key 负载均衡** — 轮换使用多个 Key，规避单 Key 速率限制。
-- **自动限流检测** — 401（无 `Retry-After`）触发换 Key 重试，连续失败则禁用该 Key；429/403 属于确定性上游决策，带 `Retry-After` 才冷却该 Key，否则透传不重试。
+- **自动限流检测** — 429/403（带 `Retry-After`）冷却该 Key；401（无 `Retry-After`）触发换 Key 重试，连续失败则禁用该 Key。
 - **健康检查** — 启动时探测 + 定期恢复检查，保持 Key 池健康。
-- **Responses API ↔ Chat Completions 协议翻译** — Codex CLI（`wire_api = "responses"`）可直接对接 NVIDIA 的 `/v1/chat/completions` 后端，代理自动双向翻译。
-- **Codex CLI 自动配置** — 启动时自动生成 `~/.codex/config.toml` 和模型目录，无需 cc-switch 中转。
 - **可观测性** — Prometheus 指标 + 结构化 tracing 日志。
 - **安全** — 真实 Key 不出进程；日志中 Key 以 `XXXX***XXXX` 格式脱敏。
 
@@ -50,16 +48,9 @@
    metrics_path   = "/metrics"
    log_level      = "info"
 
-   [codex]
-   enabled                  = true
-   default_model            = "z-ai/glm-5.2"
-   model_reasoning_effort   = "high"
-   disable_response_storage = true
-   bearer_token             = "proxy-managed"
-   # models = [
-   #   "z-ai/glm-5.2:GLM 5.2:1000000",
-   #   "moonshotai/kimi-k2.6:Kimi K2.6:256000",
-   # ]
+   # 请求超时（秒）。设为 0 关闭（流式建议关闭）。
+   # 流式请求始终绕过此超时。
+   request_timeout_seconds = 60
    ```
 
 3. **运行**
@@ -68,79 +59,6 @@
    ```
 
 4. **接入客户端** — 将 `base_url` 指向 `http://localhost:8888`。`api_key` 字段可填任意值，代理会用池中的真实 Key 替换。
-
-## Codex CLI 集成
-
-代理在启动时自动管理 `~/.codex/config.toml`，省去 cc-switch 作为中间层。
-
-## Cursor 集成
-
-代理同样支持写入 Cursor 的配置文件（Unix 系统为 `~/.cursor/config.json`，Windows 为 `%APPDATA%/Cursor/User/settings.json`），通过 `config.toml` 中的 `[cursor]` 表进行配置。
-
-### 配置字段
-
-- `mode` – `"local"` 表示走本地代理，`"official"` 表示直接使用官方 OpenAI 接口。
-- `proxy_port` – 代理监听的端口，默认与 `listen_addr` 相同。
-- `api_key` – Cursor 要求的占位 API Key，代理在转发请求时会替换为真实的 NVIDIA Key。
-- `settings_path` – Cursor JSON 设置文件路径，`~` 会展开为用户主目录。
-
-启动时，主程序会调用 `cursor_config::apply(&config.cursor)`，该函数保证文件存在且幂等地写入 `openai.baseUrl` 与 `openai.apiKey` 两个字段。
-
-示例 `config.toml` 片段：
-
-```toml
-[cursor]
-mode = "local"
-proxy_port = 8888
-api_key = "cursor-dummy-key"
-settings_path = "~/.cursor/config.json"
-```
-
-此集成在 Unix 与 Windows 上均可工作。
-
-### 工作原理
-
-1. **生成 `~/.codex/nvidia-proxy-model-catalog.json`** — 模型目录，优先从 Codex 的 `gpt-5.5` 模板（`models_cache.json`）衍生，否则使用最小化 fallback。
-2. **增量更新 `~/.codex/config.toml`** — 设置 `model_provider`、`model`、`model_reasoning_effort`、`disable_response_storage`、`model_catalog_json`（绝对路径）和 `[model_providers.nvidia-proxy]` section。用户自定义的 section（`notify`、`mcp_servers` 等）原样保留。
-3. **清理冲突 Provider** — cc-switch 残留的 `[model_providers.custom]` section 会被自动移除。
-
-### 为什么 `model_catalog_json` 必须是绝对路径
-
-Codex CLI 要求 `model_catalog_json` 使用绝对路径。相对路径会在较新版本的 Codex 上触发 `AbsolutePathBuf deserialized without a base path` 错误。代理始终写入绝对路径（如 `/Users/<用户>/.codex/nvidia-proxy-model-catalog.json`）。
-
-### 默认模型列表
-
-| 模型 ID | 显示名称 | 上下文窗口 |
-|---|---|---|
-| `z-ai/glm-5.2` | GLM 5.2 | 1,000,000 |
-| `moonshotai/kimi-k2.6` | Kimi K2.6 | 256,000 |
-| `deepseek-ai/deepseek-v4-pro` | DeepSeek V4 Pro | 1,000,000 |
-| `deepseek-ai/deepseek-v4-flash` | DeepSeek V4 Flash | 1,000,000 |
-| `qwen/qwen3.5-397b-a17b` | Qwen 3.5 397B | 256,000 |
-| `meta/llama-3.3-70b-instruct` | Llama 3.3 70B | 128,000 |
-
-通过 `[codex] models` 自定义（格式：`"model_id:显示名称:上下文窗口"`）。
-
-## Responses API 协议翻译
-
-Codex CLI 使用 `wire_api = "responses"`（OpenAI Responses API），但 NVIDIA 只实现 `/v1/chat/completions`。代理在中间做双向翻译：
-
-```
-Codex CLI                    代理                       NVIDIA API
-   |                           |                            |
-   |-- POST /v1/responses -->  |                            |
-   |   (Responses 格式)        |                            |
-   |                           |-- 翻译请求体 -->             |
-   |                           |-- POST /v1/chat/completions -->
-   |                           |                            |
-   |                           |<-- SSE (chat completions) --|
-   |<-- SSE (responses)  <----|                            |
-```
-
-- **请求翻译**：`input` → `messages`，`instructions` → 系统消息，展开嵌套内容，`max_output_tokens` → `max_tokens`。
-- **响应翻译（非流式）**：Chat Completions 响应 → Responses API JSON（`response.created`、`response.completed` 包装）。
-- **响应翻译（流式 SSE）**：Chat Completions SSE 片段 → Responses API 事件（`response.created`、`response.output_text.delta`、`response.output_text.done`、`response.completed`）。
-- **触发条件**：路径为 `/v1/responses`，或请求体含 `input` 字段但无 `messages`（cc-switch 转发到 `/v1/chat/completions` 时不翻译请求体）。
 
 ## 配置说明
 
@@ -151,6 +69,7 @@ Codex CLI                    代理                       NVIDIA API
 | `listen_addr` | 监听地址 | 必填 |
 | `base_url` | NVIDIA API 地址 | 必填 |
 | `keys` | NVIDIA API Key 列表 | 必填（或 `NVIDIA_KEYS` 环境变量） |
+| `request_timeout_seconds` | 请求超时；0 关闭（流式始终绕过） | `60` |
 
 ### `[rate_limiter]` 速率限制
 
@@ -182,20 +101,18 @@ Codex CLI                    代理                       NVIDIA API
 | `metrics_path` | 指标端点路径（默认 `/metrics`） |
 | `log_level` | tracing 日志级别（也可通过 `RUST_LOG` 覆盖） |
 
-### `[codex]` Codex 集成
+### `[retry]` 重试
 
 | 字段 | 说明 | 默认值 |
 |---|---|---|
-| `enabled` | 启动时是否自动管理 Codex 配置 | `true` |
-| `default_model` | Codex 默认模型 | `z-ai/glm-5.2` |
-| `model_reasoning_effort` | 推理强度：none/minimal/low/medium/high | `high` |
-| `disable_response_storage` | 禁用响应存储（非 OpenAI 后端必填） | `true` |
-| `bearer_token` | `experimental_bearer_token` 的占位值 | `proxy-managed` |
-| `models` | 自定义模型列表（覆盖默认） | `[]` |
+| `max_retries` | 可重试错误的最大重试次数 | `3` |
+| `backoff_base_ms` | 初始退避毫秒 | `200` |
+| `backoff_max_ms` | 退避上限毫秒 | `2000` |
+| `auth_fail_threshold` | 连续鉴权失败多少次后禁用 Key | `3` |
 
 ## Prometheus 指标
 
-当 `observability.enable_metrics` 为 `true` 时，指标暴露在根路径（`/`）。
+当 `observability.enable_metrics` 为 `true` 时，指标暴露在 `observability.metrics_path`（默认 `/metrics`）。
 
 | 指标名 | 说明 |
 |---|---|
@@ -206,28 +123,38 @@ Codex CLI                    代理                       NVIDIA API
 | `proxy_key_active` | 活跃 Key 数 |
 | `proxy_key_cooldown` | 冷却中 Key 数 |
 | `proxy_key_disabled` | 禁用 Key 数 |
-
-- `proxy_tokens_input_total` – 累计输入 token 数（prompt tokens）
-- `proxy_tokens_output_total` – 累计输出 token 数（completion tokens）
-- `proxy_tokens_total` – 累计 token 总数（prompt + completion）
-
-## 实现重构 (2026‑07‑11)
-
-- 引入 **`AppState`** 将共享运行时对象（metrics、key_pool、proxy、health_checker、stop_signal、config）统一管理。
-- 将 tracing 初始化抽离为 **`init_tracing`**，确保启动顺序更清晰。
-- 将路由构建抽象为 **`build_routes`**，`main` 只负责 orchestration（启动、后台任务、Graceful shutdown）。
-- 使用单一 `Notify` 实现优雅关闭，并在关机时直接 `drop` 背景任务句柄，避免死锁。
-- 在 `tests/` 目录新增了集成测试，覆盖健康接口、指标端点（启用/禁用）以及未知路径的 404 行为。
+| `proxy_tokens_input_total` | 累计输入 token 数（prompt tokens） |
+| `proxy_tokens_output_total` | 累计输出 token 数（completion tokens） |
+| `proxy_tokens_total` | 累计 token 总数（prompt + completion） |
 
 ## API 端点
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/` | Prometheus 指标 |
-| GET | `/v1/models` | 模型目录（从生成的 catalog JSON 返回） |
-| GET | `/models` | 同上（无 `/v1` 前缀） |
+| GET | `{metrics_path}` | Prometheus 指标 |
 | GET | `/health` | 健康检查（返回 204） |
 | * | `/*` | 透传到 NVIDIA API（注入 Key + 限流） |
+
+## 架构
+
+代理按职责拆分为 `src/lib.rs` 下的多个模块：
+
+- **`config`** — 加载 `config.toml` / 环境变量；`Debug` 实现对 API Key 脱敏。
+- **`key_pool`** — 维护每个 Key 的状态（active / cooling / disabled），加权随机选择。
+- **`proxy`** — warp handler：获取 Key → 限流 → 转发 → 更新 Key 状态 → 流式回传响应。
+- **`health`** — 启动探测 + 定期坏 Key 恢复。
+- **`metrics`** — Prometheus 计数器和直方图。
+- **`failure_log`** — 结构化 JSONL 失败日志（`failure.log`）。
+
+`AppState` 把共享运行时对象（metrics、key_pool、proxy、health_checker、stop_signal、config）打包，`build_routes` 构建 warp 过滤器，使集成测试无需进入 `main` 即可测试整条链路。
+
+## 实现重构 (2026-07-11)
+
+- 引入 **`AppState`** 将共享运行时对象统一管理。
+- 将 tracing 初始化抽离为 **`init_tracing`**，确保启动顺序清晰。
+- 将路由构建抽象为 **`build_routes`**，`main` 只负责 orchestration。
+- 使用单一 `Notify` 实现优雅关闭，关机时直接 `drop` 背景任务句柄，避免死锁。
+- 在 `tests/` 新增集成测试，覆盖健康接口、指标端点（启用/禁用）以及未知路径 404。
 
 ## 测试
 
@@ -235,10 +162,7 @@ Codex CLI                    代理                       NVIDIA API
 cargo test --release
 ```
 
-当前测试覆盖 `codex_config` 模块：
-- 删除 `[model_providers.custom]` section（有后续 section、在文件末尾、不存在三种场景）
-- 替换 `[model_providers.nvidia-proxy]` section
-- 验证 Rust `regex` crate 不支持 lookahead `(?=...)`，改用手动 `find` 逻辑
+单元测试覆盖 Key 池状态转换、令牌桶正确性、代理重试/超时行为。集成测试覆盖健康接口、指标端点（启用/禁用）以及未知路径 404。
 
 ## 许可证
 
@@ -246,4 +170,4 @@ MIT
 
 ## 技术栈
 
-Tokio、Warp、reqwest、regex、serde、tracing。
+Tokio、Warp、reqwest、serde、tracing。
