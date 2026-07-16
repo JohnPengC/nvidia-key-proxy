@@ -110,6 +110,23 @@
 | `backoff_max_ms` | 退避上限毫秒 | `2000` |
 | `auth_fail_threshold` | 连续鉴权失败多少次后禁用 Key | `3` |
 
+## 配置校验
+
+代理在启动时会对加载的配置进行校验，若发现明显错误会立即退出，避免在占位配置下静默产生 401/404 失败：
+
+- `base_url` 不能是 `example.com`、`localhost` 或 `127.0.0.1`，且必须以 `http://` 或 `https://` 开头。
+- API Key 长度至少为 8，且不能包含 `fake`、`dummy`、`test`、`example`、`placeholder`。
+- 若 `request_timeout_seconds` 小于 `5`，会打印警告，建议使用更大的值。
+
+## 请求校验
+
+在转发 chat-completion 请求前，代理会校验已知会导致上游 400 的请求体字段：
+
+- `max_tokens`：若存在，必须是大于等于 1 的整数。
+- `reasoning_effort`：若存在，必须是 `"low"`、`"medium"`、`"high"` 之一。
+
+非法请求会立即以 400 返回，不会进入上游 Key 池，避免浪费重试。
+
 ## Prometheus 指标
 
 当 `observability.enable_metrics` 为 `true` 时，指标暴露在 `observability.metrics_path`（默认 `/metrics`）。
@@ -155,6 +172,12 @@
 - 将路由构建抽象为 **`build_routes`**，`main` 只负责 orchestration。
 - 使用单一 `Notify` 实现优雅关闭，关机时直接 `drop` 背景任务句柄，避免死锁。
 - 在 `tests/` 新增集成测试，覆盖健康接口、指标端点（启用/禁用）以及未知路径 404。
+
+## 校验与加固 (2026-07-16)
+
+- 新增 **配置校验**（`Config::validate`），在启动时快速识别占位 `base_url`/Key，并对过短的请求超时发出警告。
+- 在代理层新增 **请求体校验**，对 `max_tokens` 和 `reasoning_effort` 进行前置检查，避免非法 OpenAI 风格请求到达 NVIDIA。
+- 补充单元测试覆盖上述两层校验。
 
 ## 测试
 

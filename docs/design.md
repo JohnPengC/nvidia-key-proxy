@@ -70,6 +70,20 @@ Key goals
   * Probe each key; on success → reset fail count, ensure `Active`.
   * On failure → increment fail count; after `max_consecutive_failures` → move to `Cooling` (or `Disabled` if desired).
 
+### Validation
+
+Two validation layers prevent avoidable upstream failures and reduce noise in `failure.log`:
+
+1. **Configuration validation** (`Config::validate`, called from `Config::load` after env overrides):
+   * Rejects placeholder `base_url` values (`example.com`, `localhost`, `127.0.0.1`) and URLs without a scheme.
+   * Rejects obviously fake/short API keys (`fake`, `dummy`, `test`, `example`, `placeholder`, or shorter than 8 characters).
+   * Warns when `request_timeout_seconds` is set below 5 seconds, because such aggressive values cause false timeouts on normal LLM latency.
+
+2. **Request-body validation** in the proxy handler before a key is consumed:
+   * `max_tokens` must be an integer >= 1.
+   * `reasoning_effort` must be `"low"`, `"medium"`, or `"high"`.
+   * Invalid requests are returned as 400 immediately, without acquiring a key or contacting NVIDIA.
+
 ### Metrics (Prometheus)
 
 * `proxy_requests_total{status="success|error|throttled"}`
@@ -143,8 +157,8 @@ ENTRYPOINT ["/usr/local/bin/nvidia-key-proxy"]
 
 ### Testing Strategy
 
-* **Unit tests** – `KeyPool` state transitions, token‑bucket correctness, proxy retry / timeout behaviour.
-* **Integration tests** – spin up a mock NVIDIA server (using `warp`) that can return 200, 429, 500; assert proxy rotates keys, honors rate limits, honors cool‑down. Additional tests cover the health endpoint, metrics (enabled/disabled), and unknown-path 404 handling.
+* **Unit tests** – `KeyPool` state transitions, token‑bucket correctness, proxy retry / timeout behaviour, and request validation (`max_tokens`, `reasoning_effort`).
+* **Integration tests** – spin up a mock NVIDIA server (using `warp`) that can return 200, 429, 500; assert proxy rotates keys, honors rate limits, honors cool‑down. Additional tests cover the health endpoint, metrics (enabled/disabled), unknown-path 404 handling, and configuration validation.
 * **Load test** – use `wrk` or `hey` against the proxy; verify metrics show distributed load and that no single key exceeds its QPS.
 * **Security audit** – ensure logs never contain full API keys (custom `Debug` impl on `Config` masks keys as `XXXX***XXXX`).
 

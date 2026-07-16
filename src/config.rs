@@ -3,6 +3,7 @@ use serde::Deserialize;
 use std::fmt;
 use std::fs;
 use std::net::SocketAddr;
+use tracing::{info, warn};
 
 use crate::key_pool::mask_key;
 
@@ -193,6 +194,8 @@ impl Config {
         // Override from environment variables (NVIDIA_*)
         Self::apply_env_overrides(&mut config);
 
+        config.validate()?;
+
         if config.keys.is_empty() {
             return Err(
                 "No API keys configured. Set `keys` in config.toml or NVIDIA_KEYS env var.".into(),
@@ -200,6 +203,82 @@ impl Config {
         }
 
         Ok(config)
+    }
+
+    /// Validate configuration values after all overrides have been applied.
+    /// Catches placeholder/fake values that would otherwise manifest as 401/404
+    /// failures at runtime.
+    pub fn validate(&self) -> Result<(), Box<dyn std::error::Error>> {
+        // base_url must be a real endpoint, not the default example domain or
+        // a loopback address. Using example.com/localhost in production means
+        // every upstream request will 404/401 and burn retry budget.
+        if self.base_url.is_empty() {
+            return Err("base_url must not be empty".into());
+        }
+        let base_lower = self.base_url.to_ascii_lowercase();
+        if base_lower.contains("example.com")
+            || base_lower.contains("localhost")
+            || base_lower.contains("127.0.0.1")
+        {
+            return Err(format!(
+                "base_url '{}' looks like a placeholder/development endpoint; \
+                 set a real NVIDIA API base URL",
+                self.base_url
+            )
+            .into());
+        }
+        if !base_lower.starts_with("http://") && !base_lower.starts_with("https://") {
+            return Err(format!(
+                "base_url '{}' must start with http:// or https://",
+                self.base_url
+            )
+            .into());
+        }
+
+        // Reject obviously fake/test keys before startup. The log showed
+        // fake***-key / dumm***_key / cursor-dummy-key causing 401s; failing
+        // fast here prevents silent operation on a broken key pool.
+        if self.keys.is_empty() {
+            return Err(
+                "No API keys configured. Set `keys` in config.toml or NVIDIA_KEYS env var.".into(),
+            );
+        }
+        for key in &self.keys {
+            if key.len() < 8 {
+                return Err(format!(
+                    "API key '{}' is too short (must be at least 8 characters)",
+                    mask_key(key)
+                )
+                .into());
+            }
+            let key_lower = key.to_ascii_lowercase();
+            if key_lower.contains("fake")
+                || key_lower.contains("dummy")
+                || key_lower.contains("test")
+                || key_lower.contains("example")
+                || key_lower.contains("placeholder")
+            {
+                return Err(format!(
+                    "API key '{}' looks like a placeholder/fake key; \
+                     provide real NVIDIA API keys",
+                    mask_key(key)
+                )
+                .into());
+            }
+        }
+
+        // Warn if the per-request timeout is so short that it will trip on
+        // normal LLM response latency. The failure.log showed timeout=1s on
+        // chat completions, which is almost certainly a misconfiguration.
+        if self.request_timeout_seconds > 0 && self.request_timeout_seconds < 5 {
+            warn!(
+                "request_timeout_seconds={} is very short; consider 30+ seconds for non-streaming requests",
+                self.request_timeout_seconds
+            );
+        }
+
+        info!("Configuration validation passed");
+        Ok(())
     }
 
     fn apply_env_overrides(config: &mut Config) {
@@ -303,5 +382,104 @@ impl Config {
                 _ => {}
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod config_validation_tests {
+    use super::*;
+
+    fn base_valid_config() -> Config {
+        Config {
+            listen_addr: "0.0.0.0:8888".to_string(),
+            base_url: "https://integrate.api.nvidia.com".to_string(),
+            keys: vec!["nvapi-realvalidkey1234567890".to_string()],
+            rate_limiter: RateLimiterConfig {
+                qps_per_key: 0.65,
+                burst: 8,
+                token_wait_ms: 200,
+            },
+            cooldown: CooldownConfig {
+                base_seconds: 60,
+                max_seconds: 600,
+            },
+            health_check: HealthCheckConfig {
+                interval_seconds: 30,
+                timeout_seconds: 5,
+                max_consecutive_failures: 3,
+            },
+            observability: ObservabilityConfig {
+                enable_metrics: true,
+                metrics_path: "/metrics".to_string(),
+                log_level: "info".to_string(),
+            },
+            request_timeout_seconds: 60,
+            retry: RetryConfig::default(),
+        }
+    }
+
+    #[test]
+    fn valid_config_passes() {
+        let cfg = base_valid_config();
+        assert!(cfg.validate().is_ok(), "valid config should pass");
+    }
+
+    #[test]
+    fn empty_base_url_fails() {
+        let mut cfg = base_valid_config();
+        cfg.base_url = "".to_string();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn example_com_base_url_fails() {
+        let mut cfg = base_valid_config();
+        cfg.base_url = "http://example.com".to_string();
+        let err = cfg.validate().expect_err("should fail");
+        let msg = err.to_string();
+        assert!(msg.contains("placeholder"), "error should mention placeholder: {}", msg);
+    }
+
+    #[test]
+    fn localhost_base_url_fails() {
+        let mut cfg = base_valid_config();
+        cfg.base_url = "http://127.0.0.1:8080".to_string();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn missing_scheme_base_url_fails() {
+        let mut cfg = base_valid_config();
+        cfg.base_url = "integrate.api.nvidia.com".to_string();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn fake_key_fails() {
+        let mut cfg = base_valid_config();
+        cfg.keys = vec!["fake-key-1234567890".to_string()];
+        let err = cfg.validate().expect_err("should fail");
+        assert!(err.to_string().contains("placeholder"));
+    }
+
+    #[test]
+    fn dummy_key_fails() {
+        let mut cfg = base_valid_config();
+        cfg.keys = vec!["cursor-dummy-key".to_string()];
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn short_key_fails() {
+        let mut cfg = base_valid_config();
+        cfg.keys = vec!["nvapi-1".to_string()];
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn empty_keys_fails() {
+        let mut cfg = base_valid_config();
+        cfg.keys = vec![];
+        assert!(cfg.validate().is_err());
     }
 }

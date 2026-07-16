@@ -110,6 +110,23 @@ A lightweight, high‑performance proxy written in Rust that fronts multiple NVI
 | `backoff_max_ms` | Maximum backoff in milliseconds | `2000` |
 | `auth_fail_threshold` | Consecutive auth failures before a key is disabled | `3` |
 
+## Configuration Validation
+
+At startup the proxy validates the loaded configuration and exits early if it looks misconfigured, preventing silent failures (e.g. 401/404 caused by placeholder values):
+
+- `base_url` must not be `example.com`, `localhost`, or `127.0.0.1`, and must start with `http://` or `https://`.
+- API keys must be at least 8 characters long and cannot contain `fake`, `dummy`, `test`, `example`, or `placeholder`.
+- A `request_timeout_seconds` value below `5` logs a warning suggesting a larger value.
+
+## Request Validation
+
+Before forwarding chat-completion requests, the proxy validates request-body fields that are known to cause upstream 400s:
+
+- `max_tokens`: if present, must be an integer >= 1.
+- `reasoning_effort`: if present, must be one of `"low"`, `"medium"`, or `"high"`.
+
+Invalid requests are rejected immediately with a 400 and never reach the upstream key pool, avoiding wasted retries.
+
 ## Metrics
 
 Prometheus metrics are exposed at `observability.metrics_path` (default `/metrics`) when `observability.enable_metrics` is `true`.
@@ -155,6 +172,12 @@ The proxy is organised into focused modules under `src/lib.rs`:
 - Moved route construction into **`build_routes`**, keeping `main` focused on orchestration.
 - Graceful shutdown now uses a single `Notify` and drops background task handles, avoiding deadlocks.
 - Added integration tests under **`tests/`** verifying health, metrics (enabled/disabled), and unknown‑path handling.
+
+## Validation & Hardening (2026‑07‑16)
+
+- Added **configuration validation** (`Config::validate`) to fail fast on placeholder `base_url`/keys and warn on overly short request timeouts.
+- Added **request-body validation** in the proxy for `max_tokens` and `reasoning_effort`, short-circuiting invalid OpenAI-style chat requests before they reach NVIDIA.
+- Expanded unit tests covering both validation layers.
 
 ## Testing
 

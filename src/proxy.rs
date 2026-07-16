@@ -370,6 +370,34 @@ impl Proxy {
             }
         }
 
+        // Validate `reasoning_effort` for chat completions: NVIDIA (and the
+        // OpenAI spec) only accepts the strings "low", "medium", "high".
+        // Clients sometimes send `true` or arbitrary strings like "max", which
+        // produces a 400 from upstream. Reject early with a clear message so
+        // callers can fix their request instead of burning keys and retries.
+        if let Some(v) = &parsed_body {
+            if let Some(re) = v.get("reasoning_effort") {
+                let valid = match re {
+                    serde_json::Value::String(s) => {
+                        matches!(s.as_str(), "low" | "medium" | "high")
+                    }
+                    _ => false,
+                };
+                if !valid {
+                    warn!(
+                        client_req_id = %client_req_id,
+                        "Invalid reasoning_effort value: {}", re
+                    );
+                    self.metrics.inc_error();
+                    key_handle.dec_in_flight();
+                    return Err(warp::reject::custom(BadRequest {
+                        msg: "Invalid reasoning_effort (must be 'low', 'medium', or 'high')"
+                            .into(),
+                    }));
+                }
+            }
+        }
+
         // Extract `model` once from the client's request body for logging.
         let model = parsed_body
             .as_ref()
@@ -1395,5 +1423,89 @@ mod proxy_integration_tests {
             "no raw numeric code should remain in SSE output, got: {}",
             body
         );
+    }
+
+    /// Invalid `reasoning_effort` values (e.g. "max") must be rejected before
+    /// hitting upstream, mirroring the upstream 400 but saving a key attempt.
+    #[tokio::test]
+    async fn invalid_reasoning_effort_max_returns_400() {
+        let mock_server = MockServer::start().await;
+        // The proxy should reject before forwarding, so upstream sees 0 calls.
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        let addr = start_proxy(test_config(&mock_server.uri(), 0, 60)).await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://{}/v1/chat/completions", addr))
+            .header("content-type", "application/json")
+            .body(r#"{"model":"m","messages":[],"reasoning_effort":"max"}"#)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 400);
+        let body = resp.text().await.unwrap();
+        assert!(
+            body.contains("reasoning_effort"),
+            "error body should mention reasoning_effort, got: {}", body
+        );
+    }
+
+    /// Boolean `reasoning_effort` is also invalid per the OpenAI schema.
+    #[tokio::test]
+    async fn invalid_reasoning_effort_true_returns_400() {
+        let mock_server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        let addr = start_proxy(test_config(&mock_server.uri(), 0, 60)).await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://{}/v1/chat/completions", addr))
+            .header("content-type", "application/json")
+            .body(r#"{"model":"m","messages":[],"reasoning_effort":true}"#)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 400);
+    }
+
+    /// Valid `reasoning_effort` values are forwarded normally.
+    #[tokio::test]
+    async fn valid_reasoning_effort_is_forwarded() {
+        let mock_server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "chatcmpl-1",
+                "object": "chat.completion",
+                "model": "m",
+                "choices": []
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let addr = start_proxy(test_config(&mock_server.uri(), 0, 60)).await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://{}/v1/chat/completions", addr))
+            .header("content-type", "application/json")
+            .body(r#"{"model":"m","messages":[],"reasoning_effort":"high"}"#)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 200);
     }
 }
