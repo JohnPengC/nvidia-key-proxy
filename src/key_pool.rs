@@ -332,6 +332,31 @@ impl std::fmt::Debug for TokenBucket {
     }
 }
 
+/// Build a fresh `KeyStateHandle` for `key_str` with a full token bucket and
+/// `Active` state. Shared by `KeyPool::new` (startup init) and `add_key`
+/// (runtime key injection) so both paths construct identical handles.
+fn make_handle(config: &Config, key_str: &str) -> KeyStateHandle {
+    let bucket = TokenBucket::new(
+        config.rate_limiter.burst as u32,
+        if config.rate_limiter.qps_per_key > 0.0 {
+            config.rate_limiter.qps_per_key
+        } else {
+            1.0
+        },
+    );
+    KeyStateHandle {
+        inner: Arc::new(RwLock::new(InnerKeyState {
+            key: Arc::new(key_str.to_string()),
+            state: KeyState::Active,
+            weight: 1,
+            fail_count: 0,
+            last_success: None,
+            bucket,
+        })),
+        in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+    }
+}
+
 pub struct KeyPool {
     /// map from key string to handle
     pub(crate) inner: RwLock<HashMap<String, KeyStateHandle>>,
@@ -347,30 +372,7 @@ impl KeyPool {
         let mut inner = HashMap::new();
         // Initialize keys
         for key_str in &config.keys {
-            let key_id = KeyId(Arc::new(key_str.clone()));
-            // A non-positive qps_per_key is treated as 1.0 token/sec rather
-            // than unlimited, so the bucket always has a defined refill rate.
-            // Consider adding a config validation or explicit "unlimited" mode
-            // if that is the intended semantics.
-            let bucket = TokenBucket::new(
-                config.rate_limiter.burst as u32,
-                if config.rate_limiter.qps_per_key > 0.0 {
-                    config.rate_limiter.qps_per_key
-                } else {
-                    1.0
-                },
-            );
-            let handle = KeyStateHandle {
-                inner: Arc::new(RwLock::new(InnerKeyState {
-                    key: key_id.0.clone(),
-                    state: KeyState::Active,
-                    weight: 1,
-                    fail_count: 0,
-                    last_success: None,
-                    bucket,
-                })),
-                in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
-            };
+            let handle = make_handle(config, key_str);
             inner.insert(key_str.clone(), handle);
         }
         Self {
@@ -536,6 +538,25 @@ impl KeyPool {
         false
     }
 
+    /// Force a key into `Disabled` state (used by the health checker when a
+    /// key's recovery probe errors `max_consecutive_failures` times in a row).
+    /// Mirrors the `Disabled` transition inside `mark_failure`.
+    pub async fn disable_key(&self, key_str: &str) {
+        let read_guard = self.inner.read().await;
+        if let Some(handle) = read_guard.get(key_str) {
+            let handle = handle.clone();
+            drop(read_guard);
+            let ready_at = Instant::now() + Duration::from_secs(self.config.cooldown.max_seconds);
+            handle.set_state(KeyState::Disabled { ready_at }).await;
+            warn!(
+                key = %mask_key(key_str),
+                "Key force-disabled by health probe (consecutive probe failures)"
+            );
+            let _ = self.pub_notifier.send(handle);
+        }
+        self.refresh_metrics().await;
+    }
+
     /// Reactivate a previously Disabled key after a successful health probe.
     pub async fn recover_disabled(&self, key_str: &str) {
         self.mark_good(key_str).await;
@@ -613,6 +634,86 @@ impl KeyPool {
         self.refresh_metrics().await;
     }
 
+    /// Inject a key into the pool at runtime. Returns `true` if the key was
+    /// newly added, `false` if it already existed (its existing handle is left
+    /// untouched). The new key starts `Active` with a full token bucket and is
+    /// immediately eligible for `acquire()`.
+    pub async fn add_key(&self, key_str: String) -> bool {
+        if key_str.len() < 8 || key_str.trim().is_empty() {
+            warn!(key = %mask_key(&key_str), "Refusing to add key: too short or blank");
+            return false;
+        }
+        let mut write_guard = self.inner.write().await;
+        if write_guard.contains_key(&key_str) {
+            return false;
+        }
+        let handle = make_handle(&self.config, &key_str);
+        write_guard.insert(key_str.clone(), handle);
+        info!(key = %mask_key(&key_str), "Key added to pool at runtime");
+        drop(write_guard);
+        self.refresh_metrics().await;
+        true
+    }
+
+    /// Remove a key from the pool at runtime. Returns `true` if the key was
+    /// present (and removed), `false` otherwise. In-flight requests holding the
+    /// key continue to completion; `acquire()` will simply never pick it again.
+    pub async fn remove_key(&self, key_str: &str) -> bool {
+        let mut write_guard = self.inner.write().await;
+        let removed = write_guard.remove(key_str).is_some();
+        drop(write_guard);
+        if removed {
+            info!(key = %mask_key(key_str), "Key removed from pool at runtime");
+            self.refresh_metrics().await;
+        }
+        removed
+    }
+
+    /// Snapshot every key's current state for the admin `/admin/keys`
+    /// endpoint / observability. `Instant`-based fields are surfaced as
+    /// human-friendly derived values (state name, seconds-until-ready,
+    /// seconds-since-last-success) because `Instant` isn't serializable.
+    pub async fn snapshot(&self) -> Vec<serde_json::Value> {
+        let handles: Vec<(String, KeyStateHandle)> = {
+            let read_guard = self.inner.read().await;
+            read_guard
+                .iter()
+                .map(|(k, h)| (k.clone(), h.clone()))
+                .collect()
+        };
+        let now = Instant::now();
+        let mut out = Vec::with_capacity(handles.len());
+        for (key_str, handle) in handles {
+            let guard = handle.inner.read().await;
+            let (state_name, ready_in_secs) = match guard.state {
+                KeyState::Active => ("active".to_string(), None),
+                KeyState::Cooling { ready_at } => (
+                    "cooling".to_string(),
+                    Some(ready_at.saturating_duration_since(now).as_secs()),
+                ),
+                KeyState::Disabled { ready_at } => (
+                    "disabled".to_string(),
+                    Some(ready_at.saturating_duration_since(now).as_secs()),
+                ),
+            };
+            let last_success_secs = guard.last_success.map(|t| {
+                // `Instant` has no wall-clock; expose elapsed-since as a proxy.
+                now.saturating_duration_since(t).as_secs()
+            });
+            out.push(serde_json::json!({
+                "key": mask_key(&key_str),
+                "state": state_name,
+                "ready_in_secs": ready_in_secs,
+                "weight": guard.weight,
+                "fail_count": guard.fail_count,
+                "in_flight": handle.in_flight.load(std::sync::atomic::Ordering::Relaxed),
+                "available_tokens": guard.bucket.available_tokens().await,
+                "last_success_secs_ago": last_success_secs,
+            }));
+        }
+        out
+    }
+
     /// Background task to move cooling keys back to active when ready.
     /// `stop` is a Notify that signals graceful shutdown.
     ///
@@ -677,7 +778,7 @@ impl KeyPool {
 mod retry_state_machine_tests {
     use super::*;
     use crate::config::{
-        CooldownConfig, HealthCheckConfig, ObservabilityConfig, RateLimiterConfig,
+        AuthConfig, CooldownConfig, HealthCheckConfig, ObservabilityConfig, RateLimiterConfig,
     };
 
     fn build_pool(keys: &[&str]) -> KeyPool {
@@ -706,6 +807,10 @@ mod retry_state_machine_tests {
             },
             request_timeout_seconds: 0,
             retry: crate::config::RetryConfig::default(),
+            model_aliases: std::collections::HashMap::new(),
+            allow_local_base_url: false,
+            auth: AuthConfig::default(),
+            inject_stream_usage: true,
         };
         let metrics = Arc::new(Metrics::new());
         KeyPool::new(&cfg, metrics)
@@ -820,7 +925,7 @@ mod mask_key_tests {
 mod score_selection_tests {
     use super::*;
     use crate::config::{
-        CooldownConfig, HealthCheckConfig, ObservabilityConfig, RateLimiterConfig,
+        AuthConfig, CooldownConfig, HealthCheckConfig, ObservabilityConfig, RateLimiterConfig,
     };
 
     fn build_pool_with_keys(keys: &[&str], qps: f64, burst: u64) -> KeyPool {
@@ -849,6 +954,10 @@ mod score_selection_tests {
             },
             request_timeout_seconds: 0,
             retry: crate::config::RetryConfig::default(),
+            model_aliases: std::collections::HashMap::new(),
+            allow_local_base_url: false,
+            auth: AuthConfig::default(),
+            inject_stream_usage: true,
         };
         let metrics = Arc::new(Metrics::new());
         KeyPool::new(&cfg, metrics)
@@ -955,5 +1064,81 @@ mod score_selection_tests {
         // With only one key now in Cooling, acquire must return None.
         let acquire = pool.acquire().await;
         assert!(acquire.is_none(), "Cooling key must not be acquireable");
+    }
+}
+
+#[cfg(test)]
+mod runtime_key_tests {
+    use super::*;
+    use crate::config::{
+        AuthConfig, CooldownConfig, HealthCheckConfig, ObservabilityConfig, RateLimiterConfig,
+    };
+
+    fn pool(keys: &[&str]) -> KeyPool {
+        let cfg = Config {
+            listen_addr: "0.0.0.0:8888".to_string(),
+            base_url: "https://example.test".to_string(),
+            keys: keys.iter().map(|s| s.to_string()).collect(),
+            rate_limiter: RateLimiterConfig {
+                qps_per_key: 100.0,
+                burst: 100,
+                token_wait_ms: 0,
+            },
+            cooldown: CooldownConfig {
+                base_seconds: 1,
+                max_seconds: 2,
+            },
+            health_check: HealthCheckConfig {
+                interval_seconds: 1,
+                timeout_seconds: 1,
+                max_consecutive_failures: 3,
+            },
+            observability: ObservabilityConfig {
+                enable_metrics: false,
+                metrics_path: "/metrics".to_string(),
+                log_level: "info".to_string(),
+            },
+            request_timeout_seconds: 0,
+            retry: crate::config::RetryConfig::default(),
+            model_aliases: std::collections::HashMap::new(),
+            allow_local_base_url: false,
+            auth: AuthConfig::default(),
+            inject_stream_usage: true,
+        };
+        KeyPool::new(&cfg, Arc::new(Metrics::new()))
+    }
+
+    #[tokio::test]
+    async fn add_then_remove_key_changes_pool() {
+        let pool = pool(&["k1"]);
+        assert!(pool.add_key("k2-new-key".to_string()).await);
+        // Duplicate add returns false.
+        assert!(!pool.add_key("k2-new-key".to_string()).await);
+        // Too-short key is rejected.
+        assert!(!pool.add_key("short".to_string()).await);
+
+        let snap = pool.snapshot().await;
+        assert_eq!(snap.len(), 2);
+        let maskeds: Vec<&str> = snap
+            .iter()
+            .map(|v| v.get("key").and_then(|x| x.as_str()).unwrap())
+            .collect();
+        assert!(maskeds.iter().any(|m| m.contains("k2")));
+
+        assert!(pool.remove_key("k2-new-key").await);
+        assert!(!pool.remove_key("k2-new-key").await); // already gone
+        assert_eq!(pool.snapshot().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn snapshot_reports_state_and_in_flight() {
+        let pool = pool(&["k1", "k2"]);
+        let snap = pool.snapshot().await;
+        assert_eq!(snap.len(), 2);
+        for v in &snap {
+            assert_eq!(v.get("state").and_then(|x| x.as_str()), Some("active"));
+            assert_eq!(v.get("in_flight").and_then(|x| x.as_u64()), Some(0));
+            assert!(v.get("available_tokens").is_some());
+        }
     }
 }

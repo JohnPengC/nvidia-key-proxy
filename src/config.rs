@@ -23,10 +23,68 @@ pub struct Config {
     /// Retry/upstream-error policy (exponential backoff, key-disable threshold).
     #[serde(default)]
     pub retry: RetryConfig,
+    /// Client-facing model name → NVIDIA-ready model id. Empty by default.
+    /// When a chat-completion request carries `model` matching a key here,
+    /// the proxy rewrites the field to the mapped value before forwarding.
+    /// Unmatched names are forwarded unchanged.
+    #[serde(default)]
+    pub model_aliases: std::collections::HashMap<String, String>,
+    /// Allow `base_url` to point at a loopback / localhost address. Off by
+    /// default because production should never target example.com/localhost,
+    /// but turning it on is handy for pointing the proxy at a local
+    /// NVIDIA-compatible mock during development / integration testing.
+    #[serde(default)]
+    pub allow_local_base_url: bool,
+    /// Front-door authentication for the proxy itself. The pool's NVIDIA
+    /// quota is exposed to anyone who can reach `listen_addr`; enabling this
+    /// requires clients to present `Authorization: Bearer <bearer_token>` on
+    /// `/v1/*` requests. Disabled by default to preserve the "any api_key
+    /// works" behaviour existing clients rely on. `/health` is always exempt.
+    #[serde(default)]
+    pub auth: AuthConfig,
+    /// Inject `stream_options.include_usage: true` into streaming chat
+    /// requests so upstream returns token usage at stream end. NVIDIA/OpenAI
+    /// only emit usage when this flag is set; without it the proxy's token
+    /// metrics are zero for the (common) streaming case. Defaults to true;
+    /// disable via `inject_stream_usage = false` or `NVIDIA_INJECT_STREAM_USAGE=false`.
+    #[serde(default = "default_inject_stream_usage")]
+    pub inject_stream_usage: bool,
 }
 
 fn default_request_timeout_seconds() -> u64 {
     60
+}
+
+fn default_inject_stream_usage() -> bool {
+    true
+}
+
+/// Front-door auth config. See `Config::auth` for the rationale.
+#[derive(Debug, Deserialize, Clone)]
+pub struct AuthConfig {
+    /// Require clients to authenticate before the proxy forwards their
+    /// request. When false, requests are forwarded without checking a token.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Bearer token clients must present. Also overridable via
+    /// `NVIDIA_AUTH_BEARER_TOKEN`. Empty when not set.
+    #[serde(default)]
+    pub bearer_token: String,
+    /// Bearer token required by the `/admin/*` management API (key add/remove
+    /// / status). When empty (and `NVIDIA_AUTH_ADMIN_TOKEN` unset), the admin
+    /// API is disabled entirely. Also overridable via `NVIDIA_AUTH_ADMIN_TOKEN`.
+    #[serde(default)]
+    pub admin_token: String,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bearer_token: String::new(),
+            admin_token: String::new(),
+        }
+    }
 }
 
 impl fmt::Debug for Config {
@@ -45,6 +103,26 @@ impl fmt::Debug for Config {
             .field("observability", &self.observability)
             .field("request_timeout_seconds", &self.request_timeout_seconds)
             .field("retry", &self.retry)
+            .field("model_aliases", &self.model_aliases)
+            .field("allow_local_base_url", &self.allow_local_base_url)
+            .field("inject_stream_usage", &self.inject_stream_usage)
+            .field(
+                "auth",
+                &format!(
+                    "AuthConfig {{ enabled: {}, bearer_token: {}, admin_token: {} }}",
+                    self.auth.enabled,
+                    if self.auth.bearer_token.is_empty() {
+                        "<none>"
+                    } else {
+                        "<set>"
+                    },
+                    if self.auth.admin_token.is_empty() {
+                        "<none>"
+                    } else {
+                        "<set>"
+                    }
+                ),
+            )
             .finish()
     }
 }
@@ -99,6 +177,12 @@ pub struct RetryConfig {
     /// key is Disabled (until a health probe recovers it). Default 3.
     #[serde(default = "default_auth_fail_threshold")]
     pub auth_fail_threshold: u32,
+    /// Max times a single client request may switch to another key because
+    /// the current key's token bucket was starved. Decoupled from
+    /// `max_retries` (the upstream 401 retry budget) so key-switching and
+    /// retry-on-auth-failure are tuned independently. Defaults to `max_retries`.
+    #[serde(default = "default_max_key_switches")]
+    pub max_key_switches: u32,
 }
 
 fn default_max_retries() -> u32 {
@@ -113,6 +197,9 @@ fn default_backoff_max_ms() -> u64 {
 fn default_auth_fail_threshold() -> u32 {
     3
 }
+fn default_max_key_switches() -> u32 {
+    default_max_retries()
+}
 
 impl Default for RetryConfig {
     fn default() -> Self {
@@ -121,6 +208,7 @@ impl Default for RetryConfig {
             backoff_base_ms: default_backoff_base_ms(),
             backoff_max_ms: default_backoff_max_ms(),
             auth_fail_threshold: default_auth_fail_threshold(),
+            max_key_switches: default_max_key_switches(),
         }
     }
 }
@@ -170,6 +258,10 @@ impl Config {
             },
             request_timeout_seconds: default_request_timeout_seconds(),
             retry: RetryConfig::default(),
+            model_aliases: std::collections::HashMap::new(),
+            allow_local_base_url: false,
+            auth: AuthConfig::default(),
+            inject_stream_usage: default_inject_stream_usage(),
         };
 
         // Prefer NVIDIA_CONFIG_PATH, fall back to ./config.toml
@@ -189,6 +281,14 @@ impl Config {
             config.observability = toml_config.observability;
             config.request_timeout_seconds = toml_config.request_timeout_seconds;
             config.retry = toml_config.retry;
+            config.allow_local_base_url = toml_config.allow_local_base_url;
+            config.auth = toml_config.auth;
+            // Merge model_aliases: TOML-defined aliases take precedence, but
+            // we *add* (don't replace) the default set so callers can extend
+            // rather than override in the common case.
+            for (k, v) in toml_config.model_aliases.into_iter() {
+                config.model_aliases.insert(k, v);
+            }
         }
 
         // Override from environment variables (NVIDIA_*)
@@ -216,9 +316,10 @@ impl Config {
             return Err("base_url must not be empty".into());
         }
         let base_lower = self.base_url.to_ascii_lowercase();
-        if base_lower.contains("example.com")
-            || base_lower.contains("localhost")
-            || base_lower.contains("127.0.0.1")
+        if !self.allow_local_base_url
+            && (base_lower.contains("example.com")
+                || base_lower.contains("localhost")
+                || base_lower.contains("127.0.0.1"))
         {
             return Err(format!(
                 "base_url '{}' looks like a placeholder/development endpoint; \
@@ -379,6 +480,32 @@ impl Config {
                         config.retry.auth_fail_threshold = v;
                     }
                 }
+                "retry_max_key_switches" => {
+                    if let Ok(v) = value.parse::<u32>() {
+                        config.retry.max_key_switches = v;
+                    }
+                }
+                "allow_local_base_url" => {
+                    if let Ok(v) = value.parse::<bool>() {
+                        config.allow_local_base_url = v;
+                    }
+                }
+                "auth_enabled" => {
+                    if let Ok(v) = value.parse::<bool>() {
+                        config.auth.enabled = v;
+                    }
+                }
+                "auth_bearer_token" => {
+                    config.auth.bearer_token = value;
+                }
+                "auth_admin_token" => {
+                    config.auth.admin_token = value;
+                }
+                "inject_stream_usage" => {
+                    if let Ok(v) = value.parse::<bool>() {
+                        config.inject_stream_usage = v;
+                    }
+                }
                 _ => {}
             }
         }
@@ -415,6 +542,10 @@ mod config_validation_tests {
             },
             request_timeout_seconds: 60,
             retry: RetryConfig::default(),
+            model_aliases: std::collections::HashMap::new(),
+            allow_local_base_url: false,
+            auth: AuthConfig::default(),
+            inject_stream_usage: true,
         }
     }
 

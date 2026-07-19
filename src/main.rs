@@ -42,25 +42,37 @@ async fn main() {
         .listen_addr
         .parse()
         .expect("Invalid listen address");
-    info!(
-        "Listening on {}, metrics at {}",
-        addr, state.config.observability.metrics_path
-    );
 
-    // Serve with graceful shutdown support.
-    let (_, server_future) = warp::serve(routes).bind_with_graceful_shutdown(addr, async move {
-        tokio::signal::ctrl_c().await.ok();
-        info!("Shutdown signal received, draining in‑flight requests...");
-    });
+    // When bound to the IPv4 wildcard (0.0.0.0), also bind the IPv6 wildcard
+    // so clients that resolve `localhost` to `::1` can connect (macOS lists
+    // ::1 first). Without this, `http://localhost:<port>` fails even though
+    // `http://127.0.0.1:<port>` works.
+    let mut addrs = vec![addr];
+    if addr.ip().is_unspecified() && addr.is_ipv4() {
+        if let Ok(v6) = format!("[::]:{}", addr.port()).parse::<SocketAddr>() {
+            addrs.push(v6);
+        }
+    }
 
-    // Wait for either the server to finish or a Ctrl+C.
-    tokio::select! {
-        _ = server_future => {
-            info!("Server future completed");
-        }
-        _ = tokio::signal::ctrl_c() => {
-            info!("Ctrl+C received, initiating graceful shutdown");
-        }
+    let mut server_handles = Vec::new();
+    for a in addrs {
+        info!(
+            "Listening on {}, metrics at {}",
+            a, state.config.observability.metrics_path
+        );
+        let (_, fut) = warp::serve(routes.clone()).bind_with_graceful_shutdown(
+            a,
+            async {
+                tokio::signal::ctrl_c().await.ok();
+                info!("Shutdown signal received, draining in‑flight requests...");
+            },
+        );
+        server_handles.push(tokio::spawn(fut));
+    }
+
+    // Wait for all listeners to shut down (each stops on Ctrl+C).
+    for h in server_handles {
+        let _ = h.await;
     }
 
     // Notify background tasks to stop and drop their handles.

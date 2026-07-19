@@ -1,6 +1,10 @@
 listen_addr = "0.0.0.0:8888"
 base_url    = "https://integrate.api.nvidia.com"
 
+# Allow pointing base_url at a loopback/localhost address (e.g. a local
+# NVIDIA-compatible mock during testing). Off by default.
+allow_local_base_url = false
+
 # API keys – can also be set via NVIDIA_KEYS env var (comma-separated)
 keys = [
     "nvapi-xxxxxxxxxxxxxxxx1",
@@ -30,6 +34,11 @@ log_level      = "info"
 # Streaming requests bypass this timeout regardless.
 request_timeout_seconds = 60
 
+# Inject `stream_options.include_usage: true` into streaming chat requests so
+# NVIDIA returns token usage at stream end (default true). Disable to leave
+# streaming requests untouched. Env override: NVIDIA_INJECT_STREAM_USAGE.
+inject_stream_usage = true
+
 
 [retry]
 # Upstream (NVIDIA) auth retry policy.
@@ -42,6 +51,47 @@ max_retries           = 3      # retry attempts per client request (excluding in
 backoff_base_ms       = 200    # first retry sleeps ~backoff_base_ms
 backoff_max_ms        = 2000   # single backoff cap
 auth_fail_threshold   = 3      # consecutive auth-failures to disable a key
+# Max times a single request may switch to another key when the current
+# key's token bucket is starved. Decoupled from `max_retries` (the upstream
+# 401 retry budget). Defaults to `max_retries`.
+max_key_switches       = 3
+
+# Client-facing model name → NVIDIA-ready model id mappings.
+# When a chat-completion request carries `model` matching a key here, the
+# proxy rewrites the field to the mapped value before forwarding upstream.
+# Unmatched names are forwarded unchanged. Empty by default.
+#
+# Use this when your client (cc-switch, Cursor, OpenAI SDK, …) sends
+# OpenAI-style model names that don't exist on NVIDIA NIM, e.g.:
+#
+#   # Front-door authentication for the proxy itself. The NVIDIA quota behind
+# the pool is exposed to anyone who can reach `listen_addr`; enabling this
+# requires clients to present `Authorization: Bearer <bearer_token>` on
+# `/v1/*` requests. Disabled by default to preserve the "any api_key works"
+# behaviour existing clients rely on. `/health` is always exempt.
+[auth]
+enabled       = false
+bearer_token  = ""      # client bearer token; also NVIDIA_AUTH_BEARER_TOKEN
+admin_token   = ""      # protects /admin/* ; also NVIDIA_AUTH_ADMIN_TOKEN
+                        # when empty the admin API is completely disabled (404)
+
+[model_aliases]
+#   "z-ai/glm-5.2"        = "z-ai/glm-5.2"
+#   "gpt-4o"              = "meta/llama-3.1-405b-instruct"
+#   "gpt-4o-mini"         = "meta/llama-3.1-70b-instruct"
+
+# Front-door authentication for the proxy itself. The NVIDIA quota behind
+# the pool is exposed to anyone who can reach `listen_addr`; enabling this
+# requires clients to present `Authorization: Bearer <bearer_token>` on
+# `/v1/*` requests. Disabled by default to preserve the "any api_key works"
+# behaviour existing clients rely on. `/health` is always exempt.
+[auth]
+enabled       = false
+bearer_token  = ""      # client bearer token; also NVIDIA_AUTH_BEARER_TOKEN
+admin_token   = ""      # protects /admin/* ; also NVIDIA_AUTH_ADMIN_TOKEN
+                        # when empty the admin API is completely disabled (404)
+
+[model_aliases]
 
 [codex]
 enabled                  = true
@@ -60,4 +110,5 @@ mode = "local"
 proxy_port = 8888
 api_key = "cursor-dummy-key"
 settings_path = "~/.cursor/config.json"
+
 

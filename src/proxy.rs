@@ -2,6 +2,7 @@ use bytes::Bytes;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Mutex;
 
 use tracing::{error, info, warn};
 use warp::{self, Rejection, Reply};
@@ -9,9 +10,10 @@ use warp::{self, Rejection, Reply};
 use crate::failure_log;
 use crate::key_pool::{mask_key, KeyPool};
 use crate::metrics::Metrics;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use futures_util::{Stream, StreamExt};
 use reqwest::header::{self as req_header, HeaderValue as ReqHeaderValue};
-use std::pin::Pin;
 
 /// Process-wide monotonic counter used to mint per-failure `req_id`s.
 /// Monotonic, never resets — gives us a stable correlation id for retries
@@ -38,6 +40,20 @@ pub struct Proxy {
     /// Max milliseconds to wait on a single key's token bucket before
     /// switching to another key. 0 disables the timeout entirely.
     token_wait_ms: u64,
+    /// Client-facing model name → NVIDIA-ready model id map. When a request
+    /// carries `model` matching a key here, the proxy rewrites the field to
+    /// the mapped value before forwarding upstream. Unmatched names are
+    /// forwarded unchanged.
+    model_aliases: std::collections::HashMap<String, String>,
+    /// Cache of the upstream `/v1/models` catalog. NVIDIA answers this
+    /// endpoint without auth, so we forward it through and memoize the
+    /// result to avoid re-probing upstream on every client startup.
+    models_cache: Arc<Mutex<Option<serde_json::Value>>>,
+    /// Inject `stream_options.include_usage: true` into streaming chat
+    /// requests so NVIDIA returns token usage at stream end. NVIDIA/OpenAI
+    /// only emit usage when this flag is set; without it our token metrics
+    /// are zero for the (common) streaming case.
+    inject_stream_usage: bool,
 }
 
 /// Outcome of a single upstream attempt. `Retry` is used only for 401 without
@@ -155,6 +171,42 @@ fn coerce_sse_chunk(chunk: &Bytes) -> Bytes {
     }
 }
 
+/// Build a JSON error response with the given status and OpenAI-style
+/// `{"error":{"message":..., "type":...}}` body. Used for unsupported API
+/// shapes (Responses / Anthropic Messages) so clients get a clear, typed
+/// signal instead of a confusing upstream 404.
+fn json_error(status: warp::http::StatusCode, message: &str) -> warp::reply::Response {
+    let body = serde_json::json!({ "error": { "message": message, "type": "not_supported" } })
+        .to_string();
+    warp::http::Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .body(warp::hyper::Body::from(body))
+        .unwrap_or_else(|_| {
+            warp::http::Response::builder()
+                .status(warp::http::StatusCode::INTERNAL_SERVER_ERROR)
+                .body(warp::hyper::Body::empty())
+                .unwrap()
+        })
+}
+
+/// Build a JSON response from an arbitrary `serde_json::Value` (e.g. the
+/// upstream `/v1/models` catalog), used when forwarding NVIDIA's real model
+/// list through unchanged.
+fn json_value_response(status: warp::http::StatusCode, v: &serde_json::Value) -> warp::reply::Response {
+    let body = serde_json::to_vec(v).unwrap_or_default();
+    warp::http::Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .body(warp::hyper::Body::from(body))
+        .unwrap_or_else(|_| {
+            warp::http::Response::builder()
+                .status(warp::http::StatusCode::INTERNAL_SERVER_ERROR)
+                .body(warp::hyper::Body::empty())
+                .unwrap()
+        })
+}
+
 /// Build a compact, stable summary of the request body for logging.
 /// Captures the fields most likely to correlate with upstream failures:
 /// model, number of messages, whether streaming, and the presence of
@@ -184,6 +236,105 @@ fn body_summary(parsed_body: &Option<serde_json::Value>) -> String {
     serde_json::Value::Object(summary).to_string()
 }
 
+/// Token usage extracted from an upstream `usage` object. Any component may
+/// be `None` when the upstream omits it (e.g. streaming chunks before the
+/// final one, or usage-less responses).
+#[derive(Debug, Default, Clone, Copy)]
+struct Usage {
+    prompt: Option<u64>,
+    completion: Option<u64>,
+    total: Option<u64>,
+}
+
+/// Pull `Usage` out of a parsed JSON value. Returns `None` when there is no
+/// `usage` object, so callers can keep the most recent one they've seen.
+fn parse_usage(v: &serde_json::Value) -> Option<Usage> {
+    let u = v.get("usage")?;
+    Some(Usage {
+        prompt: u
+            .get("prompt_tokens")
+            .and_then(|x| x.as_i64())
+            .map(|x| x.max(0) as u64),
+        completion: u
+            .get("completion_tokens")
+            .and_then(|x| x.as_i64())
+            .map(|x| x.max(0) as u64),
+        total: u
+            .get("total_tokens")
+            .and_then(|x| x.as_i64())
+            .map(|x| x.max(0) as u64),
+    })
+}
+
+/// A stream wrapper that scans each forwarded chunk for `usage` (handling
+/// SSE `data:` lines and bare JSON, with a carry buffer for lines split
+/// across chunk boundaries) and, once the upstream stream ends, records the
+/// most recent usage to the Prometheus counters. This is what makes
+/// `proxy_tokens_input/output/total` actually reflect real traffic — without
+/// it, successful responses were forwarded as a stream and never inspected.
+struct UsageTap<S> {
+    inner: S,
+    metrics: Arc<Metrics>,
+    carry: String,
+    usage: Option<Usage>,
+}
+
+impl<S> UsageTap<S>
+where
+    S: Stream<Item = Result<Bytes, std::io::Error>> + Unpin + Send,
+{
+    fn feed(&mut self, chunk: &Bytes) {
+        let s = match std::str::from_utf8(chunk) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        self.carry.push_str(s);
+        // Process every complete line (one ending in '\n'); keep the trailing
+        // partial line (if any) in `carry` for the next chunk.
+        while let Some(nl) = self.carry.find('\n') {
+            let line: String = self.carry.drain(..=nl).collect();
+            let line = line.trim_end_matches(['\r', '\n']);
+            let json_str = match line.strip_prefix("data:") {
+                Some(rest) => rest.trim_start(),
+                None => line.trim(),
+            };
+            if json_str.is_empty() {
+                continue;
+            }
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
+                if let Some(u) = parse_usage(&v) {
+                    self.usage = Some(u);
+                }
+            }
+        }
+    }
+}
+
+impl<S> Stream for UsageTap<S>
+where
+    S: Stream<Item = Result<Bytes, std::io::Error>> + Unpin + Send,
+{
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let me = self.get_mut();
+        match Pin::new(&mut me.inner).poll_next(cx) {
+            Poll::Ready(Some(Ok(chunk))) => {
+                me.feed(&chunk);
+                Poll::Ready(Some(Ok(chunk)))
+            }
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
+            Poll::Ready(None) => {
+                if let Some(u) = me.usage.take() {
+                    me.metrics.record_usage(u.prompt, u.completion, u.total);
+                }
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
 impl Proxy {
     pub fn new(
         base_url: String,
@@ -192,6 +343,8 @@ impl Proxy {
         request_timeout_secs: u64,
         retry_config: crate::config::RetryConfig,
         token_wait_ms: u64,
+        model_aliases: std::collections::HashMap<String, String>,
+        inject_stream_usage: bool,
     ) -> Self {
         let client = reqwest::Client::builder()
             .pool_idle_timeout(Duration::from_secs(90))
@@ -202,7 +355,7 @@ impl Proxy {
             // chunk resets the read-quiet timer. The per-request
             // `request_timeout_secs` wrapper still governs non-streaming
             // responses end-to-end.
-            .connect_timeout(Duration::from_secs(10))
+            .connect_timeout(Duration::from_secs(5))
             .build()
             .expect("Failed to build reqwest client");
         Self {
@@ -213,12 +366,102 @@ impl Proxy {
             request_timeout_secs,
             retry_config,
             token_wait_ms,
+            model_aliases,
+            models_cache: Arc::new(Mutex::new(None)),
+            inject_stream_usage,
         }
+    }
+
+    /// Build a minimal `/v1/models` response from the configured
+    /// `model_aliases` only. This is the fallback used when the upstream
+    /// `/v1/models` catalog can't be fetched; the full real catalog is
+    /// served via `handle_models` whenever upstream is reachable.
+    ///
+    /// We list alias keys (the client-facing names) rather than the
+    /// mapped NVIDIA ids — the caller already knows them by that name
+    /// and will send them in `model`. We deliberately do NOT hardcode any
+    /// NVIDIA model names: the real catalog is served through
+    /// `handle_models`, and a hardcoded list drifts from reality and can
+    /// point clients at models that don't exist.
+    fn local_models_response(&self) -> warp::reply::Response {
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut entries: Vec<serde_json::Value> = Vec::new();
+
+        for name in self.model_aliases.keys() {
+            if seen.insert(name.clone()) {
+                entries.push(serde_json::json!({
+                    "id": name,
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": "nvidia",
+                }));
+            }
+        }
+
+        let payload = serde_json::json!({
+            "object": "list",
+            "data": entries,
+        });
+        let body = serde_json::to_vec(&payload).unwrap_or_else(|_| b"{}".to_vec());
+        warp::http::Response::builder()
+            .status(warp::http::StatusCode::OK)
+            .header("content-type", "application/json")
+            .body(warp::hyper::Body::from(body))
+            .unwrap_or_else(|_| {
+                warp::http::Response::builder()
+                    .status(warp::http::StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(warp::hyper::Body::empty())
+                    .unwrap()
+            })
+    }
+
+    /// Answer `GET /v1/models` with NVIDIA's real catalog. The upstream
+    /// endpoint is unauthenticated and returns the full OpenAI-format list,
+    /// so we forward it through and cache the result to avoid re-probing
+    /// upstream on every client startup (cc-switch / Cursor fire this on
+    /// launch). On any failure we fall back to the `model_aliases`-only
+    /// list so the endpoint still returns 200.
+    async fn handle_models(&self) -> warp::reply::Response {
+        // Serve from cache if we've already fetched the upstream catalog.
+        if let Some(cached) = self.models_cache.lock().await.clone() {
+            return json_value_response(warp::http::StatusCode::OK, &cached);
+        }
+
+        let result = self
+            .client
+            .get(format!("{}/v1/models", self.base_url))
+            .send()
+            .await;
+
+        if let Ok(resp) = result {
+            if resp.status().is_success() {
+                if let Ok(v) = resp.json::<serde_json::Value>().await {
+                    if v.get("data").is_some() {
+                        *self.models_cache.lock().await = Some(v.clone());
+                        return json_value_response(warp::http::StatusCode::OK, &v);
+                    }
+                }
+            }
+        }
+
+        // Upstream unreachable / malformed: fall back to the configured
+        // `model_aliases` list. We no longer hardcode NVIDIA model names.
+        self.local_models_response()
     }
 
     /// Build an upstream reqwest request for the given client path/method/body
     /// and authorize with `key_str`. Hop-by-hop and client-supplied auth
     /// headers are stripped. The returned builder is ready to `.send()`.
+    ///
+    /// `is_streaming` controls an explicit `Accept` override: NVIDIA (and
+    /// most OpenAI-compatible servers) select SSE vs buffered JSON based on
+    /// the `Accept` header, not just the body's `stream` field. Some clients
+    /// send `stream:true` without `Accept: text/event-stream`, which leads
+    /// NVIDIA to return buffered JSON for a request the client then tries to
+    /// parse as SSE — and to the proxy buffering a long body, which trips
+    /// worker back-pressure (503 ResourceExhausted). Forcing the Accept
+    /// header in lockstep with the `stream` field keeps both sides agreeing
+    /// on the transfer shape.
     fn build_upstream_request(
         &self,
         url: &str,
@@ -226,6 +469,7 @@ impl Proxy {
         headers: &warp::http::HeaderMap,
         body: &bytes::Bytes,
         key_str: &str,
+        is_streaming: bool,
     ) -> reqwest::RequestBuilder {
         let mut req_builder = self.client.request(method.clone(), url);
         req_builder = req_builder
@@ -244,6 +488,9 @@ impl Proxy {
                 | "upgrade"
                 | "content-length"
                 | "host"
+                // `accept` is dropped here and replaced explicitly below so
+                // the proxy controls which response shape NVIDIA picks.
+                | "accept"
                 | "authorization" => continue,
                 _ => {}
             }
@@ -251,6 +498,15 @@ impl Proxy {
                 req_builder = req_builder.header(key_name, req_val);
             }
         }
+        // Force Accept in lockstep with `stream`. This is the single
+        // source of truth for "does the client want SSE", and matches what
+        // cc-switch / OpenAI SDKs do when talking to NVIDIA directly.
+        let accept_val = if is_streaming {
+            "text/event-stream"
+        } else {
+            "application/json"
+        };
+        req_builder = req_builder.header(req_header::ACCEPT, accept_val);
         if !body.is_empty() {
             req_builder = req_builder.body(body.clone());
         }
@@ -269,8 +525,50 @@ impl Proxy {
         let start = std::time::Instant::now();
         self.metrics.inc_request();
 
+        // ── Explicitly reject unsupported API shapes ─────────────────────
+        //
+        // NVIDIA only serves OpenAI Chat Completions. It does not expose the
+        // OpenAI Responses API (`/v1/responses`) nor the Anthropic Messages
+        // API (`/v1/messages`) — both return 404 upstream. Rather than
+        // silently forwarding a body these endpoints can't parse (which
+        // yields a confusing upstream 4xx with no hint to the client), reject
+        // clearly up front, before acquiring a key. (A request to any of
+        // these with an invalid key also 404s at the gateway, so we can't
+        // distinguish "endpoint missing" from "auth failed" that way — we
+        // reject strictly by path.)
+        if path.starts_with("/v1/responses") {
+            return Ok(json_error(
+                warp::http::StatusCode::NOT_IMPLEMENTED,
+                "NVIDIA does not expose OpenAI's Responses API (/v1/responses). \
+                 Send OpenAI Chat Completions requests to /v1/chat/completions.",
+            ));
+        }
+        if path.starts_with("/v1/messages") {
+            return Ok(json_error(
+                warp::http::StatusCode::NOT_IMPLEMENTED,
+                "NVIDIA only serves OpenAI Chat Completions format. \
+                 The Anthropic Messages API (/v1/messages) is not supported.",
+            ));
+        }
+
+        // ── Local answers for metadata endpoints ─────────────────────────
+        //
+        // `GET /v1/models` discovery probes from OpenAI-style clients
+        // (cc-switch, Cursor, …) should not consume a key from our pool nor
+        // burn a rate-limit token. NVIDIA answers this endpoint without auth
+        // and returns its full real catalog, so we forward it through and
+        // cache the result (see `handle_models`). We don't forward chat
+        // traffic on this path.
+        if method == warp::http::Method::GET
+            && (path == "/v1/models" || path == "/v1/models/")
+        {
+            return Ok(self.handle_models().await);
+        }
+
         // ── Acquire a key with token-starvation switch loop ─────────────
-        let max_switches = self.retry_config.max_retries as usize;
+
+        // ── Acquire a key with token-starvation switch loop ─────────────
+        let max_switches = self.retry_config.max_key_switches as usize;
         let token_timeout = self.token_wait_ms;
         let mut tried_key_hashes: Vec<u64> = Vec::new();
         let mut key_handle: Option<crate::key_pool::KeyStateHandle> = None;
@@ -346,81 +644,187 @@ impl Proxy {
         let client_req_id = format!("r{}", next_req_id());
 
         // Parse the body once for validation and metadata extraction.
+        // `body_value` is the (possibly rewritten) JSON we will forward
+        // upstream; `body_bytes` is the serialized bytes derived from it.
+        // When the client's original body is valid JSON we may rewrite
+        // fields whose OpenAI-style spellings NVIDIA rejects (booleans in
+        // `reasoning_effort`/`max_tokens`, client-side model aliases, …)
+        // rather than failing the request — this is what lets cc-switch
+        // clients that work against NVIDIA directly keep working through
+        // the proxy without body edits on their side.
         let parsed_body: Option<serde_json::Value> = serde_json::from_slice(&body).ok();
         let body_summary = body_summary(&parsed_body);
 
-        // Validate `max_tokens` for chat completions: must be a positive
-        // integer when supplied. NVIDIA rejects non-positive values with a
-        // 400 which wastes a request, so we short-circuit here.
-        if let Some(v) = &parsed_body {
-            if let Some(max_val) = v.get("max_tokens") {
-                let is_valid = match max_val {
-                    serde_json::Value::Number(num) => num.as_i64().is_some_and(|n| n >= 1),
-                    serde_json::Value::String(s) => s.parse::<i64>().is_ok_and(|n| n >= 1),
+        // ── Body normalization (in-place rewrite of the parsed JSON) ──────
+        //
+        // For chat-completion-style requests we rewrite a handful of
+        // fields that cc-switch / OpenAI-style clients send in a form
+        // NVIDIA NIM rejects with a 400, instead of bouncing the request
+        // back to the caller. The intent is: "if it would work against
+        // NVIDIA directly, it should work through us."
+        //
+        // Specifically we:
+        //   * `max_tokens`
+        //       - boolean → removed (let NVIDIA pick the model default)
+        //       - null    → removed
+        //       - string  → parsed to int; if not a positive int, removed
+        //       - number <= 0 → removed
+        //   * `reasoning_effort`
+        //       - `true`  → "high"
+        //       - `false` / null → removed
+        //       - string not in {low,medium,high} → removed
+        //         (we used to 400 here, but some clients send "auto" /
+        //         "max" as a preference; safer to drop than to fail)
+        //   * `model` is remapped through `model_aliases` if configured.
+        //
+        // A hard 400 is now reserved for the one case we cannot salvage:
+        // a non-object top-level body for a chat-completion path that the
+        // caller clearly intended to be JSON.
+        let mut body_value: Option<serde_json::Value> = parsed_body.clone();
+        let mut model_rewrite_log: Option<String> = None;
+        if let Some(obj) = body_value.as_mut().and_then(|v| v.as_object_mut()) {
+            // max_tokens normalization
+            if let Some(mt) = obj.get("max_tokens").cloned() {
+                let keep = match &mt {
+                    serde_json::Value::Number(n) => n.as_i64().is_some_and(|x| x >= 1),
+                    serde_json::Value::String(s) => s.parse::<i64>().is_ok_and(|x| x >= 1),
                     _ => false,
                 };
-                if !is_valid {
-                    warn!(client_req_id = %client_req_id, "Invalid max_tokens value: {}", max_val);
-                    self.metrics.inc_error();
-                    key_handle.dec_in_flight();
-                    return Err(warp::reject::custom(BadRequest {
-                        msg: "Invalid max_tokens (must be >= 1)".into(),
-                    }));
-                }
-            }
-        }
-
-        // Validate `reasoning_effort` for chat completions: NVIDIA (and the
-        // OpenAI spec) only accepts the strings "low", "medium", "high".
-        // Clients sometimes send `true` or arbitrary strings like "max", which
-        // produces a 400 from upstream. Reject early with a clear message so
-        // callers can fix their request instead of burning keys and retries.
-        if let Some(v) = &parsed_body {
-            if let Some(re) = v.get("reasoning_effort") {
-                let valid = match re {
-                    serde_json::Value::String(s) => {
-                        matches!(s.as_str(), "low" | "medium" | "high")
-                    }
-                    _ => false,
-                };
-                if !valid {
+                if !keep {
                     warn!(
                         client_req_id = %client_req_id,
-                        "Invalid reasoning_effort value: {}", re
+                        "Dropping non-positive/non-numeric max_tokens: {}", mt
                     );
-                    self.metrics.inc_error();
-                    key_handle.dec_in_flight();
-                    return Err(warp::reject::custom(BadRequest {
-                        msg: "Invalid reasoning_effort (must be 'low', 'medium', or 'high')"
-                            .into(),
-                    }));
+                    obj.remove("max_tokens");
+                } else if let serde_json::Value::String(s) = &mt {
+                    // Coerce numeric strings to numbers so NVIDIA sees an int.
+                    if let Ok(n) = s.parse::<i64>() {
+                        obj.insert(
+                            "max_tokens".to_string(),
+                            serde_json::Value::Number(serde_json::Number::from(n)),
+                        );
+                    }
+                }
+            }
+
+            // reasoning_effort normalization: bool/non-canonical → rewrite/drop
+            if let Some(re) = obj.get("reasoning_effort").cloned() {
+                let replacement: Option<serde_json::Value> = match &re {
+                    serde_json::Value::Bool(b) => {
+                        if *b {
+                            Some(serde_json::Value::String("high".to_string()))
+                        } else {
+                            None
+                        }
+                    }
+                    serde_json::Value::Null => None,
+                    serde_json::Value::String(s) => match s.as_str() {
+                        "low" | "medium" | "high" => Some(re.clone()),
+                        _ => {
+                            warn!(
+                                client_req_id = %client_req_id,
+                                "Dropping unrecognized reasoning_effort value: {}", s
+                            );
+                            None
+                        }
+                    },
+                    // numbers/arrays/objects: drop silently
+                    _ => None,
+                };
+                match replacement {
+                    Some(v) => {
+                        obj.insert("reasoning_effort".to_string(), v);
+                    }
+                    None => {
+                        obj.remove("reasoning_effort");
+                    }
+                }
+            }
+
+            // model alias remap: client name → NVIDIA-ready name
+            if let Some(m) = obj.get("model").and_then(|x| x.as_str()).map(|s| s.to_string()) {
+                if let Some(target) = self.model_aliases.get(&m).cloned() {
+                    if target != m {
+                        info!(
+                            client_req_id = %client_req_id,
+                            "Remapping model alias '{}' -> '{}'", m, target
+                        );
+                        obj.insert(
+                            "model".to_string(),
+                            serde_json::Value::String(target.clone()),
+                        );
+                        model_rewrite_log = Some(target);
+                    }
+                }
+            }
+
+            // stream_options.include_usage injection (streaming token usage):
+            // NVIDIA/OpenAI only emit `usage` at the end of an SSE stream when
+            // the request carries `stream_options.include_usage: true`. Inject
+            // it so our token metrics are populated for streaming requests,
+            // but never override a value the client already set (true OR
+            // false) — only inject when `include_usage` is absent.
+            if self.inject_stream_usage {
+                let is_stream = obj
+                    .get("stream")
+                    .and_then(|s| s.as_bool())
+                    .unwrap_or(false);
+                if is_stream {
+                    let client_set = obj
+                        .get("stream_options")
+                        .and_then(|so| so.get("include_usage"))
+                        .is_some();
+                    if !client_set {
+                        let mut so = obj
+                            .get("stream_options")
+                            .and_then(|v| v.as_object().cloned())
+                            .unwrap_or_default();
+                        so.insert(
+                            "include_usage".to_string(),
+                            serde_json::Value::Bool(true),
+                        );
+                        obj.insert(
+                            "stream_options".to_string(),
+                            serde_json::Value::Object(so),
+                        );
+                    }
                 }
             }
         }
 
-        // Extract `model` once from the client's request body for logging.
-        let model = parsed_body
-            .as_ref()
-            .and_then(|v| {
-                v.get("model")
-                    .and_then(|m| m.as_str())
-                    .map(|s| s.to_string())
+        // Re-serialize the (possibly rewritten) body. If the original
+        // body wasn't JSON, fall back to the original bytes untouched —
+        // non-JSON bodies are rare here and forwarded as-is.
+        let body_bytes: bytes::Bytes = match &body_value {
+            Some(v) => serde_json::to_vec(v)
+                .map(bytes::Bytes::from)
+                .unwrap_or_else(|_| body.clone()),
+            None => body.clone(),
+        };
+
+        // Extract `model` for logging. Prefer the (possibly rewritten)
+        // value so logs show the name NVIDIA will actually see.
+        let model = model_rewrite_log
+            .clone()
+            .or_else(|| {
+                body_value
+                    .as_ref()
+                    .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(|s| s.to_string()))
             })
             .unwrap_or_default();
 
-        // Passthrough: use original path and body. Honor the client's
-        // `stream` field so chat-completions clients that ask for streaming
-        // get a streamed body (no `bytes().await` buffering).
-        let upstream_path = path.clone();
-        let request_body = body.clone();
-        let is_streaming = parsed_body
+        // Forward the (possibly rewritten) body. Honor the client's `stream`
+        // field so chat-completions clients that ask for streaming get a
+        // streamed body (no `bytes().await` buffering).
+        let request_body = body_bytes.clone();
+        let is_streaming = body_value
             .as_ref()
             .and_then(|v| v.get("stream").and_then(|s| s.as_bool()))
             .unwrap_or(false);
 
         // Build upstream URL
         let mut url = self.base_url.clone();
-        url.push_str(&upstream_path);
+        url.push_str(&path);
 
         info!(client_req_id = %client_req_id, body_summary = %body_summary, "Proxying request to: {} {}", method.as_str(), url);
 
@@ -550,9 +954,16 @@ impl Proxy {
                         Some("network"),
                     );
                     self.key_pool.mark_bad(&k, None).await;
-                    if attempt < self.retry_config.max_retries {
+                    // Network errors are often correlated (NVIDIA maintenance,
+                    // DNS hiccup, local network outage) across keys: retrying
+                    // `max_retries` times (default 3) against different keys
+                    // just multiplies the pain for the client, which has
+                    // already received ~10s of connection timeouts. Cap
+                    // network-error retries at 1 additional attempt.
+                    let network_retry_cap: u32 = 1;
+                    if attempt < network_retry_cap && attempt < self.retry_config.max_retries {
                         if let Some(next) = self.key_pool.acquire().await {
-                            let will_retry_again = attempt + 1 < self.retry_config.max_retries;
+                            let will_retry_again = false; // network cap = 1 → no further retry
                             self.metrics.inc_retry_attempt_failure();
                             key_handle.dec_in_flight();
                             let got_backup = next.try_consume_token(self.token_wait_ms).await;
@@ -720,7 +1131,7 @@ impl Proxy {
             body_summary = %body_summary,
             "upstream attempt start"
         );
-        let req_builder = self.build_upstream_request(url, method, headers, request_body, &key_str);
+        let req_builder = self.build_upstream_request(url, method, headers, request_body, &key_str, is_streaming);
         let resp = req_builder.send().await.map_err(AttemptError::Network)?;
 
         let status = resp.status();
@@ -759,9 +1170,27 @@ impl Proxy {
             return Ok(AttemptResponse::Done(resp));
         }
 
-        // Buffer the body once. All non-SSE paths (success, 4xx, 5xx) use
-        // this owned `body_bytes` for classification, failure logging, and
-        // the final response body.
+        // Successful non-SSE responses: forward the upstream bytes_stream
+        // to the client without buffering. NVIDIA workers expect the
+        // downstream to drain the body so they can release inference
+        // resources; `resp.bytes().await` would hold the whole body in
+        // memory until the (potentially slow) client finishes reading,
+        // which triggers 503 `ResourceExhausted: Worker local total
+        // request limit reached`. Mark the key good here, then stream.
+        if status.is_success() {
+            self.key_pool.mark_good(&key_str).await;
+            self.metrics.inc_success();
+            let resp = self
+                .handle_passthrough_stream(resp, resp_headers, status)
+                .await
+                .map_err(AttemptError::Fatal)?;
+            return Ok(AttemptResponse::Done(resp));
+        }
+
+        // Non-success paths still buffer the body — we need the bytes for
+        // classification (Retry-After parsing, error.code coercion, token
+        // stats, failure.log). Errors are short JSON, so buffering them is
+        // cheap and doesn't keep workers alive (errors release eagerly).
         let body_bytes = resp.bytes().await.map_err(AttemptError::BodyRead)?;
 
         // `resp.headers()` is no longer accessible after `resp.bytes()`
@@ -773,10 +1202,8 @@ impl Proxy {
             .and_then(|(_, v)| std::str::from_utf8(v).ok())
             .and_then(|s| s.parse::<u64>().ok());
 
-        if status.is_success() {
-            self.key_pool.mark_good(&key_str).await;
-            self.metrics.inc_success();
-        } else if status == reqwest::StatusCode::UNAUTHORIZED {
+        // From here on, status is non-success (success paths returned above).
+        if status == reqwest::StatusCode::UNAUTHORIZED {
             // 401 is the only status we retry: it's the clearest
             // "this specific key is rejected" signal.
             if let Some(ra) = retry_after {
@@ -855,27 +1282,12 @@ impl Proxy {
             self.metrics.inc_error();
         }
 
-        // Token statistics (prompt/completion/total) for successful Chat Completion responses.
-        if status.is_success() {
-            if let Ok(json_body) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
-                if let Some(usage) = json_body.get("usage") {
-                    if let Some(prompt) = usage.get("prompt_tokens").and_then(|v| v.as_u64()) {
-                        crate::metrics::token_input().inc_by(prompt as f64);
-                    }
-                    if let Some(completion) =
-                        usage.get("completion_tokens").and_then(|v| v.as_u64())
-                    {
-                        crate::metrics::token_output().inc_by(completion as f64);
-                    }
-                    if let (Some(p), Some(c)) = (
-                        usage.get("prompt_tokens").and_then(|v| v.as_u64()),
-                        usage.get("completion_tokens").and_then(|v| v.as_u64()),
-                    ) {
-                        crate::metrics::token_total().inc_by((p + c) as f64);
-                    }
-                }
-            }
-        }
+        // Token statistics for successful Chat Completion responses are
+        // collected when we already buffered the body — i.e. only on the
+        // non-success paths below, which never carry usage. Successful
+        // responses are forwarded as a stream and we don't buffer the body,
+        // so nothing to record here. If usage-on-stream is needed later,
+        // wrap the stream in a tap that parses the final chunk.
 
         // ── Structured failure log (failure.log JSONL) ───────────────────
         // Single hook covering all non-2xx upstream outcomes. Key facts we
@@ -973,25 +1385,32 @@ impl Proxy {
         Ok(AttemptResponse::Done(resp))
     }
 
-    /// Handle passthrough streaming: forward the upstream SSE/byte stream
-    /// to the client. Each chunk passes through `coerce_sse_chunk` which
-    /// rewrites numeric `error.code` values to strings in `data:` lines;
-    /// non-`data:` bytes and chunks without a `code` field are forwarded
-    /// verbatim.
-    async fn handle_passthrough_stream(
-        &self,
-        resp: reqwest::Response,
-        resp_headers: Vec<(String, Vec<u8>)>,
-        status: warp::http::StatusCode,
-    ) -> Result<warp::http::Response<warp::hyper::Body>, Rejection> {
-        let upstream = resp.bytes_stream();
-        let forwarded: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> =
-            Box::pin(upstream.map(|r| {
-                r.map(|chunk| coerce_sse_chunk(&chunk)).map_err(|e| {
-                    warn!("Passthrough stream read error: {}", e);
-                    std::io::Error::other(e.to_string())
-                })
-            }));
+/// Handle passthrough streaming: forward the upstream SSE/byte stream
+/// to the client. Each chunk passes through `coerce_sse_chunk` which
+/// rewrites numeric `error.code` values to strings in `data:` lines;
+/// non-`data:` bytes and chunks without a `code` field are forwarded
+/// verbatim. A `UsageTap` wraps the stream so token usage is accounted for.
+async fn handle_passthrough_stream(
+    &self,
+    resp: reqwest::Response,
+    resp_headers: Vec<(String, Vec<u8>)>,
+    status: warp::http::StatusCode,
+) -> Result<warp::http::Response<warp::hyper::Body>, Rejection> {
+    let upstream = resp.bytes_stream();
+    let forwarded: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> =
+        Box::pin(upstream.map(|r| {
+            r.map(|chunk| coerce_sse_chunk(&chunk)).map_err(|e| {
+                warn!("Passthrough stream read error: {}", e);
+                std::io::Error::other(e.to_string())
+            })
+        }));
+    let tapped: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> =
+        Box::pin(UsageTap {
+            inner: forwarded,
+            metrics: self.metrics.clone(),
+            carry: String::new(),
+            usage: None,
+        });
 
         let mut response_builder = warp::http::Response::builder().status(status);
         for (key, value) in resp_headers {
@@ -1019,7 +1438,7 @@ impl Proxy {
             }
         }
 
-        let body = warp::hyper::Body::wrap_stream(forwarded);
+        let body = warp::hyper::Body::wrap_stream(tapped);
         Ok(response_builder.body(body).unwrap_or_else(|_| {
             warp::http::Response::builder()
                 .status(status)
@@ -1038,14 +1457,9 @@ struct ServiceUnavailable {
 struct BadGateway {
     msg: String,
 }
-#[derive(Debug, Clone)]
-struct BadRequest {
-    msg: String,
-}
 
 impl warp::reject::Reject for ServiceUnavailable {}
 impl warp::reject::Reject for BadGateway {}
-impl warp::reject::Reject for BadRequest {}
 
 impl Reply for ServiceUnavailable {
     fn into_response(self) -> warp::reply::Response {
@@ -1058,11 +1472,12 @@ impl Reply for BadGateway {
         warp::reply::with_status(self.msg, warp::http::StatusCode::BAD_GATEWAY).into_response()
     }
 }
-impl Reply for BadRequest {
-    fn into_response(self) -> warp::reply::Response {
-        warp::reply::with_status(self.msg, warp::http::StatusCode::BAD_REQUEST).into_response()
-    }
-}
+// NOTE: A `BadRequest` reject type used to live here for the hard-400
+// validation paths (`max_tokens` / `reasoning_effort`). Those paths were
+// converted to in-place body normalization in 2026-07, so the reject
+// type is no longer emitted by the handler. If a future hard-400 case
+// is needed, re-introduce `struct BadRequest { msg: String }` with
+// `impl Reject` + `impl Reply` (mapping to BAD_REQUEST).
 
 #[cfg(test)]
 mod proxy_integration_tests {
@@ -1074,8 +1489,8 @@ mod proxy_integration_tests {
     use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
 
     use crate::config::{
-        Config, CooldownConfig, HealthCheckConfig, ObservabilityConfig, RateLimiterConfig,
-        RetryConfig,
+        AuthConfig, Config, CooldownConfig, HealthCheckConfig, ObservabilityConfig,
+        RateLimiterConfig, RetryConfig,
     };
     use crate::key_pool::KeyPool;
     use crate::metrics::Metrics;
@@ -1122,7 +1537,12 @@ mod proxy_integration_tests {
                 backoff_base_ms: 100,
                 backoff_max_ms: 2000,
                 auth_fail_threshold: 3,
+                max_key_switches: 3,
             },
+            model_aliases: std::collections::HashMap::new(),
+            allow_local_base_url: false,
+            auth: AuthConfig::default(),
+            inject_stream_usage: true,
         }
     }
 
@@ -1136,6 +1556,8 @@ mod proxy_integration_tests {
             config.request_timeout_seconds,
             config.retry.clone(),
             config.rate_limiter.token_wait_ms,
+            config.model_aliases.clone(),
+            true,
         );
 
         let proxy_route = warp::path::full()
@@ -1183,6 +1605,144 @@ mod proxy_integration_tests {
             .unwrap();
 
         assert_eq!(resp.status(), 401);
+    }
+
+    // ── Unsupported API shape rejection (mod ①+②) ────────────────────────
+
+    #[tokio::test]
+    async fn responses_endpoint_rejected_with_501() {
+        let mock_server = MockServer::start().await;
+        let addr = start_proxy(test_config(&mock_server.uri(), 0, 5)).await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://{}/v1/responses", addr))
+            .body(r#"{"model":"m","input":"hi"}"#)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 501);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["error"]["type"], "not_supported");
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("/v1/chat/completions"));
+    }
+
+    #[tokio::test]
+    async fn messages_endpoint_rejected_with_501() {
+        let mock_server = MockServer::start().await;
+        let addr = start_proxy(test_config(&mock_server.uri(), 0, 5)).await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://{}/v1/messages", addr))
+            .body(r#"{"model":"m","messages":[]}"#)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 501);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["error"]["type"], "not_supported");
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("/v1/messages"));
+    }
+
+    // ── /v1/models passthrough + cache (mod ③) ───────────────────────────
+
+    #[tokio::test]
+    async fn models_passthrough_returns_upstream_catalog_and_caches() {
+        let mock_server = MockServer::start().await;
+        Mock::given(matchers::method("GET"))
+            .and(matchers::path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "object": "list",
+                "data": [
+                    {"id": "custom/model-a", "object": "model", "owned_by": "custom"}
+                ]
+            })))
+            // Only one upstream call: the 2nd client request must hit the cache.
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let addr = start_proxy(test_config(&mock_server.uri(), 0, 5)).await;
+        let client = reqwest::Client::new();
+
+        let resp1 = client
+            .get(format!("http://{}/v1/models", addr))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp1.status(), 200);
+        let body1: serde_json::Value = resp1.json().await.unwrap();
+        assert_eq!(body1["data"][0]["id"], "custom/model-a");
+
+        let resp2 = client
+            .get(format!("http://{}/v1/models", addr))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp2.status(), 200);
+        let body2: serde_json::Value = resp2.json().await.unwrap();
+        assert_eq!(body2["data"][0]["id"], "custom/model-a");
+    }
+
+    // ── stream_options.include_usage injection (mod ④) ───────────────────
+
+    #[tokio::test]
+    async fn stream_options_injected_for_streaming() {
+        let mock_server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&mock_server)
+            .await;
+
+        let addr = start_proxy(test_config(&mock_server.uri(), 0, 5)).await;
+        let client = reqwest::Client::new();
+        let _resp = client
+            .post(format!("http://{}/v1/chat/completions", addr))
+            .json(&serde_json::json!({"model": "m", "messages": [], "stream": true}))
+            .send()
+            .await
+            .unwrap();
+
+        let requests = mock_server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["stream_options"]["include_usage"], true);
+    }
+
+    #[tokio::test]
+    async fn stream_options_not_overridden_when_client_disables() {
+        let mock_server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&mock_server)
+            .await;
+
+        let addr = start_proxy(test_config(&mock_server.uri(), 0, 5)).await;
+        let client = reqwest::Client::new();
+        let _resp = client
+            .post(format!("http://{}/v1/chat/completions", addr))
+            .json(&serde_json::json!({
+                "model": "m",
+                "messages": [],
+                "stream": true,
+                "stream_options": {"include_usage": false}
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        let requests = mock_server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["stream_options"]["include_usage"], false);
     }
 
     #[tokio::test]
@@ -1245,9 +1805,6 @@ mod proxy_integration_tests {
             return Ok(e.into_response());
         }
         if let Some(e) = err.find::<super::ServiceUnavailable>().cloned() {
-            return Ok(e.into_response());
-        }
-        if let Some(e) = err.find::<super::BadRequest>().cloned() {
             return Ok(e.into_response());
         }
         Err(err)
@@ -1425,16 +1982,18 @@ mod proxy_integration_tests {
         );
     }
 
-    /// Invalid `reasoning_effort` values (e.g. "max") must be rejected before
-    /// hitting upstream, mirroring the upstream 400 but saving a key attempt.
+    /// Non-canonical `reasoning_effort` strings (e.g. "max") are silently
+    /// dropped and forwarded — NVIDIA would 400 on them, so dropping lets the
+    /// request succeed without making the client rewrite their body.
     #[tokio::test]
-    async fn invalid_reasoning_effort_max_returns_400() {
+    async fn noncanonical_reasoning_effort_max_is_dropped() {
         let mock_server = MockServer::start().await;
-        // The proxy should reject before forwarding, so upstream sees 0 calls.
         Mock::given(matchers::method("POST"))
             .and(matchers::path("/v1/chat/completions"))
-            .respond_with(ResponseTemplate::new(200))
-            .expect(0)
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "x", "object": "chat.completion", "model": "m", "choices": []
+            })))
+            .expect(1)
             .mount(&mock_server)
             .await;
 
@@ -1448,22 +2007,21 @@ mod proxy_integration_tests {
             .await
             .unwrap();
 
-        assert_eq!(resp.status(), 400);
-        let body = resp.text().await.unwrap();
-        assert!(
-            body.contains("reasoning_effort"),
-            "error body should mention reasoning_effort, got: {}", body
-        );
+        assert_eq!(resp.status(), 200, "non-canonical reasoning_effort should be dropped, not 400");
     }
 
-    /// Boolean `reasoning_effort` is also invalid per the OpenAI schema.
+    /// Boolean `reasoning_effort: true` is rewritten to "high" and forwarded,
+    /// rather than being rejected. cc-switch / OpenAI o1-style clients send
+    /// `true`/`false` and expect the proxy to accept them.
     #[tokio::test]
-    async fn invalid_reasoning_effort_true_returns_400() {
+    async fn reasoning_effort_true_is_rewritten_to_high() {
         let mock_server = MockServer::start().await;
         Mock::given(matchers::method("POST"))
             .and(matchers::path("/v1/chat/completions"))
-            .respond_with(ResponseTemplate::new(200))
-            .expect(0)
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "x", "object": "chat.completion", "model": "m", "choices": []
+            })))
+            .expect(1)
             .mount(&mock_server)
             .await;
 
@@ -1477,7 +2035,7 @@ mod proxy_integration_tests {
             .await
             .unwrap();
 
-        assert_eq!(resp.status(), 400);
+        assert_eq!(resp.status(), 200, "reasoning_effort=true should be rewritten to 'high' and forwarded");
     }
 
     /// Valid `reasoning_effort` values are forwarded normally.
@@ -1507,5 +2065,61 @@ mod proxy_integration_tests {
             .unwrap();
 
         assert_eq!(resp.status(), 200);
+    }
+}
+
+#[cfg(test)]
+mod usage_accounting_tests {
+    use super::*;
+
+    #[test]
+    fn parse_usage_pulls_components() {
+        let v = serde_json::json!({
+            "id": "x",
+            "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
+        });
+        let u = parse_usage(&v).expect("usage present");
+        assert_eq!(u.prompt, Some(10));
+        assert_eq!(u.completion, Some(5));
+        assert_eq!(u.total, Some(15));
+    }
+
+    #[test]
+    fn parse_usage_absent_returns_none() {
+        let v = serde_json::json!({"id": "x", "choices": []});
+        assert!(parse_usage(&v).is_none());
+    }
+
+    #[test]
+    fn parse_usage_negative_clamped_to_zero() {
+        let v = serde_json::json!({"usage": {"prompt_tokens": -3, "total_tokens": -3}});
+        let u = parse_usage(&v).expect("usage present");
+        assert_eq!(u.prompt, Some(0));
+        assert_eq!(u.total, Some(0));
+    }
+
+    /// Drive `UsageTap::feed` directly and confirm it extracts the last `usage`
+    /// seen, including when the `data:` line is split across two chunks.
+    #[test]
+    fn usage_tap_feed_captures_usage_across_chunks() {
+        let mut tap = UsageTap {
+            inner: futures_util::stream::empty(),
+            metrics: Arc::new(Metrics::new()),
+            carry: String::new(),
+            usage: None,
+        };
+        // First chunk: a token delta (no usage) + a partial data line.
+        tap.feed(&Bytes::from_static(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: {\"usage\":{\"prompt_tokens\":7,",
+        ));
+        assert!(tap.usage.is_none(), "usage not yet complete");
+        // Second chunk completes the split data line, then a final usage event.
+        tap.feed(&Bytes::from_static(
+            b"\"completion_tokens\":3,\"total_tokens\":10}}\n\n",
+        ));
+        let u = tap.usage.expect("usage captured");
+        assert_eq!(u.prompt, Some(7));
+        assert_eq!(u.completion, Some(3));
+        assert_eq!(u.total, Some(10));
     }
 }

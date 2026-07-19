@@ -12,6 +12,11 @@ pub struct HealthChecker {
     interval: Duration,
     timeout: Duration,
     max_failures: usize,
+    /// Per-key count of *consecutive probe errors* (network/probe failures,
+    /// not non-2xx). When a key's count reaches `max_failures`, the health
+    /// checker force-disables it (see `recover_one`) instead of forever
+    /// deferring to the cooldown timer. Reset to 0 on a successful probe.
+    probe_failures: std::sync::Mutex<std::collections::HashMap<String, usize>>,
     client: reqwest::Client,
 }
 
@@ -33,6 +38,7 @@ impl HealthChecker {
             interval: Duration::from_secs(interval_seconds),
             timeout: Duration::from_secs(timeout_seconds),
             max_failures: max_consecutive_failures,
+            probe_failures: std::sync::Mutex::new(std::collections::HashMap::new()),
             client,
         }
     }
@@ -109,37 +115,59 @@ impl HealthChecker {
             "Recovery probe round"
         );
         for key_str in &bad_keys {
-            match self.probe_key(key_str).await {
-                Ok(status) if status.is_success() => {
+            self.recover_one(key_str, false).await;
+        }
+        for key_str in &disabled_keys {
+            self.recover_one(key_str, true).await;
+        }
+        Ok(())
+    }
+
+    /// Probe a single bad/disabled key and react accordingly.
+    ///
+    /// * Success → recover the key (`mark_good` / `recover_disabled`) and reset
+    ///   its consecutive-probe-error counter.
+    /// * Non-2xx → not decisive (NVIDIA's `/v1/models` can 403/401 on a
+    ///   perfectly valid key), so defer to the cooldown timer; the error
+    ///   counter is left untouched.
+    /// * Probe *error* (network/timeout) → increment the consecutive-error
+    ///   counter. Once it reaches `max_failures` the key is force-disabled so a
+    ///   persistently-unreachable key can't keep cycling through cooldown
+    ///   forever. A `max_failures` of 0 disables this behaviour.
+    async fn recover_one(&self, key_str: &str, was_disabled: bool) {
+        match self.probe_key(key_str).await {
+            Ok(status) if status.is_success() => {
+                self.reset_probe_failures(key_str);
+                if was_disabled {
+                    info!(key = %mask_key(key_str), "Disabled key recovered via probe; reactivating");
+                    self.key_pool.recover_disabled(key_str).await;
+                } else {
                     info!(key = %mask_key(key_str), "Bad key recovered via probe; marking as good");
                     self.key_pool.mark_good(key_str).await;
                 }
-                Ok(status) => {
-                    // /v1/models returning non-2xx is not decisive evidence
-                    // the key is bad. Defer to cooldown timing for recovery
-                    // (cool_down_task reactivates once ready_at passes).
-                    warn!(key = %mask_key(key_str), status = %status, "Recovery probe non-2xx; deferring to cooldown timer");
-                }
-                Err(e) => {
-                    warn!(key = %mask_key(key_str), error = %e, "Recovery probe error; deferring to cooldown timer");
+            }
+            Ok(status) => {
+                warn!(key = %mask_key(key_str), status = %status, "Recovery probe non-2xx; deferring to cooldown timer");
+            }
+            Err(e) => {
+                let count = {
+                    let mut map = self.probe_failures.lock().unwrap();
+                    let c = map.entry(key_str.to_string()).or_insert(0);
+                    *c += 1;
+                    *c
+                };
+                warn!(key = %mask_key(key_str), error = %e, probe_errors = count, max_failures = self.max_failures, "Recovery probe error");
+                if self.max_failures > 0 && count >= self.max_failures {
+                    warn!(key = %mask_key(key_str), "Consecutive probe failures reached threshold; force-disabling key");
+                    self.key_pool.disable_key(key_str).await;
+                    self.reset_probe_failures(key_str);
                 }
             }
         }
-        for key_str in &disabled_keys {
-            match self.probe_key(key_str).await {
-                Ok(status) if status.is_success() => {
-                    info!(key = %mask_key(key_str), "Disabled key recovered via probe; reactivating");
-                    self.key_pool.recover_disabled(key_str).await;
-                }
-                Ok(status) => {
-                    warn!(key = %mask_key(key_str), status = %status, "Disabled key still failing probe; staying Disabled");
-                }
-                Err(e) => {
-                    warn!(key = %mask_key(key_str), error = %e, "Disabled key probe error; staying Disabled");
-                }
-            }
-        }
-        Ok(())
+    }
+
+    fn reset_probe_failures(&self, key_str: &str) {
+        self.probe_failures.lock().unwrap().remove(key_str);
     }
 
     async fn probe_key(

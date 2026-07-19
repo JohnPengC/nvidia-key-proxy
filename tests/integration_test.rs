@@ -39,6 +39,10 @@ fn test_config() -> Config {
         },
         request_timeout_seconds: 60,
         retry: RetryConfig::default(),
+        model_aliases: std::collections::HashMap::new(),
+        allow_local_base_url: false,
+        auth: AuthConfig::default(),
+        inject_stream_usage: true,
     }
 }
 
@@ -135,4 +139,121 @@ async fn v1_path_is_forwarded_to_upstream() {
         .reply(&filter)
         .await;
     assert_eq!(resp.status(), 200, "v1 path must reach upstream, not 404");
+}
+
+fn test_config_with_auth(enabled: bool, bearer: &str, admin: &str) -> Config {
+    let mut cfg = test_config();
+    // Point at a refused local port so the forwarded attempt fails fast
+    // instead of hanging on a real DNS lookup. `allow_local_base_url`
+    // bypasses the localhost validation for this test only.
+    cfg.allow_local_base_url = true;
+    cfg.base_url = "http://127.0.0.1:1".to_string();
+    cfg.auth.enabled = enabled;
+    cfg.auth.bearer_token = bearer.to_string();
+    cfg.auth.admin_token = admin.to_string();
+    cfg
+}
+
+#[tokio::test]
+async fn admin_api_hidden_when_token_unset() {
+    // Default test_config has no admin_token → admin surface must 404.
+    let state = AppState::new(test_config());
+    let filter = build_routes(&state);
+    let resp = request()
+        .method("GET")
+        .path("/admin/keys")
+        .reply(&filter)
+        .await;
+    assert_eq!(resp.status(), 404);
+}
+
+#[tokio::test]
+async fn admin_keys_list_and_add_and_remove() {
+    let mut cfg = test_config();
+    cfg.auth.admin_token = "admin-secret".to_string();
+    let state = AppState::new(cfg);
+    let filter = build_routes(&state);
+
+    // List (initially one key from test_config: "dummy_key").
+    let resp = request()
+        .method("GET")
+        .path("/admin/keys")
+        .header("authorization", "Bearer admin-secret")
+        .reply(&filter)
+        .await;
+    assert_eq!(resp.status(), 200);
+    let list: serde_json::Value = serde_json::from_slice(resp.body()).unwrap();
+    assert!(list.as_array().unwrap().len() >= 1);
+
+    // Add a new key.
+    let resp = request()
+        .method("POST")
+        .path("/admin/keys")
+        .header("authorization", "Bearer admin-secret")
+        .json(&vec!["nvapi-newkey-12345678"])
+        .reply(&filter)
+        .await;
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = serde_json::from_slice(resp.body()).unwrap();
+    assert_eq!(body["added"].as_array().unwrap().len(), 1);
+
+    // Remove it.
+    let resp = request()
+        .method("DELETE")
+        .path("/admin/keys/nvapi-newkey-12345678")
+        .header("authorization", "Bearer admin-secret")
+        .reply(&filter)
+        .await;
+    assert_eq!(resp.status(), 200);
+    let v: serde_json::Value = serde_json::from_slice(resp.body()).unwrap();
+    assert_eq!(v["removed"].as_bool(), Some(true));
+
+    // Admin auth required: missing token → 401.
+    let resp = request()
+        .method("GET")
+        .path("/admin/keys")
+        .reply(&filter)
+        .await;
+    assert_eq!(resp.status(), 401);
+}
+
+
+#[tokio::test]
+async fn front_door_auth_enforced() {
+    let cfg = test_config_with_auth(true, "letmein", "admin-secret");
+    let state = AppState::new(cfg);
+    let filter = build_routes(&state);
+
+    // No token → 401.
+    let resp = request()
+        .method("POST")
+        .path("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(r#"{"model":"x","stream":false}"#)
+        .reply(&filter)
+        .await;
+    assert_eq!(resp.status(), 401);
+
+    // Wrong token → 401.
+    let resp = request()
+        .method("POST")
+        .path("/v1/chat/completions")
+        .header("authorization", "Bearer wrong")
+        .header("content-type", "application/json")
+        .body(r#"{"model":"x","stream":false}"#)
+        .reply(&filter)
+        .await;
+    assert_eq!(resp.status(), 401);
+
+    // Correct token → passes through the auth gate (then 404 from upstream
+    // since there is no mock; the point is the proxy gate accepted it).
+    let resp = request()
+        .method("POST")
+        .path("/v1/chat/completions")
+        .header("authorization", "Bearer letmein")
+        .header("content-type", "application/json")
+        .body(r#"{"model":"x","stream":false}"#)
+        .reply(&filter)
+        .await;
+    assert_ne!(resp.status(), 401);
 }

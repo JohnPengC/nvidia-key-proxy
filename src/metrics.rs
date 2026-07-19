@@ -188,6 +188,22 @@ impl Metrics {
         key_403_auth_cooldown().inc();
     }
 
+    /// Record token usage extracted from an upstream response. Called once per
+    /// request (after a non-streaming body is read, or when a stream ends) with
+    /// the `usage` object's prompt/completion/total counts. Any `None`/`0`
+    /// component is simply skipped so partial usage objects don't under-count.
+    pub fn record_usage(&self, prompt: Option<u64>, completion: Option<u64>, total: Option<u64>) {
+        if let Some(p) = prompt {
+            token_input().inc_by(p as f64);
+        }
+        if let Some(c) = completion {
+            token_output().inc_by(c as f64);
+        }
+        if let Some(t) = total {
+            token_total().inc_by(t as f64);
+        }
+    }
+
     /// Expose metrics in Prometheus text format.
     pub fn render(&self) -> String {
         use prometheus::Encoder;
