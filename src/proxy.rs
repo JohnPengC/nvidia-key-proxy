@@ -54,6 +54,13 @@ pub struct Proxy {
     /// only emit usage when this flag is set; without it our token metrics
     /// are zero for the (common) streaming case.
     inject_stream_usage: bool,
+    /// Synthesize a placeholder `choices` entry when a non-stream 2xx body
+    /// arrives with an empty `choices` array, so downstream consumers (notably
+    /// cc-switch's `openai_to_anthropic`) don't hard-error on the empty
+    /// array. See `Config::synthesize_empty_choices` for the full rationale.
+    /// Only the non-streaming non-SSE success path is affected, and only a
+    /// bounded prefix is ever inspected.
+    synthesize_empty_choices: bool,
 }
 
 /// Outcome of a single upstream attempt. `Retry` is used only for 401 without
@@ -272,11 +279,42 @@ fn parse_usage(v: &serde_json::Value) -> Option<Usage> {
 /// most recent usage to the Prometheus counters. This is what makes
 /// `proxy_tokens_input/output/total` actually reflect real traffic — without
 /// it, successful responses were forwarded as a stream and never inspected.
+///
+/// It also sniffs for an *empty* `choices` array on the stream. Recall:
+/// cc-switch translates the upstream ChatCompletions body back to Anthropic
+/// format, and its non-streaming converter `openai_to_anthropic` hard-errors
+/// with "格式转换错误: Empty choices array" (surfaced as 422 to the Claude
+/// Code client) when the body parses to `{"choices": [], ...}` — which
+/// happens on a genuine OpenAI/NVIDIA usage-only final SSE chunk
+/// `data: {"choices":[],"usage":{...}}` aggregated by cc-switch, or on a
+/// non-stream 200 whose body really did carry `choices: []`. We can't see
+/// cc-switch from here, but when the upstream stream actually contained a JSON
+/// object with an empty `choices` array, logging it (with status) lets us
+/// pinpoint the trigger in production rather than guessing.
+///
+/// The diagnostic is *read-only* (never mutates the stream) and guarded so it
+/// only fires when we genuinely parsed a JSON object carrying `choices: []`
+/// and never afterward saw a non-empty `choices` — text/plain bodies, SSE
+/// `[DONE]`, and chunks we failed to parse all stay quiet, so the warning
+/// doesn't false-positive on every non-streaming or non-JSON response.
 struct UsageTap<S> {
     inner: S,
     metrics: Arc<Metrics>,
     carry: String,
     usage: Option<Usage>,
+    /// Did any parsed JSON object on this stream carry a non-empty `choices`
+    /// array? If yes by stream end, the response had real content and we
+    /// don't need to warn.
+    saw_choices: bool,
+    /// Did any parsed JSON object carry an *empty* `choices: []` array?
+    saw_empty_choices: bool,
+    /// Did we successfully parse *any* JSON object at all? Guards the
+    /// end-of-stream diagnostic: a text/plain body or a chunk we couldn't
+    /// parse should not be mistaken for a JSON response with empty choices.
+    saw_any_json: bool,
+    /// Status of the upstream response this tap wraps, for the log line.
+    status: Option<u16>,
+    client_req_id: String,
 }
 
 impl<S> UsageTap<S>
@@ -293,19 +331,58 @@ where
         // partial line (if any) in `carry` for the next chunk.
         while let Some(nl) = self.carry.find('\n') {
             let line: String = self.carry.drain(..=nl).collect();
-            let line = line.trim_end_matches(['\r', '\n']);
-            let json_str = match line.strip_prefix("data:") {
-                Some(rest) => rest.trim_start(),
-                None => line.trim(),
-            };
-            if json_str.is_empty() {
-                continue;
+            self.classify_json_line(&line);
+        }
+    }
+
+    /// Parse a single line (with or without a trailing newline) as a JSON
+    /// payload, after stripping an SSE `data:` prefix. Used both by `feed`
+    /// (for complete lines) and by `flush_trailing` (for the final line that
+    /// never received a newline, e.g. a single-line non-streaming
+    /// ChatCompletions body). A single bare JSON object on its own — no
+    /// `data:` prefix, no surrounding SSE framing — is what a non-streaming
+    /// OpenAI response looks like, so don't require SSE framing here.
+    fn classify_json_line(&mut self, line: &str) {
+        let line = line.trim_end_matches(['\r', '\n']);
+        let json_str = match line.strip_prefix("data:") {
+            Some(rest) => rest.trim_start(),
+            None => line.trim(),
+        };
+        if json_str.is_empty() {
+            return;
+        }
+        // `[DONE]` and similar SSE terminators aren't JSON; skip quietly.
+        if json_str == "[DONE]" {
+            return;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) else {
+            return;
+        };
+        if let Some(u) = parse_usage(&v) {
+            self.usage = Some(u);
+        }
+        // Track that we saw *any* JSON object at all, so the end-of-stream
+        // diagnostic can distinguish "we never parsed JSON" (text/plain or a
+        // parse failure — not our concern) from "we parsed JSON but it never
+        // carried a non-empty choices array" (the cc-switch 422 trigger).
+        self.saw_any_json = true;
+        if let Some(choices) = v.get("choices") {
+            match choices.as_array() {
+                Some(arr) if !arr.is_empty() => self.saw_choices = true,
+                Some(_) => self.saw_empty_choices = true,
+                None => {}
             }
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
-                if let Some(u) = parse_usage(&v) {
-                    self.usage = Some(u);
-                }
-            }
+        }
+    }
+
+    /// Drain whatever is left in `carry` when the stream ends. A non-streaming
+    /// OpenAI response is a single JSON object with no trailing newline; if we
+    /// never flushed it, `saw_choices` would stay false and the diagnostic
+    /// would false-positive on every non-streaming request.
+    fn flush_trailing(&mut self) {
+        if !self.carry.is_empty() {
+            let rest: String = std::mem::take(&mut self.carry);
+            self.classify_json_line(&rest);
         }
     }
 }
@@ -325,12 +402,74 @@ where
             }
             Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
             Poll::Ready(None) => {
+                // Drain any trailing line that never got a '\n'. A non-streaming
+                // OpenAI response is a single JSON object with no trailing
+                // newline; without this flush it'd sit unread in `carry` and
+                // the empty-choices diagnostic would false-positive.
+                me.flush_trailing();
                 if let Some(u) = me.usage.take() {
                     me.metrics.record_usage(u.prompt, u.completion, u.total);
+                }
+                // Empty-choices diagnostic: warn *only* when we parsed a JSON
+                // object that carried an empty `choices: []` array and never
+                // subsequently saw a non-empty one. Requiring `saw_empty_choices`
+                // (not merely `!saw_choices`) keeps text/plain bodies, single-line
+                // non-streaming responses, and chunks we failed to parse from
+                // false-positiving — those never had an empty-choices JSON to
+                // begin with.
+                if let Some(status) = me.status {
+                    if me.saw_empty_choices && !me.saw_choices {
+                        warn!(
+                            client_req_id = %me.client_req_id,
+                            status = status,
+                            "Upstream 2xx returned an empty choices array — cc-switch may \
+                             hard-error translating it to Anthropic (格式转换错误: Empty \
+                             choices array → 422)"
+                        );
+                    }
                 }
                 Poll::Ready(None)
             }
             Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+/// How much of a non-stream success body we'll buffer while looking for an
+/// empty `choices` array to synthesize around. Bodies that actually have an
+/// empty `choices` (no generated tokens) are tiny — far under this cap — so we
+/// never hold a large completion in memory, and any genuinely large non-stream
+/// body falls straight through to streaming passthrough after this many bytes.
+const EMPTY_CHOICES_PEEK_BYTES: usize = 64 * 1024;
+
+/// Strip hop-by-hop and length headers we'll recompute, then copy the rest of
+/// `resp_headers` onto `builder`. Shared by the streaming-passthrough and
+/// empty-choices synthesis paths so the client sees a consistent forwarded
+/// header set regardless of which path a response takes.
+fn apply_forwarded_response_headers(
+    builder: &mut warp::http::response::Builder,
+    resp_headers: Vec<(String, Vec<u8>)>,
+) {
+    for (key, value) in resp_headers {
+        match key.as_str() {
+            "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailers"
+            | "transfer-encoding"
+            | "upgrade"
+            | "content-length" => continue,
+            _ => {}
+        }
+        if let Ok(hv) = warp::http::HeaderValue::from_bytes(&value) {
+            if let Some(headers) = builder.headers_mut() {
+                let key_bytes = key.as_bytes().to_vec();
+                let hname = warp::http::HeaderName::from_bytes(&key_bytes)
+                    .unwrap_or_else(|_| warp::http::HeaderName::from_bytes(b"x-unknown").unwrap());
+                headers.append(hname, hv);
+            }
         }
     }
 }
@@ -345,6 +484,7 @@ impl Proxy {
         token_wait_ms: u64,
         model_aliases: std::collections::HashMap<String, String>,
         inject_stream_usage: bool,
+        synthesize_empty_choices: bool,
     ) -> Self {
         let client = reqwest::Client::builder()
             .pool_idle_timeout(Duration::from_secs(90))
@@ -369,6 +509,7 @@ impl Proxy {
             model_aliases,
             models_cache: Arc::new(Mutex::new(None)),
             inject_stream_usage,
+            synthesize_empty_choices,
         }
     }
 
@@ -790,6 +931,65 @@ impl Proxy {
                     }
                 }
             }
+
+            // tools normalization: NVIDIA's ToolDescription requires `description`
+            // and (when nested under `function`) `function.description` to be a
+            // *string* — it rejects `null` with a 400 (pydantic
+            // "Input should be a valid string, input_value=None"). cc-switch /
+            // Claude Code emit tool definitions where some tools carry no
+            // description (rendered as `null`), which were passing straight
+            // through to NVIDIA and 400-ing (see failure.log). Coerce a missing
+            // or null `description` to an empty string; the empty type
+            // annotation already used for max_tokens/reasoning_effort applies
+            // here too. We also coerce `name` defensively (NVIDIA requires
+            // non-null), but leave `parameters` untouched.
+            //
+            // Handles both shapes a client may send:
+            //   * flat:  {type, name, description, parameters}
+            //   * nested (OpenAI canonical): {type:"function", function:{name, description, parameters}}
+            if let Some(arr) = obj.get_mut("tools").and_then(|t| t.as_array_mut()) {
+                let mut fixed = 0u32;
+                for tool in arr.iter_mut() {
+                    // Target object: the nested `function` when present, else
+                    // the tool itself (flat shape).
+                    let target: Option<&mut serde_json::Map<String, serde_json::Value>> =
+                        if let Some(func) = tool.get_mut("function") {
+                            func.as_object_mut()
+                        } else {
+                            tool.as_object_mut()
+                        };
+                    let Some(tobj) = target else { continue };
+
+                    // Need a fix when the field is absent or explicitly null;
+                    // a real string (even empty "" left by a prior tooling run
+                    // round-tripping through us) is left as-is.
+                    let need_desc = tobj
+                        .get("description")
+                        .map_or(true, serde_json::Value::is_null);
+                    if need_desc {
+                        tobj.insert(
+                            "description".to_string(),
+                            serde_json::Value::String(String::new()),
+                        );
+                        fixed += 1;
+                    }
+                    let need_name = tobj.get("name").map_or(true, serde_json::Value::is_null);
+                    if need_name {
+                        tobj.insert(
+                            "name".to_string(),
+                            serde_json::Value::String(String::new()),
+                        );
+                        fixed += 1;
+                    }
+                }
+                if fixed > 0 {
+                    warn!(
+                        client_req_id = %client_req_id,
+                        tool_fields_fixed = fixed,
+                        "Coerced null/missing tool description/name to empty string (NVIDIA rejects null)"
+                    );
+                }
+            }
         }
 
         // Re-serialize the (possibly rewritten) body. If the original
@@ -1164,7 +1364,7 @@ impl Proxy {
         // verbatim without buffering.
         if is_streaming && is_sse && status.is_success() {
             let resp = self
-                .handle_passthrough_stream(resp, resp_headers, status)
+                .handle_passthrough_stream(resp, resp_headers, status, client_req_id)
                 .await
                 .map_err(AttemptError::Fatal)?;
             return Ok(AttemptResponse::Done(resp));
@@ -1177,13 +1377,25 @@ impl Proxy {
         // memory until the (potentially slow) client finishes reading,
         // which triggers 503 `ResourceExhausted: Worker local total
         // request limit reached`. Mark the key good here, then stream.
+        //
+        // We do a bounded peek *only* when the empty-choices synthesis is
+        // enabled: the body is read up to `EMPTY_CHOICES_PEEK_BYTES` and, if it
+        // parses to a JSON object with an empty `choices` array, rewritten to a
+        // legal single-choice response (so cc-switch's non-streaming converter
+        // doesn't 422 on it). Any other body — non-JSON, large completion, or a
+        // non-empty `choices` — falls back to the same zero-ownership passthrough
+        // as before, with the already-buffered prefix prepended to the stream.
         if status.is_success() {
             self.key_pool.mark_good(&key_str).await;
             self.metrics.inc_success();
-            let resp = self
-                .handle_passthrough_stream(resp, resp_headers, status)
-                .await
-                .map_err(AttemptError::Fatal)?;
+            let resp = if self.synthesize_empty_choices {
+                self.handle_success_maybe_synthesize(resp, resp_headers, status, client_req_id)
+                    .await
+            } else {
+                self.handle_passthrough_stream(resp, resp_headers, status, client_req_id)
+                    .await
+            }
+            .map_err(AttemptError::Fatal)?;
             return Ok(AttemptResponse::Done(resp));
         }
 
@@ -1389,12 +1601,15 @@ impl Proxy {
 /// to the client. Each chunk passes through `coerce_sse_chunk` which
 /// rewrites numeric `error.code` values to strings in `data:` lines;
 /// non-`data:` bytes and chunks without a `code` field are forwarded
-/// verbatim. A `UsageTap` wraps the stream so token usage is accounted for.
+/// verbatim. A `UsageTap` wraps the stream so token usage is accounted for
+/// and (on success-path streams) an empty-choices diagnostic is logged
+/// when the response carried no real `choices` content.
 async fn handle_passthrough_stream(
     &self,
     resp: reqwest::Response,
     resp_headers: Vec<(String, Vec<u8>)>,
     status: warp::http::StatusCode,
+    client_req_id: &str,
 ) -> Result<warp::http::Response<warp::hyper::Body>, Rejection> {
     let upstream = resp.bytes_stream();
     let forwarded: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> =
@@ -1410,33 +1625,15 @@ async fn handle_passthrough_stream(
             metrics: self.metrics.clone(),
             carry: String::new(),
             usage: None,
+            saw_choices: false,
+            saw_empty_choices: false,
+            saw_any_json: false,
+            status: Some(status.as_u16()),
+            client_req_id: client_req_id.to_string(),
         });
 
         let mut response_builder = warp::http::Response::builder().status(status);
-        for (key, value) in resp_headers {
-            match key.as_str() {
-                "connection"
-                | "keep-alive"
-                | "proxy-authenticate"
-                | "proxy-authorization"
-                | "te"
-                | "trailers"
-                | "transfer-encoding"
-                | "upgrade"
-                | "content-length" => continue,
-                _ => {}
-            }
-            if let Ok(hv) = warp::http::HeaderValue::from_bytes(&value) {
-                if let Some(headers) = response_builder.headers_mut() {
-                    let key_bytes = key.as_bytes().to_vec();
-                    let hname =
-                        warp::http::HeaderName::from_bytes(&key_bytes).unwrap_or_else(|_| {
-                            warp::http::HeaderName::from_bytes(b"x-unknown").unwrap()
-                        });
-                    headers.append(hname, hv);
-                }
-            }
-        }
+        apply_forwarded_response_headers(&mut response_builder, resp_headers);
 
         let body = warp::hyper::Body::wrap_stream(tapped);
         Ok(response_builder.body(body).unwrap_or_else(|_| {
@@ -1445,6 +1642,215 @@ async fn handle_passthrough_stream(
                 .body(warp::hyper::Body::empty())
                 .unwrap()
         }))
+    }
+
+    /// Try to rewrite an empty-`choices` success body without buffering the
+    /// whole upstream — the hot success path stays zero-ownership once we've
+    /// decided it isn't the empty-choices case.
+    ///
+    /// Strategy: read up to [`EMPTY_CHOICES_PEEK_BYTES`] of the streaming body
+    /// into a buffer. After each chunk attempt to parse the *entire* buffer as
+    /// a JSON object:
+    ///   * parsed, and the top-level `choices` array is **empty** → this is the
+    ///     cc-switch 422 trigger; synthesize a single placeholder `choice` (an
+    ///     empty assistant message, `finish_reason: "stop"`) while preserving
+    ///     `id` / `model` / `usage`, and return a buffered JSON response.
+    ///     Bodies with an empty `choices` are always tiny (no generation), so
+    ///     truncation can't hide one.
+    ///   * parsed, and `choices` is non-empty (or absent as a key that isn't an
+    ///     empty array) → a normal completion: stop peeking and fall through to
+    ///     streaming passthrough below, prepending what we already read.
+    ///   * not yet a complete JSON object → keep reading until we either parse,
+    ///     hit the peek cap, or see non-UTF8 / clearly non-JSON bytes.
+    ///
+    /// On any unparseable / over-cap / synthesis-disabled case we forward the
+    /// buffered prefix concatenated with the remaining upstream stream, so the
+    /// client sees the exact bytes it would have under `handle_passthrough_stream`.
+    async fn handle_success_maybe_synthesize(
+        &self,
+        resp: reqwest::Response,
+        resp_headers: Vec<(String, Vec<u8>)>,
+        status: warp::http::StatusCode,
+        client_req_id: &str,
+    ) -> Result<warp::http::Response<warp::hyper::Body>, Rejection> {
+        let mut upstream = resp.bytes_stream();
+        let mut buf: Vec<u8> = Vec::new();
+
+        while let Some(chunk_res) = upstream.next().await {
+            let chunk = match chunk_res {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!(client_req_id = %client_req_id, "Success peek read error: {}", e);
+                    // Forward what we have, plus an error tail; the client will
+                    // see a truncated stream, same as passthrough would.
+                    break;
+                }
+            };
+            buf.extend_from_slice(&chunk);
+            // Only attempt JSON decomposition when the buffer is valid UTF-8.
+            // A gzipped / binary body fails here and falls straight through.
+            let candidate = match std::str::from_utf8(&buf) {
+                Ok(s) => s,
+                Err(_) => break,
+            };
+            let parsed = serde_json::from_str::<serde_json::Value>(candidate);
+            if let Ok(v) = &parsed {
+                if let Some(arr) = v.get("choices").and_then(|c| c.as_array()) {
+                    if arr.is_empty() {
+                        // Confirmed the cc-switch 422 trigger. Synthesize and
+                        // serve a normal (buffered) JSON body — the upstream
+                        // finished, so there's no more stream to forward.
+                        return self.respond_synthesized_empty_choices(
+                            v,
+                            resp_headers,
+                            client_req_id,
+                        );
+                    }
+                    // Non-empty choices: ordinary completion. Stop peeking and
+                    // passthrough the already-read prefix + the rest.
+                    break;
+                }
+                // Parsed JSON but no `choices` key: not our case (and per the
+                // upstream contract a 2xx ChatCompletions body always has one),
+                // so fall through to streaming. Slicing the prefix off isn't
+                // needed — we forward the exact bytes we read.
+                break;
+            }
+            if buf.len() >= EMPTY_CHOICES_PEEK_BYTES {
+                // Genuinely large non-streaming body (no compression to blame
+                // unless the JSON is huge): don't keep buffering; stream it
+                // through. An empty-choices body can't be this big.
+                break;
+            }
+        }
+
+        // Fallthrough: passthrough with the buffered prefix prepended to the
+        // remaining upstream stream. This preserves byte-for-byte fidelity with
+        // `handle_passthrough_stream` (no synthesis happened).
+        let prefix = Bytes::from(buf);
+        let req_id_owned = client_req_id.to_string();
+        let rest = upstream.map(move |r| {
+            r.map(|chunk| coerce_sse_chunk(&chunk)).map_err(|e| {
+                warn!(client_req_id = %req_id_owned, "Passthrough stream read error: {}", e);
+                std::io::Error::other(e.to_string())
+            })
+        });
+        let pref: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> =
+            if prefix.is_empty() {
+                Box::pin(rest)
+            } else {
+                let head = futures_util::stream::iter(vec![Ok(prefix)]);
+                Box::pin(head.chain(rest))
+            };
+
+        let tapped: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> =
+            Box::pin(UsageTap {
+                inner: pref,
+                metrics: self.metrics.clone(),
+                carry: String::new(),
+                usage: None,
+                saw_choices: false,
+                saw_empty_choices: false,
+                saw_any_json: false,
+                status: Some(status.as_u16()),
+                client_req_id: client_req_id.to_string(),
+            });
+
+        let mut response_builder = warp::http::Response::builder().status(status);
+        apply_forwarded_response_headers(&mut response_builder, resp_headers);
+        // The response is now a known-length buffered-prefix stream; we leave
+        // Content-Length off (chunked) to stay byte-faithful without having to
+        // recompute it for the prefix + dynamic remainder.
+        let body = warp::hyper::Body::wrap_stream(tapped);
+        Ok(response_builder.body(body).unwrap_or_else(|_| {
+            warp::http::Response::builder()
+                .status(status)
+                .body(warp::hyper::Body::empty())
+                .unwrap()
+        }))
+    }
+
+    /// Build and return the synthesized response: take a parsed body with an
+    /// empty `choices` array, drop in a single empty-assistant-message choice,
+    /// preserve `id` / `model` / `usage` / any sibling fields, re-serialize,
+    /// and serve it as a buffered JSON response with a corrected Content-Length.
+    fn respond_synthesized_empty_choices(
+        &self,
+        body: &serde_json::Value,
+        resp_headers: Vec<(String, Vec<u8>)>,
+        client_req_id: &str,
+    ) -> Result<warp::http::Response<warp::hyper::Body>, Rejection> {
+        warn!(
+            client_req_id = %client_req_id,
+            "Synthesizing placeholder choice for empty-choices 2xx body \
+             (prevents downstream \"Empty choices array\" 422)",
+        );
+        let mut obj = match body {
+            serde_json::Value::Object(m) => m.clone(),
+            // The caller only reaches here after `body.choices` resolved to an
+            // empty array, which requires a JSON object; anything else is a bug
+            // in the parser guard, so fail safe to the raw passthrough path.
+            _ => return self.handle_passthrough_empty_synthesize_fallback(),
+        };
+        obj.insert("choices".to_string(), serde_json::json!([{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": ""
+            },
+            "finish_reason": "stop"
+        }]));
+        let out = serde_json::to_vec(&serde_json::Value::Object(obj))
+            .unwrap_or_else(|_| b"{}".to_vec());
+
+        let mut response_builder = warp::http::Response::builder().status(
+            warp::http::StatusCode::OK,
+        );
+        apply_forwarded_response_headers(&mut response_builder, resp_headers);
+        // Drop any upstream Content-Length/transfer-encoding and set our own so
+        // the client knows exactly where the synthesized body ends.
+        if let Some(headers) = response_builder.headers_mut() {
+            headers.remove("content-length");
+            headers.insert(
+                warp::http::header::CONTENT_LENGTH,
+                warp::http::HeaderValue::from(out.len()),
+            );
+            headers.insert(
+                warp::http::header::CONTENT_TYPE,
+                warp::http::HeaderValue::from_static("application/json"),
+            );
+        }
+        Ok(response_builder
+            .body(warp::hyper::Body::from(out))
+            .unwrap_or_else(|_| {
+                warp::http::Response::builder()
+                    .status(warp::http::StatusCode::OK)
+                    .body(warp::hyper::Body::empty())
+                    .unwrap()
+            }))
+    }
+
+    /// Unreachable in practice under the object guard; provided so the
+    /// synthesis helper can return *some* response rather than `unwrap`.
+    fn handle_passthrough_empty_synthesize_fallback(
+        &self,
+    ) -> Result<warp::http::Response<warp::hyper::Body>, Rejection> {
+        let mut response_builder =
+            warp::http::Response::builder().status(warp::http::StatusCode::OK);
+        if let Some(headers) = response_builder.headers_mut() {
+            headers.insert(
+                warp::http::header::CONTENT_TYPE,
+                warp::http::HeaderValue::from_static("application/json"),
+            );
+        }
+        Ok(response_builder
+            .body(warp::hyper::Body::from(b"{}" as &[u8]))
+            .unwrap_or_else(|_| {
+                warp::http::Response::builder()
+                    .status(warp::http::StatusCode::OK)
+                    .body(warp::hyper::Body::empty())
+                    .unwrap()
+            }))
     }
 }
 
@@ -1543,6 +1949,7 @@ mod proxy_integration_tests {
             allow_local_base_url: false,
             auth: AuthConfig::default(),
             inject_stream_usage: true,
+            synthesize_empty_choices: true,
         }
     }
 
@@ -1557,7 +1964,8 @@ mod proxy_integration_tests {
             config.retry.clone(),
             config.rate_limiter.token_wait_ms,
             config.model_aliases.clone(),
-            true,
+            config.inject_stream_usage,
+            config.synthesize_empty_choices,
         );
 
         let proxy_route = warp::path::full()
@@ -2066,6 +2474,234 @@ mod proxy_integration_tests {
 
         assert_eq!(resp.status(), 200);
     }
+
+    // ── tools normalization (mod: ToolDescription.description null→empty) ──
+
+    /// Flat-shape tool with `description: null` must be coerced to `""`
+    /// before forwarding, and the request must still succeed. NVIDIA's
+    /// pydantic ToolDescription rejects null description with a 400; the
+    /// failure.log showed this cascading into cc-switch's
+    /// "Empty choices array" 422.
+    #[tokio::test]
+    async fn tool_flat_null_description_normalized_to_empty() {
+        let mock_server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "x", "object": "chat.completion", "model": "m",
+                "choices": [{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let addr = start_proxy(test_config(&mock_server.uri(), 0, 60)).await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://{}/v1/chat/completions", addr))
+            .header("content-type", "application/json")
+            .body(r#"{"model":"m","messages":[],"tools":[{"type":"function","name":"t","description":null,"parameters":{}}]}"#)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 200, "flat tool with null description should be coerced, not 400");
+
+        let requests = mock_server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let desc = body["tools"][0]["description"]
+            .as_str()
+            .expect("flat description should be a string after coercion");
+        assert_eq!(desc, "", "null description should become empty string, got {:?}", body["tools"][0]["description"]);
+    }
+
+    /// Nested OpenAI-canonical shape `{type:function, function:{...}}` with
+    /// a missing `function.description` must be backfilled with `""`.
+    #[tokio::test]
+    async fn tool_nested_missing_description_backfilled_to_empty() {
+        let mock_server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "x", "object": "chat.completion", "model": "m",
+                "choices": [{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let addr = start_proxy(test_config(&mock_server.uri(), 0, 60)).await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://{}/v1/chat/completions", addr))
+            .header("content-type", "application/json")
+            .body(r#"{"model":"m","messages":[],"tools":[{"type":"function","function":{"name":"t","parameters":{}}}],"stream":false}"#)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 200, "nested tool with missing description should be backfilled, not 400");
+
+        let requests = mock_server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let desc = body["tools"][0]["function"]["description"]
+            .as_str()
+            .expect("nested function.description should be a string after backfill");
+        assert_eq!(desc, "", "missing description should become empty string");
+        // Sanity: non-null description is preserved untouched.
+        let name = body["tools"][0]["function"]["name"].as_str().unwrap();
+        assert_eq!(name, "t");
+    }
+
+    /// A tool with a real non-empty `description` must pass through
+    /// unchanged (the normalizer is a no-op when the field is already valid).
+    #[tokio::test]
+    async fn tool_nonempty_description_preserved() {
+        let mock_server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "x", "object": "chat.completion", "model": "m",
+                "choices": [{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let addr = start_proxy(test_config(&mock_server.uri(), 0, 60)).await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://{}/v1/chat/completions", addr))
+            .header("content-type", "application/json")
+            .body(r#"{"model":"m","messages":[],"tools":[{"type":"function","function":{"name":"t","description":"real desc","parameters":{}}}],"stream":false}"#)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 200);
+        let requests = mock_server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["tools"][0]["function"]["description"].as_str(), Some("real desc"));
+    }
+
+    // ── empty-choices synthesis (cc-switch 422 mitigation, no cc-switch change) ──
+
+    /// A non-stream `stream:false` 2xx body with an empty `choices` array —
+    /// the exact shape that makes cc-switch's `openai_to_anthropic` throw
+    /// "Empty choices array" (→ 422 to Claude Code, e.g. on context
+    /// compaction). The proxy must inject a single placeholder choice and
+    /// preserve `id` / `model` / `usage`, so the downstream converter sees a
+    /// legal ChatCompletions response instead of erroring.
+    #[tokio::test]
+    async fn non_stream_empty_choices_is_synthesized_to_legal_body() {
+        let mock_server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cc-42", "object": "chat.completion", "model": "z-ai/glm-5.2",
+                "choices": [],
+                "usage": {"prompt_tokens": 7, "completion_tokens": 0, "total_tokens": 7}
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let addr = start_proxy(test_config(&mock_server.uri(), 0, 60)).await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://{}/v1/chat/completions", addr))
+            .header("content-type", "application/json")
+            .body(r#"{"model":"z-ai/glm-5.2","messages":[],"stream":false}"#)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 200, "synthesized response must be 200");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let choices = body["choices"].as_array().expect("choices present");
+        assert_eq!(choices.len(), 1, "a placeholder choice is injected");
+        assert_eq!(choices[0]["index"].as_u64(), Some(0));
+        assert_eq!(choices[0]["message"]["role"].as_str(), Some("assistant"));
+        assert_eq!(choices[0]["message"]["content"].as_str(), Some(""));
+        assert_eq!(choices[0]["finish_reason"].as_str(), Some("stop"));
+        // id/model/usage must be preserved so token accounting & metadata survive.
+        assert_eq!(body["id"].as_str(), Some("cc-42"));
+        assert_eq!(body["model"].as_str(), Some("z-ai/glm-5.2"));
+        assert_eq!(body["usage"]["prompt_tokens"].as_u64(), Some(7));
+        assert_eq!(body["usage"]["total_tokens"].as_u64(), Some(7));
+    }
+
+    /// A normal non-empty-choices `stream:false` response must pass through the
+    /// bounded-peek path unchanged — the synthesis is strictly additive and
+    /// only touches the empty-choices case.
+    #[tokio::test]
+    async fn non_stream_normal_response_passes_through_unchanged() {
+        let mock_body = serde_json::json!({
+            "id": "cc-7", "object": "chat.completion", "model": "m",
+            "choices": [{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        });
+        let mock_server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(mock_body.clone()))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let addr = start_proxy(test_config(&mock_server.uri(), 0, 60)).await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://{}/v1/chat/completions", addr))
+            .header("content-type", "application/json")
+            .body(r#"{"model":"m","messages":[],"stream":false}"#)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        // Byte-faithful: choices/content unchanged, no injection.
+        assert_eq!(body["choices"][0]["message"]["content"].as_str(), Some("hi"));
+        assert_eq!(body["id"].as_str(), Some("cc-7"));
+        assert_eq!(body["usage"]["total_tokens"].as_u64(), Some(2));
+    }
+
+    /// With `synthesize_empty_choices = false` the proxy must NOT synthesize:
+    /// an empty-choices 200 body is forwarded as-is (the pre-mitigation
+    /// behaviour). This is the escape hatch documented on the config field.
+    #[tokio::test]
+    async fn synthesize_disabled_forwards_empty_choices_unchanged() {
+        let mock_server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cc-1", "object": "chat.completion", "model": "m",
+                "choices": [],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 0, "total_tokens": 3}
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let mut cfg = test_config(&mock_server.uri(), 0, 60);
+        cfg.synthesize_empty_choices = false;
+        let addr = start_proxy(cfg).await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://{}/v1/chat/completions", addr))
+            .header("content-type", "application/json")
+            .body(r#"{"model":"m","messages":[],"stream":false}"#)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        // Unchanged: still empty choices — synthesis was off.
+        assert!(body["choices"].as_array().map(|a| a.is_empty()).unwrap_or(false));
+        assert_eq!(body["id"].as_str(), Some("cc-1"));
+    }
 }
 
 #[cfg(test)]
@@ -2107,6 +2743,11 @@ mod usage_accounting_tests {
             metrics: Arc::new(Metrics::new()),
             carry: String::new(),
             usage: None,
+            saw_choices: false,
+            saw_empty_choices: false,
+            saw_any_json: false,
+            status: None,
+            client_req_id: String::new(),
         };
         // First chunk: a token delta (no usage) + a partial data line.
         tap.feed(&Bytes::from_static(
@@ -2121,5 +2762,93 @@ mod usage_accounting_tests {
         assert_eq!(u.prompt, Some(7));
         assert_eq!(u.completion, Some(3));
         assert_eq!(u.total, Some(10));
+    }
+
+    // ── empty-choices diagnostic: classify without false-positiving ──
+
+    /// Helper: feed a body through a `UsageTap` (with an inner `empty()` stream
+    /// so the only thing being exercised is `feed`/`flush_trailing`), then run
+    /// the end-of-stream logic and report whether the empty-choices warning
+    /// *would* fire. Mirrors the `Poll::Ready(None)` branch in `Stream`.
+    fn empty_choices_would_warn(body: &[u8], status: Option<u16>) -> bool {
+        let mut tap = UsageTap {
+            inner: futures_util::stream::empty(),
+            metrics: Arc::new(Metrics::new()),
+            carry: String::new(),
+            usage: None,
+            saw_choices: false,
+            saw_empty_choices: false,
+            saw_any_json: false,
+            status,
+            client_req_id: String::from("t"),
+        };
+        // Feed the whole body as if it arrived in one chunk; `feed` processes
+        // complete lines, `flush_trailing` drains whatever the body left
+        // without a trailing newline.
+        tap.feed(&Bytes::copy_from_slice(body));
+        tap.flush_trailing();
+        // Same guard as poll_next's Ready(None) branch.
+        tap.saw_empty_choices && !tap.saw_choices
+    }
+
+    /// The genuinely-pathological case: a 2xx usage-only final SSE chunk with
+    /// `choices: []` (and usage). This is what cc-switch aggregates and then
+    /// 422's on — the diagnostic must fire.
+    #[test]
+    fn empty_choices_diagnostic_fires_on_empty_choices_json() {
+        let body = b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":0,\"total_tokens\":1}}\n";
+        assert!(
+            empty_choices_would_warn(body, Some(200)),
+            "an empty-choices JSON object on a 2xx stream must trigger the diagnostic",
+        );
+    }
+
+    /// A non-streaming ChatCompletions response is a single JSON line with no
+    /// trailing newline. Despite the missing '\\n', `flush_trailing` must read
+    /// its non-empty `choices` so the diagnostic does *not* false-positive.
+    #[test]
+    fn empty_choices_diagnostic_quiet_on_nonstream_json_without_newline() {
+        let body = b"{\"id\":\"x\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}";
+        assert!(
+            !empty_choices_would_warn(body, Some(200)),
+            "a normal non-streaming response (single JSON line, non-empty choices) must not warn",
+        );
+    }
+
+    /// A streaming response with content deltas followed by a usage-only final
+    /// chunk (`choices:[]`). The earlier non-empty `choices` makes the
+    /// diagnostic quiet — this is the common OpenAI streaming tail.
+    #[test]
+    fn empty_choices_diagnostic_quiet_when_real_choice_preceded_usage_tail() {
+        let body = b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n";
+        assert!(
+            !empty_choices_would_warn(body, Some(200)),
+            "a real choice earlier in the stream suppresses the empty-tail warning",
+        );
+    }
+
+    /// A non-JSON success body (text/plain upstream, or any body we can't
+    /// parse as JSON) must never fire the diagnostic — there's no choices
+    /// array to be empty, so the cc-switch trigger doesn't apply.
+    #[test]
+    fn empty_choices_diagnostic_quiet_on_text_body() {
+        let body = b"hello world this is not json at all\n";
+        assert!(
+            !empty_choices_would_warn(body, Some(200)),
+            "text/non-JSON bodies must not false-positive the empty-choices diagnostic",
+        );
+    }
+
+    /// Error-shaped bodies (`{"error":...}`) intentionally parse as JSON with
+    /// no `choices` key at all — that does not set `saw_empty_choices`, so the
+    /// diagnostic stays quiet. (cc-switch's "No choices in response" is a
+    /// separate upstream-handles path.)
+    #[test]
+    fn empty_choices_diagnostic_quiet_on_error_body_no_choices_key() {
+        let body = b"{\"error\":{\"message\":\"bad\",\"type\":\"BadRequestError\",\"code\":400}}\n";
+        assert!(
+            !empty_choices_would_warn(body, Some(200)),
+            "an error body with no choices key is not the empty-choices case",
+        );
     }
 }

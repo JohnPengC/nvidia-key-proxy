@@ -43,6 +43,7 @@ fn test_config() -> Config {
         allow_local_base_url: false,
         auth: AuthConfig::default(),
         inject_stream_usage: true,
+        synthesize_empty_choices: true,
     }
 }
 

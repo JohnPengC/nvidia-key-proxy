@@ -55,6 +55,7 @@ impl AppState {
             config.rate_limiter.token_wait_ms,
             model_aliases,
             config.inject_stream_usage,
+            config.synthesize_empty_choices,
         );
         let health_checker = Arc::new(HealthChecker::new(
             key_pool.clone(),

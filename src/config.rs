@@ -49,6 +49,23 @@ pub struct Config {
     /// disable via `inject_stream_usage = false` or `NVIDIA_INJECT_STREAM_USAGE=false`.
     #[serde(default = "default_inject_stream_usage")]
     pub inject_stream_usage: bool,
+    /// Synthesize a placeholder `choices` entry when upstream returns a 2xx
+    /// non-SSE body whose `choices` array is empty (`choices: []`). cc-switch's
+    /// non-streaming converter `openai_to_anthropic` hard-errors on an empty
+    /// `choices` ("格式转换错误: Empty choices array" → 422 to Claude Code);
+    /// this commonly happens on context compaction (`stream:false`) where the
+    /// model produced no tokens but still returned `usage`. Instead of relying
+    /// on cc-switch being patched, the proxy rewrites that body in-place to a
+    /// legal single-choice response (empty assistant message, `finish_reason:
+    /// stop`, preserving `id`/`model`/`usage`) so cc-switch succeeds.
+    ///
+    /// Only the non-streaming, non-SSE success branch is affected — and there
+    /// only a bounded ≤64 KiB prefix is buffered to decide, so large streaming
+    /// completions keep their zero-copy passthrough. Defaults to true; disable
+    /// via `synthesize_empty_choices = false` or
+    /// `NVIDIA_SYNTHESIZE_EMPTY_CHOICES=false`.
+    #[serde(default = "default_synthesize_empty_choices")]
+    pub synthesize_empty_choices: bool,
 }
 
 fn default_request_timeout_seconds() -> u64 {
@@ -56,6 +73,10 @@ fn default_request_timeout_seconds() -> u64 {
 }
 
 fn default_inject_stream_usage() -> bool {
+    true
+}
+
+fn default_synthesize_empty_choices() -> bool {
     true
 }
 
@@ -106,6 +127,7 @@ impl fmt::Debug for Config {
             .field("model_aliases", &self.model_aliases)
             .field("allow_local_base_url", &self.allow_local_base_url)
             .field("inject_stream_usage", &self.inject_stream_usage)
+            .field("synthesize_empty_choices", &self.synthesize_empty_choices)
             .field(
                 "auth",
                 &format!(
@@ -262,6 +284,7 @@ impl Config {
             allow_local_base_url: false,
             auth: AuthConfig::default(),
             inject_stream_usage: default_inject_stream_usage(),
+            synthesize_empty_choices: default_synthesize_empty_choices(),
         };
 
         // Prefer NVIDIA_CONFIG_PATH, fall back to ./config.toml
@@ -506,6 +529,11 @@ impl Config {
                         config.inject_stream_usage = v;
                     }
                 }
+                "synthesize_empty_choices" => {
+                    if let Ok(v) = value.parse::<bool>() {
+                        config.synthesize_empty_choices = v;
+                    }
+                }
                 _ => {}
             }
         }
@@ -546,6 +574,7 @@ mod config_validation_tests {
             allow_local_base_url: false,
             auth: AuthConfig::default(),
             inject_stream_usage: true,
+            synthesize_empty_choices: true,
         }
     }
 

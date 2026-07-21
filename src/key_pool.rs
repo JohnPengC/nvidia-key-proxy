@@ -811,6 +811,7 @@ mod retry_state_machine_tests {
             allow_local_base_url: false,
             auth: AuthConfig::default(),
             inject_stream_usage: true,
+        synthesize_empty_choices: true,
         };
         let metrics = Arc::new(Metrics::new());
         KeyPool::new(&cfg, metrics)
@@ -958,6 +959,7 @@ mod score_selection_tests {
             allow_local_base_url: false,
             auth: AuthConfig::default(),
             inject_stream_usage: true,
+        synthesize_empty_choices: true,
         };
         let metrics = Arc::new(Metrics::new());
         KeyPool::new(&cfg, metrics)
@@ -1104,6 +1106,7 @@ mod runtime_key_tests {
             allow_local_base_url: false,
             auth: AuthConfig::default(),
             inject_stream_usage: true,
+        synthesize_empty_choices: true,
         };
         KeyPool::new(&cfg, Arc::new(Metrics::new()))
     }
