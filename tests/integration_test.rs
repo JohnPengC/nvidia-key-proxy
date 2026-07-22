@@ -44,6 +44,8 @@ fn test_config() -> Config {
         auth: AuthConfig::default(),
         inject_stream_usage: true,
         synthesize_empty_choices: true,
+        retry_on_empty_shell: true,
+        empty_shell_retry_max_tokens: 8192,
     }
 }
 

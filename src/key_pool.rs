@@ -812,6 +812,8 @@ mod retry_state_machine_tests {
             auth: AuthConfig::default(),
             inject_stream_usage: true,
         synthesize_empty_choices: true,
+        retry_on_empty_shell: true,
+        empty_shell_retry_max_tokens: 8192,
         };
         let metrics = Arc::new(Metrics::new());
         KeyPool::new(&cfg, metrics)
@@ -960,6 +962,8 @@ mod score_selection_tests {
             auth: AuthConfig::default(),
             inject_stream_usage: true,
         synthesize_empty_choices: true,
+        retry_on_empty_shell: true,
+        empty_shell_retry_max_tokens: 8192,
         };
         let metrics = Arc::new(Metrics::new());
         KeyPool::new(&cfg, metrics)
@@ -1107,6 +1111,8 @@ mod runtime_key_tests {
             auth: AuthConfig::default(),
             inject_stream_usage: true,
         synthesize_empty_choices: true,
+        retry_on_empty_shell: true,
+        empty_shell_retry_max_tokens: 8192,
         };
         KeyPool::new(&cfg, Arc::new(Metrics::new()))
     }

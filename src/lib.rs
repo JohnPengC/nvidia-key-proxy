@@ -79,6 +79,8 @@ impl AppState {
             model_aliases,
             config.inject_stream_usage,
             config.synthesize_empty_choices,
+            config.retry_on_empty_shell,
+            config.empty_shell_retry_max_tokens,
         );
         let health_checker = Arc::new(HealthChecker::new(
             key_pool.clone(),

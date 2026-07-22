@@ -61,6 +61,13 @@ pub struct Proxy {
     /// Only the non-streaming non-SSE success path is affected, and only a
     /// bounded prefix is ever inspected.
     synthesize_empty_choices: bool,
+    /// Retry once with a clamped `max_tokens` when NVIDIA returns an empty-shell
+    /// 2xx soft failure (`choices:[]` with a null `usage` and empty `id`).
+    /// See `Config::retry_on_empty_shell` for the full rationale.
+    retry_on_empty_shell: bool,
+    /// `max_tokens` value used for that single post-shell retry. Only the retry
+    /// attempt is affected; the original request is forwarded unchanged.
+    empty_shell_retry_max_tokens: u64,
 }
 
 /// Outcome of a single upstream attempt. `Retry` is used only for 401 without
@@ -68,6 +75,64 @@ pub struct Proxy {
 enum AttemptResponse {
     Done(warp::reply::Response),
     Retry,
+}
+
+/// Disposition of a 2xx non-SSE ChatCompletions response after the
+/// empty-choices peek. `Response` is the normal carry (a synthesized
+/// placeholder when the body legitimately had empty `choices` + real `usage`,
+/// or zero-ownership passthrough). `ShellFailure` is the NVIDIA "empty-shell"
+/// soft failure: `choices:[]` with a NONE `usage` and empty `id` — no real
+/// inference ran. The caller (`process_upstream_attempt`) decides whether to
+/// retry once with a clamped `max_tokens` (see `Config::retry_on_empty_shell`)
+/// or surface a 502 instead of the misleading empty-content placeholder that
+/// made Claude Code's `/compact` print "summarization produced empty response".
+enum SuccessOutcome {
+    Response(warp::reply::Response),
+    /// Upstream returned an empty-shell soft failure. Carries the parsed body
+    /// so the caller can extract fields for the 502 detail message if it
+    /// chooses not to (or cannot) retry.
+    ShellFailure { body: serde_json::Value },
+}
+
+/// Classify an empty-`choices` 2xx body as an NVIDIA empty-shell soft failure.
+///
+/// NVIDIA's soft-failure shell (observed on GLM-class models at
+/// build.integrate, notably for `/compact` with large `max_tokens`) looks like:
+///   `{"choices":[],"id":"","model":"","created":0,"object":"chat.completion",
+///     "service_tier":null,"system_fingerprint":null,"usage":null}`
+/// Every meaningful field is null/empty because no inference actually ran —
+/// the model was silently dropped, not run. The tell is `usage:null`: a
+/// *legitimate* compaction empty-choices body (model ran, produced zero
+/// tokens) still carries a real `usage` object. So this returns true only when
+/// `choices` is empty AND `usage` is null/absent. We also require `id` to be
+/// empty-ish as a second corroborating signal, which keeps a hypothetical
+/// long-running empty-body usage-less 200 (not in NVIDIA's contract) from
+/// being misread as a shell.
+fn is_empty_shell_failure(body: &serde_json::Value) -> bool {
+    // choices must be present and empty.
+    let choices_empty = body
+        .get("choices")
+        .and_then(|c| c.as_array())
+        .map(|a| a.is_empty())
+        .unwrap_or(false);
+    if !choices_empty {
+        return false;
+    }
+    // usage null/absent/empty object → no inference ran.
+    let usage_null = match body.get("usage") {
+        None | Some(serde_json::Value::Null) => true,
+        Some(u) if u.as_object().map(|o| o.is_empty()).unwrap_or(false) => true,
+        Some(_) => false,
+    };
+    if !usage_null {
+        return false;
+    }
+    // Empty-id as a second corroborating signal.
+    match body.get("id") {
+        None | Some(serde_json::Value::Null) => true,
+        Some(serde_json::Value::String(s)) => s.is_empty(),
+        Some(_) => false,
+    }
 }
 
 /// Errors that can occur during a single upstream attempt.
@@ -242,6 +307,349 @@ fn body_summary(parsed_body: &Option<serde_json::Value>) -> String {
     }
     serde_json::Value::Object(summary).to_string()
 }
+
+/// Emit a structured `failure.log` record when an upstream 2xx ChatCompletions
+/// response was identified as an NVIDIA empty-shell soft failure (`choices:[]`
+/// with `usage:null` and empty `id` — no real inference ran). The record carries
+/// enough evidence to pin the root cause from failure.log alone, without
+/// re-poking NVIDIA:
+///   * `body_excerpt` — the full upstream response body (tiny; capped at 2048).
+///     Its `usage:null` vs `usage:{...}` is the tell that distinguishes a shell
+///     from a legitimate zero-token compaction response.
+///   * `detail` — a structured fingerprint: request side (`max_tokens`, `stream`,
+///     `messages` count, **rough prompt-token estimate**, `temperature`, `top_p`,
+///     `reasoning_effort`, `tools`/`tool_choice`), the shell side (`id`,
+///     `usage`, `created`, `choiceslen`), the retry disposition (clamped
+///     `max_tokens`, attempt index, retry reason), and per-attempt upstream
+///     elapsed-ms when supplied by the caller.
+///
+/// Request messages are NEVER logged in full (they may hold large transcript);
+/// only the rough token estimate + first/last message previews.
+///
+/// `category` distinguishes the first-attempt shell from a retry shell so a jq
+/// group-by can tell the two apart. `retry_attempt` is the attempt index that
+/// produced this shell (0 → original request), and `retry_reason` is set to
+/// the reason a retry followed (or None when none followed). `elapsed_ms` is the
+/// upstream round-trip time for the attempt that produced this shell when the
+/// caller has it (None when unknown).
+#[allow(clippy::too_many_arguments)]
+fn write_empty_shell_failure_log(
+    upstream_body: &serde_json::Value,
+    request_body: &bytes::Bytes,
+    client_req_id: &str,
+    model: &str,
+    key_str: &str,
+    upstream_url: &str,
+    body_summary: &str,
+    category: &str,
+    retry_attempt: u32,
+    retry_reason: Option<&str>,
+    elapsed_ms: Option<u128>,
+) {
+    // Full upstream response body — the empty-shell body is tiny (no
+    // generation), so this is cheap. Cap defensively in case upstream bloats.
+    let body_excerpt = upstream_body
+        .to_string()
+        .chars()
+        .take(2048)
+        .collect::<String>();
+
+    let req_fp = request_body_fingerprint(request_body);
+    let shell_fp = shell_body_fingerprint(upstream_body);
+    let detail = build_empty_shell_detail(
+        &req_fp,
+        &shell_fp,
+        retry_attempt,
+        retry_reason,
+        elapsed_ms,
+    );
+
+    failure_log::write_failure(
+        "POST",
+        "/v1/chat/completions",
+        upstream_url,
+        model,
+        key_str,
+        Some(200),
+        category,
+        &detail,
+        &body_excerpt,
+        body_summary,
+        retry_attempt,
+        retry_reason,
+        next_req_id(),
+        client_req_id,
+        Some("empty_choices"),
+    );
+}
+
+/// Compact, structured fingerprint of a chat-completions **request** body, for
+/// failure-log/tracing context. Pulls the fields that most commonly influence
+/// NVIDIA's soft-rejection of GLM-class models: `max_tokens` (the prime suspect
+/// on `/compact`), `stream`, `messages` count, a rough prompt-token estimate
+/// (Σ content chars / 4 — coarse but enough to spot a context-window overflow),
+/// `temperature` / `top_p` / `reasoning_effort`, and any `tools`/`tool_choice`.
+/// Returns the request untouched when unparseable. Never logs full message
+/// text — only the scalar/preview facets here.
+fn request_body_fingerprint(body: &bytes::Bytes) -> String {
+    let Ok(s) = std::str::from_utf8(body) else {
+        return "<unparseable request body>".to_string();
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(s) else {
+        return "<request body not JSON>".to_string();
+    };
+
+    let scalar = |field: &str| match v.get(field) {
+        None => "<absent>".to_string(),
+        Some(other) => other.to_string(),
+    };
+
+    // messages count + rough prompt-token estimate + first/last role previews.
+    let messages = v.get("messages").and_then(|m| m.as_array());
+    let n = messages.map(|a| a.len()).unwrap_or(0);
+    let mut est_chars: usize = 0;
+    // System/tool text also counts toward the prompt; sum every message's
+    // content length regardless of role.
+    if let Some(arr) = messages {
+        for m in arr {
+            match m.get("content") {
+                Some(serde_json::Value::String(s)) => est_chars += s.chars().count(),
+                Some(other) => est_chars += other.to_string().chars().count(),
+                None => {}
+            }
+        }
+    }
+    let est_tokens = est_chars / 4;
+
+    let prev = |idx: usize| -> Option<String> {
+        let arr = messages?;
+        let m = arr.get(idx)?;
+        let role = m
+            .get("role")
+            .and_then(|r| r.as_str())
+            .unwrap_or("?")
+            .to_string();
+        let content_str = match m.get("content") {
+            Some(serde_json::Value::String(s)) => s.clone(),
+            Some(other) => other.to_string(),
+            None => String::new(),
+        };
+        let c = content_str.chars().take(120).collect::<String>();
+        Some(format!("role={role} content[..120]={c:?}"))
+    };
+    let first = prev(0).unwrap_or_else(|| "<none>".to_string());
+    let last = prev(n.saturating_sub(1)).unwrap_or_else(|| "<none>".to_string());
+
+    let tools_n = v
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .map(|a| a.len())
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "<absent>".to_string());
+
+    format!(
+        "max_tokens={} stream={} messages={} est_prompt_tokens=~{} temperature={} top_p={} \
+         reasoning_effort={} tools={} tool_choice={} first=[{first}] last=[{last}]",
+        scalar("max_tokens"),
+        scalar("stream"),
+        n,
+        est_tokens,
+        scalar("temperature"),
+        scalar("top_p"),
+        scalar("reasoning_effort"),
+        tools_n,
+        scalar("tool_choice"),
+    )
+}
+
+/// Compact fingerprint of an NVIDIA empty-shell response body — the fields that
+/// confirm it's a shell (vs. a legitimate zero-token completion): `id`, `model`,
+/// `created`, `usage`, and the length of the `choices` array (should be 0).
+/// `usage:null` here is the smoking gun that no inference ran.
+fn shell_body_fingerprint(body: &serde_json::Value) -> String {
+    let id = body
+        .get("id")
+        .map(|v| if v.is_null() { "null".to_string() } else { v.to_string() })
+        .unwrap_or_else(|| "<absent>".to_string());
+    let model = body
+        .get("model")
+        .map(|v| if v.is_null() { "null".to_string() } else { v.to_string() })
+        .unwrap_or_else(|| "<absent>".to_string());
+    let created = body.get("created").map(|v| v.to_string()).unwrap_or_else(|| "<absent>".to_string());
+    let usage = body
+        .get("usage")
+        .map(|v| if v.is_null() { "null".to_string() } else { v.to_string() })
+        .unwrap_or_else(|| "<absent>".to_string());
+    let choiceslen = body
+        .get("choices")
+        .and_then(|c| c.as_array())
+        .map(|a| a.len())
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "<absent>".to_string());
+    let object = body
+        .get("object")
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "<absent>".to_string());
+    format!(
+        "object={object} id={id} model={model} created={created} choiceslen={choiceslen} usage={usage}",
+    )
+}
+
+/// Compose the `detail` string for an empty-shell failure record: request
+/// fingerprint + shell fingerprint + retry disposition + timing. Hard line-breaks
+/// (`\\n`) make the `jq -r .detail` output readable rather than one long comma'd
+/// run; failure.log stores it as a single JSON string either way.
+fn build_empty_shell_detail(
+    req_fp: &str,
+    shell_fp: &str,
+    retry_attempt: u32,
+    retry_reason: Option<&str>,
+    elapsed_ms: Option<u128>,
+) -> String {
+    let timing = match elapsed_ms {
+        Some(ms) => format!("upstream_elapsed_ms={ms}"),
+        None => "upstream_elapsed_ms=<unknown>".to_string(),
+    };
+    let attempt_line = match retry_reason {
+        Some(r) => format!("attempts_up_to_this_shell={retry_attempt} retry_reason={r}"),
+        None => format!("attempts_up_to_this_shell={retry_attempt} retry_reason=<none>"),
+    };
+    format!(
+        "NVIDIA empty-shell soft failure (200, choices:[], usage:null — no inference ran).\
+         \n  {timing}\
+         \n  {attempt_line}\
+         \n  request[{req_fp}]\
+         \n  upstream_shell[{shell_fp}]",
+    )
+}
+
+/// Build a 502 Bad Gateway response body that surfaces an NVIDIA empty-shell
+/// soft failure to the client — instead of the synthesized empty-content
+/// choice that made Claude Code's `/compact` print "summarization produced
+/// empty response". Carries a structured OpenAI-shaped error so downstream
+/// consumers (cc-switch → Anthropic) classify it as a hard failure rather than
+/// a zero-token completion.
+///
+/// `primary` is the body that drove the 502 (the retry's shell, or the
+/// original shell when no retry). `original` is the first-attempt shell, kept
+/// for the log detail even when `primary` is a retry outcome. `retry_max`
+/// is the clamped `max_tokens` used when a retry was attempted (None means
+/// retry was disabled/budget exhausted).
+/// Build a 502 Bad Gateway response body that surfaces an NVIDIA empty-shell
+/// soft failure to the client — instead of the synthesized empty-content choice
+/// that made Claude Code's `/compact` print "summarization produced empty
+/// response". Carries a structured OpenAI-shaped error so downstream consumers
+/// (cc-switch → Anthropic) classify it as a hard failure rather than a
+/// zero-token completion.
+///
+/// `request_body` is the body that last went upstream (original when no retry,
+/// clamped retry body when one was made). `shell_body` is the upstream
+/// empty-shell body that drove this 502 (the retry's shell, or the original).
+/// `retry` is `Some((clamped_max_tokens, attempt_index, outcome))` when a
+/// clamped retry was attempted; the outcome string names how it ended.
+fn empty_shell_bad_gateway(
+    request_body: &bytes::Bytes,
+    shell_body: &serde_json::Value,
+    client_req_id: &str,
+    retry: Option<(u64, u32, &'static str)>,
+) -> warp::reply::Response {
+    let request_fp = request_body_fingerprint(request_body);
+    let shell_fp = shell_body_fingerprint(shell_body);
+    let (retry_json, detail) = match retry {
+        Some((m, attempt, outcome)) => {
+            let j = serde_json::json!({
+                "attempted": true,
+                "clamped_max_tokens": m,
+                "attempt_index": attempt,
+                "outcome": outcome,
+            });
+            let d = format!(
+                "upstream empty-shell 2xx (choices:[], usage:null — no inference ran); \
+                 retried once with max_tokens={m} (attempt={attempt}) and failed ({outcome}); \
+                 client_req_id={client_req_id}"
+            );
+            (j, d)
+        }
+        None => {
+            let j = serde_json::json!({
+                "attempted": false,
+                "clamped_max_tokens": null,
+                "attempt_index": null,
+                "outcome": "not_attempted",
+            });
+            let d = format!(
+                "upstream empty-shell 2xx (choices:[], usage:null — no inference ran); \
+                 not retried (retry disabled or budget exhausted); client_req_id={client_req_id}"
+            );
+            (j, d)
+        }
+    };
+    let body = serde_json::json!({
+        "error": {
+            "message": "upstream soft-failure: empty chat completion (no inference produced). \
+                        This typically happens on long-context /compact with max_tokens larger \
+                        than the model's remaining context budget.",
+            "type": "upstream_empty_shell",
+            "code": "empty_completion",
+            "client_req_id": client_req_id,
+            "retry": retry_json,
+            "request_fingerprint": request_fp,
+            "upstream_shell": {
+                "status": 200,
+                "fingerprint": shell_fp,
+                "body": shell_body,
+            },
+            "detail": detail,
+        }
+    });
+    let bytes = serde_json::to_vec(&body).unwrap_or_else(|_| b"{}".to_vec());
+    warp::http::Response::builder()
+        .status(warp::http::StatusCode::BAD_GATEWAY)
+        .header("content-type", "application/json")
+        .body(warp::hyper::Body::from(bytes))
+        .unwrap_or_else(|_| {
+            warp::http::Response::builder()
+                .status(warp::http::StatusCode::BAD_GATEWAY)
+                .body(warp::hyper::Body::empty())
+                .unwrap()
+        })
+}
+
+/// Parse a chat-completions request body, clamp `max_tokens` to `target`, and
+/// re-serialize. Used by the empty-shell retry to give NVIDIA a smaller output
+/// budget so the inference actually runs. If the body isn't a valid JSON object
+/// or has no numeric `max_tokens`, the original bytes are returned unchanged.
+fn clamp_max_tokens(body: &bytes::Bytes, target: u64) -> Vec<u8> {
+    let Ok(s) = std::str::from_utf8(body) else {
+        return body.to_vec();
+    };
+    let Ok(mut v) = serde_json::from_str::<serde_json::Value>(s) else {
+        return body.to_vec();
+    };
+    let Some(obj) = v.as_object_mut() else {
+        return body.to_vec();
+    };
+    // Only clamp when the original max_tokens exceeds the target — otherwise
+    // leave the request untouched (and when there's no max_tokens at all, set
+    // nothing rather than surprise clients with a new field).
+    let clamp_needed = match obj.get("max_tokens") {
+        Some(serde_json::Value::Number(n)) => n
+            .as_u64()
+            .map(|x| x > target)
+            .unwrap_or(false),
+        Some(serde_json::Value::String(s)) => s.parse::<u64>().ok().map(|x| x > target).unwrap_or(false),
+        _ => false,
+    };
+    if !clamp_needed {
+        return body.to_vec();
+    }
+    obj.insert(
+        "max_tokens".to_string(),
+        serde_json::Value::Number(serde_json::Number::from(target)),
+    );
+    serde_json::to_vec(&v).unwrap_or_else(|_| body.to_vec())
+}
+
 
 /// Token usage extracted from an upstream `usage` object. Any component may
 /// be `None` when the upstream omits it (e.g. streaming chunks before the
@@ -475,6 +883,7 @@ fn apply_forwarded_response_headers(
 }
 
 impl Proxy {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         base_url: String,
         key_pool: Arc<KeyPool>,
@@ -485,6 +894,8 @@ impl Proxy {
         model_aliases: std::collections::HashMap<String, String>,
         inject_stream_usage: bool,
         synthesize_empty_choices: bool,
+        retry_on_empty_shell: bool,
+        empty_shell_retry_max_tokens: u64,
     ) -> Self {
         let client = reqwest::Client::builder()
             .pool_idle_timeout(Duration::from_secs(90))
@@ -510,6 +921,8 @@ impl Proxy {
             models_cache: Arc::new(Mutex::new(None)),
             inject_stream_usage,
             synthesize_empty_choices,
+            retry_on_empty_shell,
+            empty_shell_retry_max_tokens,
         }
     }
 
@@ -1388,15 +1801,38 @@ impl Proxy {
         if status.is_success() {
             self.key_pool.mark_good(&key_str).await;
             self.metrics.inc_success();
-            let resp = if self.synthesize_empty_choices {
+            let outcome = if self.synthesize_empty_choices {
                 self.handle_success_maybe_synthesize(resp, resp_headers, status, client_req_id)
                     .await
             } else {
+                // Synthesis disabled — the empty-shell retry path can't
+                // inspect the body, so passthrough verbatim (legacy behavior).
                 self.handle_passthrough_stream(resp, resp_headers, status, client_req_id)
                     .await
+                    .map(SuccessOutcome::Response)
             }
             .map_err(AttemptError::Fatal)?;
-            return Ok(AttemptResponse::Done(resp));
+            return Ok(match outcome {
+                SuccessOutcome::Response(resp) => AttemptResponse::Done(resp),
+                SuccessOutcome::ShellFailure { body } => {
+                    // NVIDIA empty-shell soft failure — no inference ran.
+                    // Surface the real cause instead of a misleading empty
+                    // body. Optionally retry once with a clamped `max_tokens`.
+                    self.handle_empty_shell_failure(
+                        body,
+                        method,
+                        url,
+                        headers,
+                        request_body,
+                        model,
+                        &key_str,
+                        body_summary,
+                        client_req_id,
+                        attempt,
+                    )
+                    .await?
+                }
+            });
         }
 
         // Non-success paths still buffer the body — we need the bytes for
@@ -1672,7 +2108,7 @@ async fn handle_passthrough_stream(
         resp_headers: Vec<(String, Vec<u8>)>,
         status: warp::http::StatusCode,
         client_req_id: &str,
-    ) -> Result<warp::http::Response<warp::hyper::Body>, Rejection> {
+    ) -> Result<SuccessOutcome, Rejection> {
         let mut upstream = resp.bytes_stream();
         let mut buf: Vec<u8> = Vec::new();
 
@@ -1697,14 +2133,33 @@ async fn handle_passthrough_stream(
             if let Ok(v) = &parsed {
                 if let Some(arr) = v.get("choices").and_then(|c| c.as_array()) {
                     if arr.is_empty() {
-                        // Confirmed the cc-switch 422 trigger. Synthesize and
-                        // serve a normal (buffered) JSON body — the upstream
-                        // finished, so there's no more stream to forward.
-                        return self.respond_synthesized_empty_choices(
+                        // Empty choices. Two distinct upstream shapes land here:
+                        //  (a) a *legitimate* compaction empty-choices body — the
+                        //      model ran but produced zero tokens, which still
+                        //      carries a real `usage` object. Synthesize a
+                        //      placeholder choice so cc-switch doesn't 422.
+                        //  (b) NVIDIA's empty-shell soft failure — `usage:null`
+                        //      and `id:"` because no inference ran at all (often
+                        //      a `/compact` with `max_tokens` too large for the
+                        //      remaining context). Synthesizing an empty-content
+                        //      choice here is what made Claude Code's `/compact`
+                        //      print "summarization produced empty response". So
+                        //      instead hand the shell to the caller, which will
+                        //      retry once with a clamped `max_tokens` or surface
+                        //      a 502 — never a misleading empty body.
+                        if is_empty_shell_failure(v) {
+                            return Ok(SuccessOutcome::ShellFailure { body: v.clone() });
+                        }
+                        // Confirmed the cc-switch 422 trigger (shape (a)).
+                        // Synthesize and serve a normal (buffered) JSON body —
+                        // the upstream finished, so there's no more stream to
+                        // forward.
+                        let resp = self.respond_synthesized_empty_choices(
                             v,
                             resp_headers,
                             client_req_id,
-                        );
+                        )?;
+                        return Ok(SuccessOutcome::Response(resp));
                     }
                     // Non-empty choices: ordinary completion. Stop peeking and
                     // passthrough the already-read prefix + the rest.
@@ -1762,12 +2217,212 @@ async fn handle_passthrough_stream(
         // Content-Length off (chunked) to stay byte-faithful without having to
         // recompute it for the prefix + dynamic remainder.
         let body = warp::hyper::Body::wrap_stream(tapped);
-        Ok(response_builder.body(body).unwrap_or_else(|_| {
+        let resp = response_builder.body(body).unwrap_or_else(|_| {
             warp::http::Response::builder()
                 .status(status)
                 .body(warp::hyper::Body::empty())
                 .unwrap()
-        }))
+        });
+        Ok(SuccessOutcome::Response(resp))
+    }
+
+    /// Disposition of an NVIDIA empty-shell soft failure (`is_empty_shell_failure`).
+    /// See `Config::retry_on_empty_shell` for the rationale. Per-shell retry
+    /// is bounded at ONE additional attempt: if the retry itself shells, or if
+    /// retry is disabled, we surface a 502 carrying the real cause so Claude
+    /// Code's `/compact` stops printing the misleading "summarization produced
+    /// empty response" and instead shows an actionable proxy/gateway error.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_empty_shell_failure(
+        &self,
+        shell_body: serde_json::Value,
+        method: &warp::http::Method,
+        url: &str,
+        headers: &warp::http::HeaderMap,
+        request_body: &bytes::Bytes,
+        model: &str,
+        key_str: &str,
+        body_summary: &str,
+        client_req_id: &str,
+        retry_attempt_already_done: u32,
+    ) -> Result<AttemptResponse, AttemptError> {
+        // Bound the retry to one extra attempt, and only when the caller still
+        // has retry budget (the attempt counter hasn't exhausted max_retries).
+        // `retry_attempt_already_done` is the attempt index that *produced* this
+        // shell; the retry is attempt+1.
+        let can_retry = self.retry_on_empty_shell
+            && retry_attempt_already_done + 1 < self.retry_config.max_retries;
+
+        // Record the shell in failure.log with the full request+response
+        // evidence regardless of whether we retry — this is the path that
+        // surfaces the root cause for jq triage. We log *after* deciding
+        // `can_retry` so `retry_reason` reflects the disposition that actually
+        // followed.
+        let req_fp = request_body_fingerprint(request_body);
+        let shell_fp = shell_body_fingerprint(&shell_body);
+        warn!(
+            client_req_id = %client_req_id,
+            attempt = retry_attempt_already_done,
+            will_retry = can_retry,
+            retry_max_tokens = if can_retry { Some(self.empty_shell_retry_max_tokens) } else { None },
+            shell = %shell_fp,
+            req = %req_fp,
+            "NVIDIA empty-shell soft failure (200, usage:null, no inference)"
+        );
+        write_empty_shell_failure_log(
+            &shell_body,
+            request_body,
+            client_req_id,
+            model,
+            key_str,
+            url,
+            body_summary,
+            "empty_choices_shell_first",
+            retry_attempt_already_done,
+            if can_retry {
+                Some("empty_shell_clamped_retry")
+            } else {
+                Some("empty_shell_no_retry")
+            },
+            None,
+        );
+
+        if can_retry {
+            let clamped = clamp_max_tokens(request_body, self.empty_shell_retry_max_tokens);
+            let retry_body: bytes::Bytes = clamped.into();
+            warn!(
+                client_req_id = %client_req_id,
+                attempt = retry_attempt_already_done + 1,
+                max_tokens = self.empty_shell_retry_max_tokens,
+                req = %request_body_fingerprint(&retry_body),
+                "Empty-shell soft failure; retrying once with clamped max_tokens",
+            );
+            let rebuild = self.build_upstream_request(
+                url,
+                method,
+                headers,
+                &retry_body,
+                key_str,
+                false, // shell responses are non-streaming compaction requests
+            );
+            match rebuild.send().await {
+                Ok(resp) => {
+                    let resp_status = resp.status();
+                    let content_type = resp
+                        .headers()
+                        .get(req_header::CONTENT_TYPE)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_string();
+                    let resp_headers: Vec<(String, Vec<u8>)> = resp
+                        .headers()
+                        .iter()
+                        .map(|(k, v)| (k.as_str().to_string(), v.as_bytes().to_vec()))
+                        .collect();
+                    info!(
+                        client_req_id = %client_req_id,
+                        attempt = retry_attempt_already_done + 1,
+                        status = %resp_status,
+                        content_type = %content_type,
+                        url = %url,
+                        "Empty-shell retry upstream response"
+                    );
+                    if resp_status.is_success() && self.synthesize_empty_choices {
+                        let outcome = self
+                            .handle_success_maybe_synthesize(
+                                resp,
+                                resp_headers,
+                                resp_status,
+                                client_req_id,
+                            )
+                            .await
+                            .map_err(AttemptError::Fatal)?;
+                        return Ok(match outcome {
+                            SuccessOutcome::Response(resp) => {
+                                self.key_pool.mark_good(key_str).await;
+                                AttemptResponse::Done(resp)
+                            }
+                            // Retry also shelled — surface 502, don't loop.
+                            SuccessOutcome::ShellFailure { body } => {
+                                let retry_shell_fp = shell_body_fingerprint(&body);
+                                warn!(
+                                    client_req_id = %client_req_id,
+                                    attempt = retry_attempt_already_done + 1,
+                                    orig_shell = %shell_fp,
+                                    retry_shell = %retry_shell_fp,
+                                    "Empty-shell retry also soft-failed; surfacing 502",
+                                );
+                                write_empty_shell_failure_log(
+                                    &body,
+                                    &retry_body,
+                                    client_req_id,
+                                    model,
+                                    key_str,
+                                    url,
+                                    body_summary,
+                                    "empty_choices_shell_retry",
+                                    retry_attempt_already_done + 1,
+                                    Some("empty_shell_retry_exhausted"),
+                                    None,
+                                );
+                                AttemptResponse::Done(empty_shell_bad_gateway(
+                                    request_body,
+                                    &body,
+                                    client_req_id,
+                                    Some((
+                                        self.empty_shell_retry_max_tokens,
+                                        retry_attempt_already_done + 1,
+                                        "retry_also_empty_shell",
+                                    )),
+                                ))
+                            }
+                        });
+                    }
+                    // Non-2xx retry or synthesis disabled: classify the error
+                    // its own way would need a whole second pass; for this rare
+                    // self-retried path, surface a 502 so the client sees a clear
+                    // failure instead of a half-handled body.
+                    return Ok(AttemptResponse::Done(empty_shell_bad_gateway(
+                        request_body,
+                        &shell_body,
+                        client_req_id,
+                        Some((
+                            self.empty_shell_retry_max_tokens,
+                            retry_attempt_already_done + 1,
+                            "retry_non_2xx_or_passthrough",
+                        )),
+                    )));
+                }
+                Err(e) => {
+                    warn!(client_req_id = %client_req_id, "Empty-shell retry send error: {}", e);
+                    // Network error on the retry: surface 502 rather than the
+                    // original shell (we'd rather show a hard failure than a
+                    // misleading empty completion).
+                    return Ok(AttemptResponse::Done(empty_shell_bad_gateway(
+                        request_body,
+                        &shell_body,
+                        client_req_id,
+                        Some((
+                            self.empty_shell_retry_max_tokens,
+                            retry_attempt_already_done + 1,
+                            "retry_network_error",
+                        )),
+                    )));
+                }
+            }
+        }
+
+        // No retry budget / retry disabled: surface 502 with the real cause.
+        warn!(
+            client_req_id = %client_req_id,
+            "Empty-shell soft failure; surfacing 502 (retry disabled or budget exhausted)",
+        );
+        Ok(AttemptResponse::Done(empty_shell_bad_gateway(
+            request_body,
+            &shell_body,
+            client_req_id,
+            None,
+        )))
     }
 
     /// Build and return the synthesized response: take a parsed body with an
@@ -1785,6 +2440,7 @@ async fn handle_passthrough_stream(
             "Synthesizing placeholder choice for empty-choices 2xx body \
              (prevents downstream \"Empty choices array\" 422)",
         );
+
         let mut obj = match body {
             serde_json::Value::Object(m) => m.clone(),
             // The caller only reaches here after `body.choices` resolved to an
@@ -1950,6 +2606,8 @@ mod proxy_integration_tests {
             auth: AuthConfig::default(),
             inject_stream_usage: true,
             synthesize_empty_choices: true,
+            retry_on_empty_shell: true,
+            empty_shell_retry_max_tokens: 8192,
         }
     }
 
@@ -1966,6 +2624,8 @@ mod proxy_integration_tests {
             config.model_aliases.clone(),
             config.inject_stream_usage,
             config.synthesize_empty_choices,
+            config.retry_on_empty_shell,
+            config.empty_shell_retry_max_tokens,
         );
 
         let proxy_route = warp::path::full()
@@ -2631,6 +3291,194 @@ mod proxy_integration_tests {
         assert_eq!(body["usage"]["total_tokens"].as_u64(), Some(7));
     }
 
+    /// NVIDIA's empty-shell soft failure: 200 with `choices:[]` AND `usage:null`
+    /// AND empty `id` (no inference ran). The proxy MUST surface a 502, not a
+    /// synthesized empty-content placeholder, so Claude Code's `/compact`
+    /// reports an actionable upstream error instead of "summarization produced
+    /// empty response". Here the retry also shells, so the client gets 502 and
+    /// exactly two upstream calls were made (initial + one clamped retry).
+    #[tokio::test]
+    async fn empty_shell_soft_failure_surfaces_502_after_one_retry() {
+        let shell = serde_json::json!({
+            "choices": [], "id": "", "model": "", "created": 0,
+            "object": "chat.completion", "service_tier": null,
+            "system_fingerprint": null, "usage": null,
+        });
+        let mock_server = MockServer::start().await;
+        // First (initial, max_tokens=64000) -> shell.
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/v1/chat/completions"))
+            .and(matchers::body_string_contains("\"max_tokens\":64000"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(shell.clone()))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        // Retry (clamped to 8192) -> also shell.
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/v1/chat/completions"))
+            .and(matchers::body_string_contains("\"max_tokens\":8192"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(shell))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let addr = start_proxy(test_config(&mock_server.uri(), 3, 60)).await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://{}/v1/chat/completions", addr))
+            .header("content-type", "application/json")
+            .body(r#"{"model":"z-ai/glm-5.2","max_tokens":64000,"messages":[],"stream":false}"#)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            502,
+            "empty-shell soft failure must surface as 502, not a synthesized empty body"
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            body["error"]["type"].as_str(),
+            Some("upstream_empty_shell"),
+            "error body should classify the failure as upstream_empty_shell, got: {body}"
+        );
+        // clamp happened: the retry request body carried max_tokens=8192.
+        assert!(
+            body["error"]["detail"].as_str().unwrap_or_default().contains("max_tokens=8192"),
+            "detail should record the clamped retry budget, got: {body}"
+        );
+        // Structured retry fields (new diagnostic surface).
+        assert_eq!(body["error"]["retry"]["attempted"].as_bool(), Some(true));
+        assert_eq!(
+            body["error"]["retry"]["clamped_max_tokens"].as_u64(),
+            Some(8192),
+            "retry.clamped_max_tokens should be 8192, got: {body}"
+        );
+        assert_eq!(
+            body["error"]["retry"]["outcome"].as_str(),
+            Some("retry_also_empty_shell"),
+            "retry.outcome should report the shell, got: {body}"
+        );
+        // Request fingerprint and upstream shell structured in the error.
+        let req_fp = body["error"]["request_fingerprint"]
+            .as_str()
+            .unwrap_or("");
+        assert!(
+            req_fp.contains("max_tokens=64000") && req_fp.contains("messages=0"),
+            "request_fingerprint should capture the request's max_tokens + message count, got: {req_fp}"
+        );
+        assert_eq!(
+            body["error"]["upstream_shell"]["status"].as_u64(),
+            Some(200),
+            "upstream_shell.status should be 200, got: {body}"
+        );
+        assert_eq!(
+            body["error"]["upstream_shell"]["body"]["choices"]
+                .as_array()
+                .map(|a| a.len()),
+            Some(0),
+            "upstream_shell.body should carry the shell's empty choices, got: {body}"
+        );
+    }
+
+    /// Empty-shell soft failure where the one clamped retry *succeeds*: the
+    /// proxy must return 200 with the retry's normal choices, not 502. Only one
+    /// retry is attempted (no loop even if retry succeeds).
+    #[tokio::test]
+    async fn empty_shell_soft_failure_retries_and_recovers() {
+        let shell = serde_json::json!({
+            "choices": [], "id": "", "model": "", "created": 0,
+            "object": "chat.completion", "service_tier": null,
+            "system_fingerprint": null, "usage": null,
+        });
+        let good = serde_json::json!({
+            "id": "cc-ok", "object": "chat.completion", "model": "z-ai/glm-5.2",
+            "choices": [{"index":0,"message":{"role":"assistant","content":"summary"},"finish_reason":"stop"}],
+            "usage": {"prompt_tokens": 9, "completion_tokens": 1, "total_tokens": 10},
+        });
+        let mock_server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/v1/chat/completions"))
+            .and(matchers::body_string_contains("\"max_tokens\":64000"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(shell))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/v1/chat/completions"))
+            .and(matchers::body_string_contains("\"max_tokens\":8192"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(good.clone()))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let addr = start_proxy(test_config(&mock_server.uri(), 3, 60)).await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://{}/v1/chat/completions", addr))
+            .header("content-type", "application/json")
+            .body(r#"{"model":"z-ai/glm-5.2","max_tokens":64000,"messages":[],"stream":false}"#)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 200, "the clamped retry should succeed as 200");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            body["choices"][0]["message"]["content"].as_str(),
+            Some("summary"),
+            "retry's real completion should be forwarded, got: {body}"
+        );
+    }
+
+    /// With `retry_on_empty_shell = false`, the shell surfaces as 502 with no
+    /// upstream retry (exactly one upstream call).
+    #[tokio::test]
+    async fn empty_shell_surfaces_502_when_retry_disabled() {
+        let shell = serde_json::json!({
+            "choices": [], "id": "", "model": "", "created": 0,
+            "object": "chat.completion", "service_tier": null,
+            "system_fingerprint": null, "usage": null,
+        });
+        let mock_server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(shell))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let mut cfg = test_config(&mock_server.uri(), 3, 60);
+        cfg.retry_on_empty_shell = false;
+        let addr = start_proxy(cfg).await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://{}/v1/chat/completions", addr))
+            .header("content-type", "application/json")
+            .body(r#"{"model":"z-ai/glm-5.2","max_tokens":64000,"messages":[],"stream":false}"#)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 502);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(
+            body["error"]["detail"].as_str().unwrap_or_default().contains("not retried"),
+            "detail should say the shell was not retried, got: {body}"
+        );
+        assert_eq!(
+            body["error"]["retry"]["attempted"].as_bool(),
+            Some(false),
+            "retry.attempted should be false, got: {body}"
+        );
+        assert_eq!(
+            body["error"]["retry"]["outcome"].as_str(),
+            Some("not_attempted"),
+            "retry.outcome should be not_attempted, got: {body}"
+        );
+    }
+
     /// A normal non-empty-choices `stream:false` response must pass through the
     /// bounded-peek path unchanged — the synthesis is strictly additive and
     /// only touches the empty-choices case.
@@ -2850,5 +3698,96 @@ mod usage_accounting_tests {
             !empty_choices_would_warn(body, Some(200)),
             "an error body with no choices key is not the empty-choices case",
         );
+    }
+
+    /// The empty-shell classifier must fire only for the NVIDIA shell shape:
+    /// empty `choices` + null/absent `usage` + empty-ish `id`. A *legitimate*
+    /// zero-token compaction body (empty choices but real `usage`) must NOT
+    /// classify as a shell — that path still synthesizes a placeholder.
+    #[test]
+    fn is_empty_shell_failure_classifies_only_null_usage_shell() {
+        let shell = serde_json::json!({
+            "choices": [], "id": "", "model": "", "created": 0,
+            "object": "chat.completion", "service_tier": null,
+            "system_fingerprint": null, "usage": null,
+        });
+        assert!(is_empty_shell_failure(&shell), "real NVIDIA shell should classify");
+
+        let legit = serde_json::json!({
+            "choices": [], "id": "cc-1", "model": "z-ai/glm-5.2",
+            "usage": {"prompt_tokens": 7, "completion_tokens": 0, "total_tokens": 7},
+        });
+        assert!(
+            !is_empty_shell_failure(&legit),
+            "legit zero-token completion (has usage) must NOT classify as a shell",
+        );
+
+        let real_completion = serde_json::json!({
+            "choices": [{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],
+            "id": "cc-2", "model": "z-ai/glm-5.2",
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        });
+        assert!(
+            !is_empty_shell_failure(&real_completion),
+            "a normal completion is never a shell",
+        );
+
+        // Non-null usage but empty id+empty choices is impossible per contract;
+        // still shouldn't classify (usage is the deciding signal).
+        let weird = serde_json::json!({
+            "choices": [], "id": "", "usage": {"prompt_tokens": 3},
+        });
+        assert!(!is_empty_shell_failure(&weird), "non-null usage wins over empty id");
+    }
+
+    /// The request fingerprint must surface the fields that influence NVIDIA's
+    /// soft-rejection of GLM-class models: `max_tokens`, `stream`, message count,
+    /// a rough prompt-token estimate, `temperature`/`top_p`/`reasoning_effort`,
+    /// and `tools` — plus first/last message role previews. Never log the full
+    /// transcript; previews cap at 120 chars.
+    #[test]
+    fn request_body_fingerprint_captures_key_fields() {
+        let body = bytes::Bytes::from(
+            r#"{"model":"z-ai/glm-5.2","max_tokens":64000,"stream":false,"temperature":0.3,"top_p":0.9,"reasoning_effort":"high","tools":[{"type":"function"}],"tool_choice":"auto","messages":[{"role":"system","content":"You are Claude Code."},{"role":"user","content":"summarize this long transcript"}]}"#,
+        );
+        let fp = request_body_fingerprint(&body);
+        assert!(fp.contains("max_tokens=64000"), "missing max_tokens in: {fp}");
+        assert!(fp.contains("stream=false"), "missing stream in: {fp}");
+        assert!(fp.contains("messages=2"), "missing message count in: {fp}");
+        assert!(fp.contains("temperature=0.3"), "missing temperature in: {fp}");
+        assert!(fp.contains("top_p=0.9"), "missing top_p in: {fp}");
+        assert!(fp.contains("reasoning_effort=\"high\""), "missing reasoning_effort in: {fp}");
+        assert!(fp.contains("tools=1"), "missing tools count in: {fp}");
+        assert!(fp.contains("tool_choice=\"auto\""), "missing tool_choice in: {fp}");
+        // Rough estimate: 2 short messages ≈ a small handful of tokens, never a
+        // huge number — sanity bound it's present and non-zero-ish.
+        assert!(fp.contains("est_prompt_tokens="), "missing token estimate in: {fp}");
+    }
+
+    /// Absent fields surface as `<absent>`/`0` rather than panicking or silently
+    /// mutating the request shape — keeps the fingerprint readable for minimal
+    /// requests like the integration tests send.
+    #[test]
+    fn request_body_fingerprint_handles_minimal_body() {
+        let body = bytes::Bytes::from(r#"{"model":"m","messages":[]}"#);
+        let fp = request_body_fingerprint(&body);
+        assert!(fp.contains("messages=0"), "no messages should show 0: {fp}");
+        assert!(fp.contains("max_tokens=<absent>"), "absent max_tokens should be visible: {fp}");
+        assert!(fp.contains("stream=<absent>"), "absent stream should be visible: {fp}");
+    }
+
+    #[test]
+    fn shell_body_fingerprint_summarizes_shell_fields() {
+        let shell = serde_json::json!({
+            "choices": [], "id": "", "model": "", "created": 0,
+            "object": "chat.completion", "service_tier": null,
+            "system_fingerprint": null, "usage": null,
+        });
+        let fp = shell_body_fingerprint(&shell);
+        assert!(fp.contains("id=\"\""), "id should be empty-string, got: {fp}");
+        assert!(fp.contains("model=\"\""), "model should be empty-string, got: {fp}");
+        assert!(fp.contains("choiceslen=0"), "choiceslen should be 0, got: {fp}");
+        assert!(fp.contains("usage=null"), "usage should be null, got: {fp}");
+        assert!(fp.contains("created=0"), "created should be 0, got: {fp}");
     }
 }

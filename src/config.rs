@@ -66,6 +66,27 @@ pub struct Config {
     /// `NVIDIA_SYNTHESIZE_EMPTY_CHOICES=false`.
     #[serde(default = "default_synthesize_empty_choices")]
     pub synthesize_empty_choices: bool,
+    /// Retry a query once with a reduced `max_tokens` when NVIDIA returns a
+    /// "shell" 2xx — a body shaped `{"choices":[], "id":"", "usage":null, ...}`
+    /// where every field is null/empty. This is NVIDIA's silent soft-failure for
+    /// GLM-class models on build.integrate (no real inference ran — hence
+    /// `usage:null`, vs. the legitimate compaction empty-choices body which
+    /// DOES carry `usage`). A 198-message `/compact` with `max_tokens=64000`
+    /// commonly trips this: NVIDIA drops the whole request into an empty shell
+    /// rather than truncating `max_tokens`. The retry re-sends the same body
+    /// with `max_tokens` clamped to `empty_shell_retry_max_tokens` (8192 by
+    /// default), which usually lets the inference actually run. Defaults to
+    /// true; disable via `retry_on_empty_shell = false` or
+    /// `NVIDIA_RETRY_ON_EMPTY_SHELL=false`.
+    #[serde(default = "default_retry_on_empty_shell")]
+    pub retry_on_empty_shell: bool,
+    /// `max_tokens` value used when retried after an empty-shell soft failure.
+    /// Only affects the single retry attempt; the original request is forwarded
+    /// unchanged first. 8192 is conservative across GLM-family models on
+    /// build.integrate. Override via the `empty_shell_retry_max_tokens` config
+    /// key or `NVIDIA_EMPTY_SHELL_RETRY_MAX_TOKENS` env var.
+    #[serde(default = "default_empty_shell_retry_max_tokens")]
+    pub empty_shell_retry_max_tokens: u64,
 }
 
 fn default_request_timeout_seconds() -> u64 {
@@ -78,6 +99,14 @@ fn default_inject_stream_usage() -> bool {
 
 fn default_synthesize_empty_choices() -> bool {
     true
+}
+
+fn default_retry_on_empty_shell() -> bool {
+    true
+}
+
+fn default_empty_shell_retry_max_tokens() -> u64 {
+    8192
 }
 
 /// Front-door auth config. See `Config::auth` for the rationale.
@@ -128,6 +157,11 @@ impl fmt::Debug for Config {
             .field("allow_local_base_url", &self.allow_local_base_url)
             .field("inject_stream_usage", &self.inject_stream_usage)
             .field("synthesize_empty_choices", &self.synthesize_empty_choices)
+            .field("retry_on_empty_shell", &self.retry_on_empty_shell)
+            .field(
+                "empty_shell_retry_max_tokens",
+                &self.empty_shell_retry_max_tokens,
+            )
             .field(
                 "auth",
                 &format!(
@@ -285,6 +319,8 @@ impl Config {
             auth: AuthConfig::default(),
             inject_stream_usage: default_inject_stream_usage(),
             synthesize_empty_choices: default_synthesize_empty_choices(),
+            retry_on_empty_shell: default_retry_on_empty_shell(),
+            empty_shell_retry_max_tokens: default_empty_shell_retry_max_tokens(),
         };
 
         // Prefer NVIDIA_CONFIG_PATH, fall back to ./config.toml
@@ -534,6 +570,16 @@ impl Config {
                         config.synthesize_empty_choices = v;
                     }
                 }
+                "retry_on_empty_shell" => {
+                    if let Ok(v) = value.parse::<bool>() {
+                        config.retry_on_empty_shell = v;
+                    }
+                }
+                "empty_shell_retry_max_tokens" => {
+                    if let Ok(v) = value.parse::<u64>() {
+                        config.empty_shell_retry_max_tokens = v;
+                    }
+                }
                 _ => {}
             }
         }
@@ -575,6 +621,8 @@ mod config_validation_tests {
             auth: AuthConfig::default(),
             inject_stream_usage: true,
             synthesize_empty_choices: true,
+            retry_on_empty_shell: true,
+            empty_shell_retry_max_tokens: 8192,
         }
     }
 
