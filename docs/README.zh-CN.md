@@ -43,14 +43,14 @@
    timeout_seconds  = 5             # 探测超时
    max_consecutive_failures = 3     # 连续失败多少次后冷却
 
+   # 请求超时（秒）。设为 0 关闭（流式建议关闭）。
+   # 流式请求始终绕过此超时。
+   request_timeout_seconds = 300
+
    [observability]
    enable_metrics = true
    metrics_path   = "/metrics"
    log_level      = "info"
-
-   # 请求超时（秒）。设为 0 关闭（流式建议关闭）。
-   # 流式请求始终绕过此超时。
-   request_timeout_seconds = 60
    ```
 
 3. **运行**

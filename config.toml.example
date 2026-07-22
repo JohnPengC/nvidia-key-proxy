@@ -5,6 +5,20 @@ base_url    = "https://integrate.api.nvidia.com"
 # NVIDIA-compatible mock during testing). Off by default.
 allow_local_base_url = false
 
+# Request timeout in seconds. Set to 0 to disable (recommended for streaming).
+# Streaming requests bypass this timeout regardless.
+request_timeout_seconds = 60
+
+# Inject `stream_options.include_usage: true` into streaming chat requests so
+# NVIDIA returns token usage at stream end (default true). Disable to leave
+# streaming requests untouched. Env override: NVIDIA_INJECT_STREAM_USAGE.
+inject_stream_usage = true
+
+# Synthesize a placeholder `choices` entry when upstream returns a 2xx
+# non-SSE body whose `choices` array is empty (`choices: []`). Defaults to
+# true; disable via NVIDIA_SYNTHESIZE_EMPTY_CHOICES=false.
+synthesize_empty_choices = true
+
 # API keys – can also be set via NVIDIA_KEYS env var (comma-separated)
 keys = [
     "nvapi-xxxxxxxxxxxxxxxx1",
@@ -15,6 +29,9 @@ keys = [
 [rate_limiter]
 qps_per_key = 0.65
 burst       = 8
+# Maximum milliseconds to wait for a token before switching to another key.
+# 0 disables switching. Default: 200.
+token_wait_ms = 200
 
 [cooldown]
 base_seconds = 60
@@ -29,16 +46,6 @@ max_consecutive_failures = 3
 enable_metrics = true
 metrics_path   = "/metrics"
 log_level      = "info"
-
-# Request timeout in seconds. Set to 0 to disable (recommended for streaming).
-# Streaming requests bypass this timeout regardless.
-request_timeout_seconds = 60
-
-# Inject `stream_options.include_usage: true` into streaming chat requests so
-# NVIDIA returns token usage at stream end (default true). Disable to leave
-# streaming requests untouched. Env override: NVIDIA_INJECT_STREAM_USAGE.
-inject_stream_usage = true
-
 
 [retry]
 # Upstream (NVIDIA) auth retry policy.
@@ -56,15 +63,7 @@ auth_fail_threshold   = 3      # consecutive auth-failures to disable a key
 # 401 retry budget). Defaults to `max_retries`.
 max_key_switches       = 3
 
-# Client-facing model name → NVIDIA-ready model id mappings.
-# When a chat-completion request carries `model` matching a key here, the
-# proxy rewrites the field to the mapped value before forwarding upstream.
-# Unmatched names are forwarded unchanged. Empty by default.
-#
-# Use this when your client (cc-switch, Cursor, OpenAI SDK, …) sends
-# OpenAI-style model names that don't exist on NVIDIA NIM, e.g.:
-#
-#   # Front-door authentication for the proxy itself. The NVIDIA quota behind
+# Front-door authentication for the proxy itself. The NVIDIA quota behind
 # the pool is exposed to anyone who can reach `listen_addr`; enabling this
 # requires clients to present `Authorization: Bearer <bearer_token>` on
 # `/v1/*` requests. Disabled by default to preserve the "any api_key works"
@@ -79,36 +78,3 @@ admin_token   = ""      # protects /admin/* ; also NVIDIA_AUTH_ADMIN_TOKEN
 #   "z-ai/glm-5.2"        = "z-ai/glm-5.2"
 #   "gpt-4o"              = "meta/llama-3.1-405b-instruct"
 #   "gpt-4o-mini"         = "meta/llama-3.1-70b-instruct"
-
-# Front-door authentication for the proxy itself. The NVIDIA quota behind
-# the pool is exposed to anyone who can reach `listen_addr`; enabling this
-# requires clients to present `Authorization: Bearer <bearer_token>` on
-# `/v1/*` requests. Disabled by default to preserve the "any api_key works"
-# behaviour existing clients rely on. `/health` is always exempt.
-[auth]
-enabled       = false
-bearer_token  = ""      # client bearer token; also NVIDIA_AUTH_BEARER_TOKEN
-admin_token   = ""      # protects /admin/* ; also NVIDIA_AUTH_ADMIN_TOKEN
-                        # when empty the admin API is completely disabled (404)
-
-[model_aliases]
-
-[codex]
-enabled                  = true
-default_model            = "z-ai/glm-5.2"
-model_reasoning_effort   = "high"
-disable_response_storage = true
-bearer_token             = "proxy-managed"
-# models = [
-#   "z-ai/glm-5.2:GLM 5.2:1000000",
-#   "moonshotai/kimi-k2.6:Kimi K2.6:256000",
-# ]
-
-[cursor]
-# Cursor integration – writes `~/.cursor/config.json` (or Windows equivalent).
-mode = "local"
-proxy_port = 8888
-api_key = "cursor-dummy-key"
-settings_path = "~/.cursor/config.json"
-
-

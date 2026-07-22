@@ -117,14 +117,14 @@ interval_seconds = 30
 timeout_seconds  = 5
 max_consecutive_failures = 3
 
+# Request timeout in seconds. Set to 0 to disable (recommended for streaming).
+# Streaming requests bypass this timeout regardless.
+request_timeout_seconds = 300
+
 [observability]
 enable_metrics = true
 metrics_path   = "/metrics"
 log_level      = "info"
-
-# Request timeout in seconds. Set to 0 to disable (recommended for streaming).
-# Streaming requests bypass this timeout regardless.
-request_timeout_seconds = 60
 ```
 
 ### Building & Running

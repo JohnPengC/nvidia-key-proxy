@@ -11,6 +11,7 @@ pub mod proxy;
 
 use std::sync::Arc;
 
+use chrono::Local;
 use tracing::error;
 use tracing_subscriber::EnvFilter;
 use warp::http::StatusCode;
@@ -21,6 +22,17 @@ use crate::health::HealthChecker;
 use crate::key_pool::KeyPool;
 use crate::metrics::Metrics;
 use crate::proxy::Proxy;
+
+struct LocalTimer;
+impl tracing_subscriber::fmt::time::FormatTime for LocalTimer {
+    fn format_time(
+        &self,
+        w: &mut tracing_subscriber::fmt::format::Writer<'_>,
+    ) -> std::fmt::Result {
+        let now = Local::now();
+        write!(w, "{}", now.format("%Y-%m-%d %H:%M:%S%.3f %:z"))
+    }
+}
 
 /// Bundles all runtime‑shared state. `Clone` so route builders can each hold
 /// their own handle to the shared `Arc` fields without fighting borrow rules.
@@ -39,6 +51,17 @@ impl AppState {
         // Tracing must be initialized before we emit any logs.
         init_tracing(&config);
         tracing::info!("Loaded configuration: {:?}", config);
+        eprintln!(
+            "[config-load] request_timeout_seconds={}",
+            config.request_timeout_seconds
+        );
+        let config_path = std::env::var("NVIDIA_CONFIG_PATH").unwrap_or_else(|_| "config.toml".to_string());
+        eprintln!("[config-load] config_path={}", config_path);
+        if let Ok(content) = std::fs::read_to_string(&config_path) {
+            eprintln!("[config-load] config_file_len={}", content.len());
+        } else {
+            eprintln!("[config-load] config_file_read=FAILED");
+        }
 
         let metrics = Arc::new(Metrics::new());
         let key_pool = Arc::new(KeyPool::new(&config, metrics.clone()));
@@ -88,7 +111,7 @@ pub fn init_tracing(config: &Config) {
     // `try_init` returns Err when a global default subscriber already exists;
     // in that case there is nothing to do.
     let _ = tracing_subscriber::fmt()
-        .with_timer(tracing_subscriber::fmt::time::SystemTime)
+        .with_timer(LocalTimer)
         .with_env_filter(filter)
         .try_init();
 }
