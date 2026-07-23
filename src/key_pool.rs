@@ -49,6 +49,10 @@ pub struct InnerKeyState {
     pub fail_count: u32,
     pub last_success: Option<Instant>,
     pub bucket: TokenBucket,
+    /// Consecutive empty-shell or 504 responses for circuit breaker.
+    /// If circuit_breaker_per_model is true, tracks per-model counts.
+    /// Otherwise uses "global" key.
+    pub circuit_breaker_failures: std::collections::HashMap<String, u32>,
 }
 
 /// Public handle to a key's state (cloneable, cheap).
@@ -120,6 +124,35 @@ impl KeyStateHandle {
     pub async fn set_last_success(&self) {
         let mut guard = self.inner.write().await;
         guard.last_success = Some(Instant::now());
+        // Reset circuit breaker on success
+        guard.circuit_breaker_failures.clear();
+    }
+
+    /// Increment circuit breaker failure count for a specific model.
+    /// Returns true if threshold is exceeded.
+    pub async fn increment_circuit_breaker(&self, model: &str, threshold: u32) -> bool {
+        let mut guard = self.inner.write().await;
+        let count = guard.circuit_breaker_failures.entry(model.to_string()).or_insert(0);
+        *count += 1;
+        *count >= threshold
+    }
+
+    /// Check if circuit breaker threshold is exceeded for a model.
+    pub async fn check_circuit_breaker(&self, model: &str, threshold: u32) -> bool {
+        let guard = self.inner.read().await;
+        guard.circuit_breaker_failures.get(model).map_or(false, |c| *c >= threshold)
+    }
+
+    /// Reset circuit breaker failure count for a model.
+    pub async fn reset_circuit_breaker(&self, model: &str) {
+        let mut guard = self.inner.write().await;
+        guard.circuit_breaker_failures.remove(model);
+    }
+
+    /// Reset all circuit breaker failure counts.
+    pub async fn reset_all_circuit_breakers(&self) {
+        let mut guard = self.inner.write().await;
+        guard.circuit_breaker_failures.clear();
     }
 
     // ── in-flight tracking ──────────────────────────────────────────
@@ -352,6 +385,7 @@ fn make_handle(config: &Config, key_str: &str) -> KeyStateHandle {
             fail_count: 0,
             last_success: None,
             bucket,
+            circuit_breaker_failures: std::collections::HashMap::new(),
         })),
         in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
     }
@@ -597,7 +631,7 @@ impl KeyPool {
             handle.set_state(KeyState::Active).await;
             handle.reset_weight().await;
             handle.reset_fail().await;
-            handle.set_last_success().await;
+            handle.reset_all_circuit_breakers().await; // Also reset circuit breaker on success
             info!(key = %mask_key(key_str), "Marked key as good (active)");
             let _ = self.pub_notifier.send(handle);
         }
@@ -632,6 +666,31 @@ impl KeyPool {
             let _ = self.pub_notifier.send(handle);
         }
         self.refresh_metrics().await;
+    }
+
+    /// Increment circuit breaker failure count for a key and model (for empty-shell/504 responses).
+    /// Returns true if the threshold is exceeded.
+    pub async fn increment_circuit_breaker(&self, key_str: &str, model: &str, threshold: u32) -> bool {
+        let read_guard = self.inner.read().await;
+        if let Some(handle) = read_guard.get(key_str) {
+            let handle = handle.clone();
+            drop(read_guard);
+            handle.increment_circuit_breaker(model, threshold).await
+        } else {
+            false
+        }
+    }
+
+    /// Check if a key has exceeded the circuit breaker threshold for a model.
+    pub async fn check_circuit_breaker(&self, key_str: &str, model: &str, threshold: u32) -> bool {
+        let read_guard = self.inner.read().await;
+        if let Some(handle) = read_guard.get(key_str) {
+            let handle = handle.clone();
+            drop(read_guard);
+            handle.check_circuit_breaker(model, threshold).await
+        } else {
+            false
+        }
     }
 
     /// Inject a key into the pool at runtime. Returns `true` if the key was
@@ -709,6 +768,7 @@ impl KeyPool {
                 "in_flight": handle.in_flight.load(std::sync::atomic::Ordering::Relaxed),
                 "available_tokens": guard.bucket.available_tokens().await,
                 "last_success_secs_ago": last_success_secs,
+                "circuit_breaker_failures": guard.circuit_breaker_failures,
             }));
         }
         out
@@ -779,6 +839,7 @@ mod retry_state_machine_tests {
     use super::*;
     use crate::config::{
         AuthConfig, CooldownConfig, HealthCheckConfig, ObservabilityConfig, RateLimiterConfig,
+        default_empty_shell_pre_clamp_max_tokens,
     };
 
     fn build_pool(keys: &[&str]) -> KeyPool {
@@ -806,14 +867,28 @@ mod retry_state_machine_tests {
                 log_level: "info".to_string(),
             },
             request_timeout_seconds: 0,
+            request_timeout_streaming_seconds: 0,
             retry: crate::config::RetryConfig::default(),
             model_aliases: std::collections::HashMap::new(),
             allow_local_base_url: false,
             auth: AuthConfig::default(),
             inject_stream_usage: true,
-        synthesize_empty_choices: true,
-        retry_on_empty_shell: true,
-        empty_shell_retry_max_tokens: 8192,
+            synthesize_empty_choices: true,
+            retry_on_empty_shell: true,
+            empty_shell_retry_max_tokens: 8192,
+            empty_shell_retry_attempts: 2,
+            empty_shell_probe_before_retry: true,
+            empty_shell_retry_backoff_base_ms: 500,
+            empty_shell_retry_backoff_max_ms: 5000,
+            empty_shell_pre_clamp_max_tokens: default_empty_shell_pre_clamp_max_tokens(),
+            circuit_breaker_threshold: 3,
+            circuit_breaker_per_model: true,
+            max_tokens_max: 100_000,
+            concurrency_limit_per_model: std::collections::HashMap::new(),
+            concurrency_queue_timeout_ms: 5000,
+            upstream_connect_timeout_secs: 5,
+            upstream_pool_idle_timeout_secs: 90,
+            retry_jitter_ms: 100,
         };
         let metrics = Arc::new(Metrics::new());
         KeyPool::new(&cfg, metrics)
@@ -929,6 +1004,7 @@ mod score_selection_tests {
     use super::*;
     use crate::config::{
         AuthConfig, CooldownConfig, HealthCheckConfig, ObservabilityConfig, RateLimiterConfig,
+        default_empty_shell_pre_clamp_max_tokens,
     };
 
     fn build_pool_with_keys(keys: &[&str], qps: f64, burst: u64) -> KeyPool {
@@ -956,14 +1032,28 @@ mod score_selection_tests {
                 log_level: "info".to_string(),
             },
             request_timeout_seconds: 0,
+            request_timeout_streaming_seconds: 0,
             retry: crate::config::RetryConfig::default(),
             model_aliases: std::collections::HashMap::new(),
             allow_local_base_url: false,
             auth: AuthConfig::default(),
             inject_stream_usage: true,
-        synthesize_empty_choices: true,
-        retry_on_empty_shell: true,
-        empty_shell_retry_max_tokens: 8192,
+            synthesize_empty_choices: true,
+            retry_on_empty_shell: true,
+            empty_shell_retry_max_tokens: 8192,
+            empty_shell_retry_attempts: 2,
+            empty_shell_probe_before_retry: true,
+            empty_shell_retry_backoff_base_ms: 500,
+            empty_shell_retry_backoff_max_ms: 5000,
+            empty_shell_pre_clamp_max_tokens: default_empty_shell_pre_clamp_max_tokens(),
+            circuit_breaker_threshold: 3,
+            circuit_breaker_per_model: true,
+            max_tokens_max: 100_000,
+            concurrency_limit_per_model: std::collections::HashMap::new(),
+            concurrency_queue_timeout_ms: 5000,
+            upstream_connect_timeout_secs: 5,
+            upstream_pool_idle_timeout_secs: 90,
+            retry_jitter_ms: 100,
         };
         let metrics = Arc::new(Metrics::new());
         KeyPool::new(&cfg, metrics)
@@ -1078,6 +1168,7 @@ mod runtime_key_tests {
     use super::*;
     use crate::config::{
         AuthConfig, CooldownConfig, HealthCheckConfig, ObservabilityConfig, RateLimiterConfig,
+        default_empty_shell_pre_clamp_max_tokens,
     };
 
     fn pool(keys: &[&str]) -> KeyPool {
@@ -1105,14 +1196,28 @@ mod runtime_key_tests {
                 log_level: "info".to_string(),
             },
             request_timeout_seconds: 0,
+            request_timeout_streaming_seconds: 0,
             retry: crate::config::RetryConfig::default(),
             model_aliases: std::collections::HashMap::new(),
             allow_local_base_url: false,
             auth: AuthConfig::default(),
             inject_stream_usage: true,
-        synthesize_empty_choices: true,
-        retry_on_empty_shell: true,
-        empty_shell_retry_max_tokens: 8192,
+            synthesize_empty_choices: true,
+            retry_on_empty_shell: true,
+            empty_shell_retry_max_tokens: 8192,
+            empty_shell_retry_attempts: 2,
+            empty_shell_probe_before_retry: true,
+            empty_shell_retry_backoff_base_ms: 500,
+            empty_shell_retry_backoff_max_ms: 5000,
+            empty_shell_pre_clamp_max_tokens: default_empty_shell_pre_clamp_max_tokens(),
+            circuit_breaker_threshold: 3,
+            circuit_breaker_per_model: true,
+            max_tokens_max: 100_000,
+            concurrency_limit_per_model: std::collections::HashMap::new(),
+            concurrency_queue_timeout_ms: 5000,
+            upstream_connect_timeout_secs: 5,
+            upstream_pool_idle_timeout_secs: 90,
+            retry_jitter_ms: 100,
         };
         KeyPool::new(&cfg, Arc::new(Metrics::new()))
     }

@@ -1,6 +1,6 @@
 use std::sync::OnceLock;
 
-use prometheus::{register_counter, register_gauge, register_histogram, Counter, Gauge, Histogram};
+use prometheus::{register_counter, register_counter_vec, register_gauge, register_gauge_vec, register_histogram, Counter, CounterVec, Gauge, GaugeVec, Histogram};
 
 fn request_count() -> &'static Counter {
     static REQUEST_COUNT: OnceLock<Counter> = OnceLock::new();
@@ -144,6 +144,82 @@ pub fn key_403_auth_cooldown() -> &'static Counter {
     })
 }
 
+pub fn circuit_breaker_triggered() -> &'static Counter {
+    static CBT: OnceLock<Counter> = OnceLock::new();
+    CBT.get_or_init(|| {
+        register_counter!(
+            "proxy_circuit_breaker_triggered_total",
+            "Number of times circuit breaker triggered due to consecutive empty-shell/504 responses"
+        )
+        .unwrap()
+    })
+}
+
+/// Total empty-shell soft failures detected, by model and outcome.
+pub fn empty_shell_total() -> &'static CounterVec {
+    static EST: OnceLock<CounterVec> = OnceLock::new();
+    EST.get_or_init(|| {
+        register_counter_vec!(
+            "proxy_empty_shell_total",
+            "Total empty-shell soft failures detected, by model and outcome",
+            &["model", "outcome"]
+        )
+        .unwrap()
+    })
+}
+
+/// Total empty-shell retry attempts, by model.
+pub fn empty_shell_retry_attempts_total() -> &'static CounterVec {
+    static ESR: OnceLock<CounterVec> = OnceLock::new();
+    ESR.get_or_init(|| {
+        register_counter_vec!(
+            "proxy_empty_shell_retry_attempts_total",
+            "Total empty-shell retry attempts made, by model",
+            &["model"]
+        )
+        .unwrap()
+    })
+}
+
+/// Current concurrency for a model (active requests).
+pub fn concurrency_current() -> &'static GaugeVec {
+    static CC: OnceLock<GaugeVec> = OnceLock::new();
+    CC.get_or_init(|| {
+        register_gauge_vec!(
+            "proxy_concurrency_current",
+            "Current number of concurrent upstream requests per model",
+            &["model"]
+        )
+        .unwrap()
+    })
+}
+
+/// Total concurrency acquire attempts, by model and result.
+pub fn concurrency_acquire_total() -> &'static CounterVec {
+    static CA: OnceLock<CounterVec> = OnceLock::new();
+    CA.get_or_init(|| {
+        register_counter_vec!(
+            "proxy_concurrency_acquire_total",
+            "Total concurrency semaphore acquire attempts, by model and result",
+            &["model", "result"]
+        )
+        .unwrap()
+    })
+}
+
+/// Total network errors, by model and error type.
+pub fn network_errors_total() -> &'static CounterVec {
+    static NET: OnceLock<CounterVec> = OnceLock::new();
+    NET.get_or_init(|| {
+        register_counter_vec!(
+            "proxy_network_errors_total",
+            "Total network errors, by model and error type",
+            &["model", "error_type"]
+        )
+        .unwrap()
+    })
+}
+
 #[derive(Clone)]
 pub struct Metrics {
     _private: (),
@@ -186,6 +262,30 @@ impl Metrics {
 
     pub fn inc_key_403_auth_cooldown(&self) {
         key_403_auth_cooldown().inc();
+    }
+
+    pub fn inc_circuit_breaker_triggered(&self) {
+        circuit_breaker_triggered().inc();
+    }
+
+    pub fn inc_empty_shell_total(&self, model: &str, outcome: &str) {
+        empty_shell_total().with_label_values(&[model, outcome]).inc();
+    }
+
+    pub fn inc_empty_shell_retry_attempts_total(&self, model: &str) {
+        empty_shell_retry_attempts_total().with_label_values(&[model]).inc();
+    }
+
+    pub fn set_concurrency_current(&self, model: &str, current: i64) {
+        concurrency_current().with_label_values(&[model]).set(current as f64);
+    }
+
+    pub fn inc_concurrency_acquire_total(&self, model: &str, result: &str) {
+        concurrency_acquire_total().with_label_values(&[model, result]).inc();
+    }
+
+    pub fn inc_network_errors_total(&self, model: &str, error_type: &str) {
+        network_errors_total().with_label_values(&[model, error_type]).inc();
     }
 
     /// Record token usage extracted from an upstream response. Called once per

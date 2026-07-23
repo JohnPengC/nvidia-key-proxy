@@ -46,6 +46,20 @@ fn test_config() -> Config {
         synthesize_empty_choices: true,
         retry_on_empty_shell: true,
         empty_shell_retry_max_tokens: 8192,
+        empty_shell_retry_attempts: 2,
+        empty_shell_probe_before_retry: true,
+        empty_shell_retry_backoff_base_ms: 500,
+        empty_shell_retry_backoff_max_ms: 5000,
+        empty_shell_pre_clamp_max_tokens: default_empty_shell_pre_clamp_max_tokens(),
+        circuit_breaker_threshold: 3,
+        circuit_breaker_per_model: true,
+        max_tokens_max: 100_000,
+        concurrency_limit_per_model: std::collections::HashMap::new(),
+        concurrency_queue_timeout_ms: 5000,
+        request_timeout_streaming_seconds: 0,
+        upstream_connect_timeout_secs: 5,
+        upstream_pool_idle_timeout_secs: 90,
+        retry_jitter_ms: 100,
     }
 }
 

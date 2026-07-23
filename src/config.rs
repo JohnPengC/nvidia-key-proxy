@@ -87,10 +87,107 @@ pub struct Config {
     /// key or `NVIDIA_EMPTY_SHELL_RETRY_MAX_TOKENS` env var.
     #[serde(default = "default_empty_shell_retry_max_tokens")]
     pub empty_shell_retry_max_tokens: u64,
+    /// Before retrying an empty-shell failure, do a lightweight health probe
+    /// against /v1/models to avoid retrying into a degraded upstream.
+    /// Default true. Override via `NVIDIA_EMPTY_SHELL_PROBE_BEFORE_RETRY`.
+    #[serde(default = "default_empty_shell_probe_before_retry")]
+    pub empty_shell_probe_before_retry: bool,
+    /// Circuit breaker threshold. After N consecutive empty-shell or 504
+    /// responses on a given key/model, the key is cooled for
+    /// cooldown.base_seconds. 0 = disabled. Default 3. Override via
+    /// `NVIDIA_CIRCUIT_BREAKER_THRESHOLD`.
+    #[serde(default = "default_circuit_breaker_threshold")]
+    pub circuit_breaker_threshold: u32,
+
+    /// Whether circuit breaker tracks failures per (key, model) pair
+    /// instead of globally per key. Default true. Override via
+    /// `NVIDIA_CIRCUIT_BREAKER_PER_MODEL`.
+    #[serde(default = "default_circuit_breaker_per_model")]
+    pub circuit_breaker_per_model: bool,
+
+    /// Number of retry attempts for empty-shell soft failures.
+    /// 2 = original + two retries. 0 = no retry (falls back to 502).
+    /// Default 2. Override via `NVIDIA_EMPTY_SHELL_RETRY_ATTEMPTS`.
+    #[serde(default = "default_empty_shell_retry_attempts")]
+    pub empty_shell_retry_attempts: u32,
+
+    /// Base delay for exponential backoff between empty-shell retries (ms).
+    /// Default 500. Override via `NVIDIA_EMPTY_SHELL_RETRY_BACKOFF_BASE_MS`.
+    #[serde(default = "default_empty_shell_retry_backoff_base_ms")]
+    pub empty_shell_retry_backoff_base_ms: u64,
+
+    /// Cap for a single empty-shell retry backoff sleep (ms).
+    /// Default 5000. Override via `NVIDIA_EMPTY_SHELL_RETRY_BACKOFF_MAX_MS`.
+    #[serde(default = "default_empty_shell_retry_backoff_max_ms")]
+    pub empty_shell_retry_backoff_max_ms: u64,
+
+    /// Per-model max_tokens ceiling for pre-clamping on first attempt.
+    /// When a request targets a model in this map and max_tokens exceeds
+    /// the ceiling, the proxy clamps it before the first upstream call.
+    /// Reduces empty-shell occurrences for known problematic models.
+    /// Default includes z-ai/glm-5.2 → 32000.
+    /// Override via `NVIDIA_EMPTY_SHELL_PRE_CLAMP_MAX_TOKENS` (JSON map).
+    #[serde(default = "default_empty_shell_pre_clamp_max_tokens")]
+    pub empty_shell_pre_clamp_max_tokens: std::collections::HashMap<String, u64>,
+
+    /// Optional ceiling for max_tokens validation. Any request with max_tokens
+    /// > this value will have the field dropped (model default used). Default
+    /// 100000. Override via `MAX_TOKENS_MAX` env var.
+    #[serde(default = "default_max_tokens_max")]
+    pub max_tokens_max: u64,
+
+    // ==================== Concurrency limiting (Priority 2) ====================
+    /// Per-model maximum concurrent upstream requests.
+    /// When a model's concurrency reaches this limit, new requests are queued
+    /// (up to `concurrency_queue_timeout_ms`) or rejected with 503.
+    /// Default: empty (no limit). Override via `NVIDIA_CONCURRENCY_LIMIT_PER_MODEL` (JSON map).
+    #[serde(default)]
+    pub concurrency_limit_per_model: std::collections::HashMap<String, u32>,
+
+    /// Maximum time (ms) to wait for a concurrency semaphore slot.
+    /// If the queue is full for this long, return 503 with Retry-After.
+    /// Default 5000 (5s). Override via `NVIDIA_CONCURRENCY_QUEUE_TIMEOUT_MS`.
+    #[serde(default = "default_concurrency_queue_timeout_ms")]
+    pub concurrency_queue_timeout_ms: u64,
+
+    // ==================== Timeout tuning (Priority 3) ====================
+    /// Request timeout for streaming connections (Priority 3).
+    /// When set > 0, used instead of request_timeout_seconds for streaming calls.
+    /// 0 = use request_timeout_seconds. Default 0 (disabled).
+    /// Override via NVIDIA_REQUEST_TIMEOUT_STREAMING_SECONDS.
+    #[serde(default)]
+    pub request_timeout_streaming_seconds: u64,
+
+    // ==================== Network resilience (Priority 4) ====================
+    /// Upstream connection timeout (seconds). Default 5.
+    /// Override via NVIDIA_UPSTREAM_CONNECT_TIMEOUT_SECONDS.
+    #[serde(default = "default_upstream_connect_timeout_secs")]
+    pub upstream_connect_timeout_secs: u64,
+
+    /// Upstream connection pool idle timeout (seconds). Default 90.
+    /// Override via NVIDIA_UPSTREAM_POOL_IDLE_TIMEOUT_SECONDS.
+    #[serde(default = "default_upstream_pool_idle_timeout_secs")]
+    pub upstream_pool_idle_timeout_secs: u64,
+
+    /// Retry jitter (ms). Added to exponential backoff. Default 100.
+    /// Override via NVIDIA_RETRY_JITTER_MS.
+    #[serde(default = "default_retry_jitter_ms")]
+    pub retry_jitter_ms: u64,
+}
+
+/// Public wrapper to get the default pre-clamp map (used in tests).
+pub fn default_empty_shell_pre_clamp_max_tokens() -> std::collections::HashMap<String, u64> {
+    let mut m = std::collections::HashMap::new();
+    m.insert("z-ai/glm-5.2".to_string(), 32000);
+    m
 }
 
 fn default_request_timeout_seconds() -> u64 {
     60
+}
+
+fn default_request_timeout_streaming_seconds() -> u64 {
+    0
 }
 
 fn default_inject_stream_usage() -> bool {
@@ -107,6 +204,50 @@ fn default_retry_on_empty_shell() -> bool {
 
 fn default_empty_shell_retry_max_tokens() -> u64 {
     8192
+}
+
+fn default_empty_shell_retry_attempts() -> u32 {
+    2
+}
+
+fn default_empty_shell_probe_before_retry() -> bool {
+    true
+}
+
+fn default_empty_shell_retry_backoff_base_ms() -> u64 {
+    500
+}
+
+fn default_empty_shell_retry_backoff_max_ms() -> u64 {
+    5000
+}
+
+fn default_circuit_breaker_threshold() -> u32 {
+    3
+}
+
+fn default_circuit_breaker_per_model() -> bool {
+    true
+}
+
+fn default_concurrency_queue_timeout_ms() -> u64 {
+    5000
+}
+
+fn default_upstream_connect_timeout_secs() -> u64 {
+    5
+}
+
+fn default_upstream_pool_idle_timeout_secs() -> u64 {
+    90
+}
+
+fn default_retry_jitter_ms() -> u64 {
+    100
+}
+
+fn default_max_tokens_max() -> u64 {
+    100_000
 }
 
 /// Front-door auth config. See `Config::auth` for the rationale.
@@ -152,6 +293,7 @@ impl fmt::Debug for Config {
             .field("health_check", &self.health_check)
             .field("observability", &self.observability)
             .field("request_timeout_seconds", &self.request_timeout_seconds)
+            .field("request_timeout_streaming_seconds", &self.request_timeout_streaming_seconds)
             .field("retry", &self.retry)
             .field("model_aliases", &self.model_aliases)
             .field("allow_local_base_url", &self.allow_local_base_url)
@@ -162,6 +304,41 @@ impl fmt::Debug for Config {
                 "empty_shell_retry_max_tokens",
                 &self.empty_shell_retry_max_tokens,
             )
+            .field(
+                "empty_shell_retry_attempts",
+                &self.empty_shell_retry_attempts,
+            )
+            .field(
+                "empty_shell_probe_before_retry",
+                &self.empty_shell_probe_before_retry,
+            )
+            .field(
+                "empty_shell_retry_backoff_base_ms",
+                &self.empty_shell_retry_backoff_base_ms,
+            )
+            .field(
+                "empty_shell_retry_backoff_max_ms",
+                &self.empty_shell_retry_backoff_max_ms,
+            )
+            .field(
+                "empty_shell_pre_clamp_max_tokens",
+                &self.empty_shell_pre_clamp_max_tokens,
+            )
+            .field(
+                "circuit_breaker_threshold",
+                &self.circuit_breaker_threshold,
+            )
+            .field(
+                "circuit_breaker_per_model",
+                &self.circuit_breaker_per_model,
+            )
+            .field("max_tokens_max", &self.max_tokens_max)
+            .field("concurrency_limit_per_model", &self.concurrency_limit_per_model)
+            .field("concurrency_queue_timeout_ms", &self.concurrency_queue_timeout_ms)
+            .field("request_timeout_streaming_seconds", &self.request_timeout_streaming_seconds)
+            .field("upstream_connect_timeout_secs", &self.upstream_connect_timeout_secs)
+            .field("upstream_pool_idle_timeout_secs", &self.upstream_pool_idle_timeout_secs)
+            .field("retry_jitter_ms", &self.retry_jitter_ms)
             .field(
                 "auth",
                 &format!(
@@ -321,6 +498,20 @@ impl Config {
             synthesize_empty_choices: default_synthesize_empty_choices(),
             retry_on_empty_shell: default_retry_on_empty_shell(),
             empty_shell_retry_max_tokens: default_empty_shell_retry_max_tokens(),
+            empty_shell_retry_attempts: default_empty_shell_retry_attempts(),
+            empty_shell_probe_before_retry: default_empty_shell_probe_before_retry(),
+            empty_shell_retry_backoff_base_ms: default_empty_shell_retry_backoff_base_ms(),
+            empty_shell_retry_backoff_max_ms: default_empty_shell_retry_backoff_max_ms(),
+            empty_shell_pre_clamp_max_tokens: default_empty_shell_pre_clamp_max_tokens(),
+            circuit_breaker_threshold: default_circuit_breaker_threshold(),
+            circuit_breaker_per_model: default_circuit_breaker_per_model(),
+            max_tokens_max: default_max_tokens_max(),
+            concurrency_limit_per_model: std::collections::HashMap::new(),
+            concurrency_queue_timeout_ms: default_concurrency_queue_timeout_ms(),
+            request_timeout_streaming_seconds: default_request_timeout_streaming_seconds(),
+            upstream_connect_timeout_secs: default_upstream_connect_timeout_secs(),
+            upstream_pool_idle_timeout_secs: default_upstream_pool_idle_timeout_secs(),
+            retry_jitter_ms: default_retry_jitter_ms(),
         };
 
         // Prefer NVIDIA_CONFIG_PATH, fall back to ./config.toml
@@ -434,6 +625,13 @@ impl Config {
             warn!(
                 "request_timeout_seconds={} is very short; consider 30+ seconds for non-streaming requests",
                 self.request_timeout_seconds
+            );
+        }
+        // Warn if streaming timeout is configured but very short
+        if self.request_timeout_streaming_seconds > 0 && self.request_timeout_streaming_seconds < 5 {
+            warn!(
+                "request_timeout_streaming_seconds={} is very short; consider 60+ seconds for streaming",
+                self.request_timeout_streaming_seconds
             );
         }
 
@@ -580,6 +778,78 @@ impl Config {
                         config.empty_shell_retry_max_tokens = v;
                     }
                 }
+                "empty_shell_retry_attempts" => {
+                    if let Ok(v) = value.parse::<u32>() {
+                        config.empty_shell_retry_attempts = v;
+                    }
+                }
+                "empty_shell_probe_before_retry" => {
+                    if let Ok(v) = value.parse::<bool>() {
+                        config.empty_shell_probe_before_retry = v;
+                    }
+                }
+                "circuit_breaker_threshold" => {
+                    if let Ok(v) = value.parse::<u32>() {
+                        config.circuit_breaker_threshold = v;
+                    }
+                }
+                "circuit_breaker_per_model" => {
+                    if let Ok(v) = value.parse::<bool>() {
+                        config.circuit_breaker_per_model = v;
+                    }
+                }
+                "empty_shell_retry_backoff_base_ms" => {
+                    if let Ok(v) = value.parse::<u64>() {
+                        config.empty_shell_retry_backoff_base_ms = v;
+                    }
+                }
+                "empty_shell_retry_backoff_max_ms" => {
+                    if let Ok(v) = value.parse::<u64>() {
+                        config.empty_shell_retry_backoff_max_ms = v;
+                    }
+                }
+                "empty_shell_pre_clamp_max_tokens" => {
+                    // Parse as JSON object: {"model": max_tokens}
+                    if let Ok(map) = serde_json::from_str::<std::collections::HashMap<String, u64>>(&value) {
+                        config.empty_shell_pre_clamp_max_tokens = map;
+                    }
+                }
+                "max_tokens_max" => {
+                    if let Ok(v) = value.parse::<u64>() {
+                        config.max_tokens_max = v;
+                    }
+                }
+                "request_timeout_streaming_seconds" => {
+                    if let Ok(v) = value.parse::<u64>() {
+                        config.request_timeout_streaming_seconds = v;
+                    }
+                }
+                "concurrency_limit_per_model" => {
+                    // Parse as JSON object: {"model": limit}
+                    if let Ok(map) = serde_json::from_str::<std::collections::HashMap<String, u32>>(&value) {
+                        config.concurrency_limit_per_model = map;
+                    }
+                }
+                "concurrency_queue_timeout_ms" => {
+                    if let Ok(v) = value.parse::<u64>() {
+                        config.concurrency_queue_timeout_ms = v;
+                    }
+                }
+                "upstream_connect_timeout_secs" => {
+                    if let Ok(v) = value.parse::<u64>() {
+                        config.upstream_connect_timeout_secs = v;
+                    }
+                }
+                "upstream_pool_idle_timeout_secs" => {
+                    if let Ok(v) = value.parse::<u64>() {
+                        config.upstream_pool_idle_timeout_secs = v;
+                    }
+                }
+                "retry_jitter_ms" => {
+                    if let Ok(v) = value.parse::<u64>() {
+                        config.retry_jitter_ms = v;
+                    }
+                }
                 _ => {}
             }
         }
@@ -615,6 +885,7 @@ mod config_validation_tests {
                 log_level: "info".to_string(),
             },
             request_timeout_seconds: 60,
+            request_timeout_streaming_seconds: 0,
             retry: RetryConfig::default(),
             model_aliases: std::collections::HashMap::new(),
             allow_local_base_url: false,
@@ -623,6 +894,19 @@ mod config_validation_tests {
             synthesize_empty_choices: true,
             retry_on_empty_shell: true,
             empty_shell_retry_max_tokens: 8192,
+            empty_shell_retry_attempts: 2,
+            empty_shell_probe_before_retry: true,
+            empty_shell_retry_backoff_base_ms: 500,
+            empty_shell_retry_backoff_max_ms: 5000,
+            empty_shell_pre_clamp_max_tokens: default_empty_shell_pre_clamp_max_tokens(),
+            circuit_breaker_threshold: 3,
+            circuit_breaker_per_model: true,
+            max_tokens_max: 100_000,
+            concurrency_limit_per_model: std::collections::HashMap::new(),
+            concurrency_queue_timeout_ms: 5000,
+            upstream_connect_timeout_secs: 5,
+            upstream_pool_idle_timeout_secs: 90,
+            retry_jitter_ms: 100,
         }
     }
 

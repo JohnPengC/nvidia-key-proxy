@@ -9,6 +9,13 @@ A lightweight, high‑performance proxy written in Rust that fronts multiple NVI
 - **Health checking** – startup probe + periodic bad-key recovery keep the pool aware of dead keys.
 - **Observability** – Prometheus metrics at `metrics_path` (default `/metrics`) and structured tracing.
 - **Secure** – real keys never leave the process; logs use `XXXX***XXXX` masking.
+- **Empty-shell retry** – detects NVIDIA's silent 200 soft-failure (`choices:[]`, `usage:null`), auto-clamps `max_tokens`, retries with exponential backoff (default 2 retries, 500ms base), optional upstream health probe, per-model circuit breaker.
+- **Concurrency limiting** – per-model semaphore prevents overwhelming upstream workers (e.g., nemotron-3-ultra's 32-worker limit); queue timeout returns 503 with `Retry-After`.
+- **Network resilience** – configurable connection pool (idle timeout 90s, connect timeout 5s), retry jitter (default 100ms), network error metrics.
+- **Request normalization** – coalesces invalid `max_tokens`/`reasoning_effort`/`tools` fields instead of hard 400; remaps model aliases; injects `stream_options.include_usage`.
+- **Configuration validation** – fails fast on placeholder `base_url`/keys, warns on overly short timeouts.
+- **Streaming timeout** – separate `request_timeout_streaming_seconds` for long generations.
+- **max_tokens validation** – drops invalid `max_tokens` (≤0, >100k, non‑numeric, negative strings) before they hit NVIDIA.
 
 ## Quick Start
 
@@ -44,13 +51,62 @@ A lightweight, high‑performance proxy written in Rust that fronts multiple NVI
    max_consecutive_failures = 3
 
    # Request timeout in seconds. Set to 0 to disable (recommended for streaming).
-   # Streaming requests bypass this timeout regardless.
-   request_timeout_seconds = 300
+   # Non-streaming requests use this timeout end-to-end. Streaming requests
+   # bypass this timeout entirely (long-running token generation can exceed 60s).
+   # Default increased to 600s for long-context non-streaming completions.
+   request_timeout_seconds = 600
+
+   # Optional: separate timeout for streaming connections (connect + idle read).
+   # When set > 0, this governs the streaming path instead of request_timeout_seconds.
+   # 0 = use request_timeout_seconds for both (legacy). Default 0 (disabled).
+   # request_timeout_streaming_seconds = 0
+
+   # On NVIDIA's "empty-shell" soft failure — a 200 whose body is
+   # `{"choices":[],"id":"","usage":null,...}` (no real inference ran; common on
+   # `/compact` with max_tokens larger than the model's remaining context budget) —
+   # retry once with max_tokens clamped to `empty_shell_retry_max_tokens` before
+   # giving up and surfacing a 502. Without this, Claude Code's `/compact` prints
+   # the misleading "summarization produced empty response". Defaults to true;
+   # disable via NVIDIA_RETRY_ON_EMPTY_SHELL=false.
+   retry_on_empty_shell = true
+
+   # max_tokens used for that single post-shell retry (the original request is
+   # forwarded unchanged first). 8192 is conservative across GLM-family models on
+   # build.integrate. Env override: NVIDIA_EMPTY_SHELL_RETRY_MAX_TOKENS.
+   empty_shell_retry_max_tokens = 8192
+
+   # Optional: number of retry attempts for empty-shell soft failures.
+   # 1 = one retry (original + one retry). 0 = no retry (falls back to 502).
+   # Default 1. Env override: NVIDIA_EMPTY_SHELL_RETRY_ATTEMPTS.
+   # empty_shell_retry_attempts = 1
+
+   # Optional: before retrying an empty-shell failure, do a lightweight health
+   # probe against /v1/models to avoid retrying into a degraded upstream.
+   # Default true. Env override: NVIDIA_EMPTY_SHELL_PROBE_BEFORE_RETRY.
+   # empty_shell_probe_before_retry = true
+
+   # Optional: circuit breaker threshold. After N consecutive empty-shell or 504
+   # responses on a given key/model, the key is cooled for cooldown.base_seconds.
+   # 0 = disabled. Default 3. Env override: NVIDIA_CIRCUIT_BREAKER_THRESHOLD.
+   # circuit_breaker_threshold = 3
 
    [observability]
    enable_metrics = true
    metrics_path   = "/metrics"
    log_level      = "info"
+
+   # Client-facing model name → NVIDIA-ready model id mappings.
+   # When a chat-completion request carries `model` matching a key here, the
+   # proxy rewrites the field to the mapped value before forwarding upstream.
+   # Unmatched names are forwarded unchanged. Empty by default.
+   #
+   # Use this when your client (cc-switch, Cursor, OpenAI SDK, …) sends
+   # OpenAI-style model names that don't exist on NVIDIA NIM, e.g.:
+   #
+   #   [model_aliases]
+   #   "claude-opus-4-8"        = "z-ai/glm-5.2"   # identity mapping kept for clarity
+   #   "gpt-4o"              = "meta/llama-3.1-405b-instruct"
+   #   "gpt-4o-mini"         = "meta/llama-3.1-70b-instruct"
    ```
 
 3. **Run**
@@ -69,7 +125,14 @@ A lightweight, high‑performance proxy written in Rust that fronts multiple NVI
 | `listen_addr` | Address to listen on | Required |
 | `base_url` | NVIDIA API base URL | Required |
 | `keys` | List of NVIDIA API keys | Required (or `NVIDIA_KEYS` env) |
-| `request_timeout_seconds` | Request timeout; 0 disables (streaming always bypasses) | `60` |
+| `request_timeout_seconds` | Non-streaming request timeout; 0 disables (streaming always bypasses) | `600` |
+| `request_timeout_streaming_seconds` | Streaming request timeout; 0 = use non-streaming timeout or disabled | `0` |
+| `retry_on_empty_shell` | Retry on NVIDIA empty-shell soft failure (200 with `choices:[]`, `usage:null`) | `true` |
+| `empty_shell_retry_max_tokens` | Clamped `max_tokens` for empty-shell retry | `8192` |
+| `empty_shell_retry_attempts` | Number of empty-shell retries (0 = no retry) | `1` |
+| `empty_shell_probe_before_retry` | Probe `/v1/models` before empty-shell retry | `true` |
+| `circuit_breaker_threshold` | Consecutive shell/504 before cooldown (0 = disabled) | `3` |
+| `max_tokens_max` | Ceiling for `max_tokens` validation; drop field if exceeded | `100_000` |
 | `allow_local_base_url` | Permit a loopback/localhost `base_url` (testing only) | `false` |
 | `auth` | Front-door + admin auth config (see below) | disabled |
 
@@ -130,6 +193,43 @@ At startup the proxy validates the loaded configuration and exits early if it lo
 - `base_url` must not be `example.com`, `localhost`, or `127.0.0.1`, and must start with `http://` or `https://`.
 - API keys must be at least 8 characters long and cannot contain `fake`, `dummy`, `test`, `example`, or `placeholder`.
 - A `request_timeout_seconds` value below `5` logs a warning suggesting a larger value.
+
+## Failure-Log-Driven Reliability (2026‑07‑23)
+
+Analyzed `failure.log` and addressed the four dominant error classes:
+
+| Category | Count | Root Cause | Fix |
+|---|---|---|---|
+| `empty_choices_shell_first` | 41.9% | NVIDIA returns 200 with `choices:[]`, `usage:null`, `id:""` — no inference ran. | **Retry with clamped `max_tokens`** (config `empty_shell_retry_max_tokens`, default 8192). Optional upstream health probe before retry (`empty_shell_probe_before_retry`). Configurable attempts (`empty_shell_retry_attempts`, default 1). Surfaces actionable 502 instead of misleading "summarization produced empty response". |
+| `timeout` | 37.2% | 300s hard timeout too short for long-context non-streaming. | **Default `request_timeout_seconds` raised to 600s**. Streaming requests bypass this entirely. New `request_timeout_streaming_seconds` for separate streaming timeout. Warn threshold raised to 30s. |
+| `upstream_5xx` (504) | 14.0% | Gateway timeout on streaming. | Client `connect_timeout` (5s) unchanged; per-request timeout now only for non-streaming. Streaming path unbounded by default. |
+| `upstream_4xx` (400 `max_tokens < 1`) | 2.3% | Client-computed `max_tokens` underflow (large context + reserved tokens). | **Proxy drops invalid `max_tokens`** (≤0, >100k, non-numeric). Ceiling configurable via `max_tokens_max` (default 100_000) or `MAX_TOKENS_MAX` env. |
+
+### New Configuration Options
+
+```toml
+# config.toml
+request_timeout_seconds = 600                # Non-streaming timeout (0 = disabled)
+request_timeout_streaming_seconds = 0        # Streaming timeout (0 = use non-streaming or disabled)
+
+# Empty-shell soft failure retry
+retry_on_empty_shell = true
+empty_shell_retry_max_tokens = 8192          # Clamped budget for retry
+empty_shell_retry_attempts = 1               # Number of retries after shell
+empty_shell_probe_before_retry = true        # Probe /v1/models before retry
+
+# Circuit breaker (pre-reserved, logic pending)
+circuit_breaker_threshold = 3                # Consecutive shell/504 before cooldown
+
+# max_tokens validation ceiling
+max_tokens_max = 100_000                     # Drop field if exceeded
+```
+
+All options overrideable via `NVIDIA_*` env vars (e.g. `NVIDIA_REQUEST_TIMEOUT_SECONDS`, `NVIDIA_EMPTY_SHELL_RETRY_ATTEMPTS`).
+
+### Circuit Breaker Fields (Pre-reserved)
+
+`circuit_breaker_threshold` and `max_tokens_max` are now in `Config` and `Proxy` structs; the circuit breaker logic will be implemented in a follow-up. `max_tokens_max` is already active for request validation.
 
 ## Request Normalization
 

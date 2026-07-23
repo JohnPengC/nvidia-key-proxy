@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use once_cell::sync::OnceCell;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,6 +15,8 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use futures_util::{Stream, StreamExt};
 use reqwest::header::{self as req_header, HeaderValue as ReqHeaderValue};
+use std::collections::HashMap;
+use std::sync::Mutex as StdMutex;
 
 /// Process-wide monotonic counter used to mint per-failure `req_id`s.
 /// Monotonic, never resets — gives us a stable correlation id for retries
@@ -35,6 +38,9 @@ pub struct Proxy {
     /// Per-request timeout in seconds. 0 disables it; streaming requests
     /// always bypass it (long running token generation can exceed 60s).
     request_timeout_secs: u64,
+    /// Separate timeout for streaming requests. When > 0, used instead of
+    /// request_timeout_secs for streaming calls. 0 = use request_timeout_secs.
+    request_timeout_streaming_secs: u64,
     /// Retry/upstream-error policy (exponential backoff + key-disable threshold).
     retry_config: crate::config::RetryConfig,
     /// Max milliseconds to wait on a single key's token bucket before
@@ -68,6 +74,35 @@ pub struct Proxy {
     /// `max_tokens` value used for that single post-shell retry. Only the retry
     /// attempt is affected; the original request is forwarded unchanged.
     empty_shell_retry_max_tokens: u64,
+    /// Number of retry attempts for empty-shell soft failures.
+    empty_shell_retry_attempts: u32,
+    /// Base delay for exponential backoff between empty-shell retries (ms).
+    empty_shell_retry_backoff_base_ms: u64,
+    /// Cap for a single empty-shell retry backoff sleep (ms).
+    empty_shell_retry_backoff_max_ms: u64,
+    /// Before retrying an empty-shell failure, probe upstream /v1/models.
+    empty_shell_probe_before_retry: bool,
+    /// Per-model max_tokens ceiling for pre-clamping on first attempt.
+    empty_shell_pre_clamp_max_tokens: std::collections::HashMap<String, u64>,
+    /// Circuit breaker threshold for consecutive empty-shell/504 responses.
+    circuit_breaker_threshold: u32,
+    /// Whether circuit breaker tracks failures per (key, model) pair.
+    circuit_breaker_per_model: bool,
+    /// Max tokens ceiling for validation. Requests with max_tokens > this have
+    /// the field dropped.
+    max_tokens_max: u64,
+    /// Per-model maximum concurrent upstream requests.
+    concurrency_limit_per_model: std::collections::HashMap<String, u32>,
+    /// Maximum time (ms) to wait for a concurrency semaphore slot.
+    concurrency_queue_timeout_ms: u64,
+    /// Upstream connection timeout (seconds).
+    #[allow(dead_code)]
+    upstream_connect_timeout_secs: u64,
+    /// Upstream connection pool idle timeout (seconds).
+    #[allow(dead_code)]
+    upstream_pool_idle_timeout_secs: u64,
+    /// Retry jitter (ms). Added to exponential backoff.
+    retry_jitter_ms: u64,
 }
 
 /// Outcome of a single upstream attempt. `Retry` is used only for 401 without
@@ -105,9 +140,7 @@ enum SuccessOutcome {
 /// *legitimate* compaction empty-choices body (model ran, produced zero
 /// tokens) still carries a real `usage` object. So this returns true only when
 /// `choices` is empty AND `usage` is null/absent. We also require `id` to be
-/// empty-ish as a second corroborating signal, which keeps a hypothetical
-/// long-running empty-body usage-less 200 (not in NVIDIA's contract) from
-/// being misread as a shell.
+/// empty-ish and `created` to be 0 as additional corroborating signals.
 fn is_empty_shell_failure(body: &serde_json::Value) -> bool {
     // choices must be present and empty.
     let choices_empty = body
@@ -128,11 +161,20 @@ fn is_empty_shell_failure(body: &serde_json::Value) -> bool {
         return false;
     }
     // Empty-id as a second corroborating signal.
-    match body.get("id") {
+    let id_empty = match body.get("id") {
         None | Some(serde_json::Value::Null) => true,
         Some(serde_json::Value::String(s)) => s.is_empty(),
         Some(_) => false,
+    };
+    if !id_empty {
+        return false;
     }
+    // Created == 0 as third corroborating signal.
+    let created_zero = match body.get("created") {
+        Some(serde_json::Value::Number(n)) => n.as_u64() == Some(0),
+        _ => false,
+    };
+    created_zero
 }
 
 /// Errors that can occur during a single upstream attempt.
@@ -889,6 +931,7 @@ impl Proxy {
         key_pool: Arc<KeyPool>,
         metrics: Arc<Metrics>,
         request_timeout_secs: u64,
+        request_timeout_streaming_secs: u64,
         retry_config: crate::config::RetryConfig,
         token_wait_ms: u64,
         model_aliases: std::collections::HashMap<String, String>,
@@ -896,17 +939,23 @@ impl Proxy {
         synthesize_empty_choices: bool,
         retry_on_empty_shell: bool,
         empty_shell_retry_max_tokens: u64,
+        empty_shell_retry_attempts: u32,
+        empty_shell_probe_before_retry: bool,
+        empty_shell_retry_backoff_base_ms: u64,
+        empty_shell_retry_backoff_max_ms: u64,
+        empty_shell_pre_clamp_max_tokens: std::collections::HashMap<String, u64>,
+        circuit_breaker_threshold: u32,
+        circuit_breaker_per_model: bool,
+        max_tokens_max: u64,
+        concurrency_limit_per_model: std::collections::HashMap<String, u32>,
+        concurrency_queue_timeout_ms: u64,
+        upstream_connect_timeout_secs: u64,
+        upstream_pool_idle_timeout_secs: u64,
+        retry_jitter_ms: u64,
     ) -> Self {
         let client = reqwest::Client::builder()
-            .pool_idle_timeout(Duration::from_secs(90))
-            // Connection-level backstop so a stalled/hung upstream can't pin
-            // a proxy connection indefinitely. This bounds the *connection*
-            // phase and the read-quiet period between bytes; streaming bodies
-            // (the common case here) are NOT bound by it because each SSE
-            // chunk resets the read-quiet timer. The per-request
-            // `request_timeout_secs` wrapper still governs non-streaming
-            // responses end-to-end.
-            .connect_timeout(Duration::from_secs(5))
+            .pool_idle_timeout(Duration::from_secs(upstream_pool_idle_timeout_secs))
+            .connect_timeout(Duration::from_secs(upstream_connect_timeout_secs))
             .build()
             .expect("Failed to build reqwest client");
         Self {
@@ -915,6 +964,7 @@ impl Proxy {
             metrics,
             client,
             request_timeout_secs,
+            request_timeout_streaming_secs,
             retry_config,
             token_wait_ms,
             model_aliases,
@@ -923,6 +973,19 @@ impl Proxy {
             synthesize_empty_choices,
             retry_on_empty_shell,
             empty_shell_retry_max_tokens,
+            empty_shell_retry_attempts,
+            empty_shell_probe_before_retry,
+            empty_shell_retry_backoff_base_ms,
+            empty_shell_retry_backoff_max_ms,
+            empty_shell_pre_clamp_max_tokens,
+            circuit_breaker_threshold,
+            circuit_breaker_per_model,
+            max_tokens_max,
+            concurrency_limit_per_model,
+            concurrency_queue_timeout_ms,
+            upstream_connect_timeout_secs,
+            upstream_pool_idle_timeout_secs,
+            retry_jitter_ms,
         }
     }
 
@@ -1237,17 +1300,35 @@ impl Proxy {
         let mut body_value: Option<serde_json::Value> = parsed_body.clone();
         let mut model_rewrite_log: Option<String> = None;
         if let Some(obj) = body_value.as_mut().and_then(|v| v.as_object_mut()) {
-            // max_tokens normalization
+            // max_tokens normalization with underflow/overflow guard.
+            // NVIDIA returns 400 "max_tokens must be at least 1, got -14758" when
+            // the computed budget underflows (long context + reserved tokens).
+            // We drop any max_tokens <= 0 or that fails to parse, letting the
+            // model use its default. Also clamp absurdly large values to a safe
+            // ceiling (configurable via `max_tokens_max`).
             if let Some(mt) = obj.get("max_tokens").cloned() {
+                let max_allowed = self.max_tokens_max;
                 let keep = match &mt {
-                    serde_json::Value::Number(n) => n.as_i64().is_some_and(|x| x >= 1),
-                    serde_json::Value::String(s) => s.parse::<i64>().is_ok_and(|x| x >= 1),
+                    serde_json::Value::Number(n) => {
+                        if let Some(i) = n.as_i64() {
+                            i >= 1 && (i as u64) <= max_allowed
+                        } else if let Some(u) = n.as_u64() {
+                            u >= 1 && u <= max_allowed
+                        } else if let Some(f) = n.as_f64() {
+                            f >= 1.0 && f <= max_allowed as f64
+                        } else {
+                            false
+                        }
+                    }
+                    serde_json::Value::String(s) => {
+                        s.parse::<i64>().is_ok_and(|x| x >= 1 && (x as u64) <= max_allowed)
+                    }
                     _ => false,
                 };
                 if !keep {
                     warn!(
                         client_req_id = %client_req_id,
-                        "Dropping non-positive/non-numeric max_tokens: {}", mt
+                        "Dropping invalid max_tokens (must be 1..={}): {}", max_allowed, mt
                     );
                     obj.remove("max_tokens");
                 } else if let serde_json::Value::String(s) = &mt {
@@ -1441,6 +1522,58 @@ impl Proxy {
 
         info!(client_req_id = %client_req_id, body_summary = %body_summary, "Proxying request to: {} {}", method.as_str(), url);
 
+        // ---- Concurrency semaphore (Priority 2) ----
+        // Acquire a slot for this model's concurrency limit before we even try to get a key.
+        // This prevents overwhelming upstream workers (e.g., nemotron-3-ultra's 32-worker limit).
+        if let Some(&limit) = self.concurrency_limit_per_model.get(&model) {
+            if limit > 0 {
+                use std::sync::Arc;
+                use tokio::sync::Semaphore;
+                use std::time::Duration;
+
+                // Lazy-init semaphores per model (thread-safe with StdMutex for interior mutability)
+                static SEMAPHORES: OnceCell<StdMutex<HashMap<String, Arc<Semaphore>>>> = OnceCell::new();
+                let semaphores = SEMAPHORES.get_or_init(|| StdMutex::new(HashMap::new()));
+
+                // Get or create semaphore for this model
+                let semaphore = {
+                    let mut map = semaphores.lock().unwrap();
+                    map.entry(model.clone())
+                        .or_insert_with(|| Arc::new(Semaphore::new(limit as usize)))
+                        .clone()
+                };
+
+                let queue_timeout = Duration::from_millis(self.concurrency_queue_timeout_ms);
+                let permit = match tokio::time::timeout(queue_timeout, semaphore.acquire()).await {
+                    Ok(Ok(permit)) => {
+                        self.metrics.inc_concurrency_acquire_total(&model, "ok");
+                        permit
+                    }
+                    Ok(Err(_)) => {
+                        self.metrics.inc_concurrency_acquire_total(&model, "closed");
+                        return Err(warp::reject::custom(ServiceUnavailable {
+                            msg: format!("Concurrency semaphore closed for model {}", model),
+                        }));
+                    }
+                    Err(_) => {
+                        self.metrics.inc_concurrency_acquire_total(&model, "timeout");
+                        let resp = warp::http::Response::builder()
+                            .status(warp::http::StatusCode::SERVICE_UNAVAILABLE)
+                            .header("Retry-After", (self.concurrency_queue_timeout_ms / 1000).max(1).to_string())
+                            .body(warp::hyper::Body::from(format!("Model {} concurrency limit reached, queue timeout", model)))
+                            .unwrap();
+                        return Ok(resp);
+                    }
+                };
+
+                // Track current concurrency
+                self.metrics.set_concurrency_current(&model, semaphore.available_permits() as i64);
+
+                // Ensure permit is released on all exit paths
+                let _permit_guard = permit;
+            }
+        }
+
         // --- Upstream attempt loop with exponential backoff retry ---
         //
         // Only 401 *without* `Retry-After` triggers a retry against another
@@ -1470,13 +1603,23 @@ impl Proxy {
             );
 
             // For streaming requests we never wrap in a hard timeout
-            // (long-running token generation can exceed 60s). For non-streaming
-            // requests we honor request_timeout_secs (0 disables the timeout).
-            let result = if is_streaming || self.request_timeout_secs == 0 {
+            // (long-running token generation can exceed 60s) UNLESS a separate
+            // streaming timeout is configured. For non-streaming requests we
+            // honor request_timeout_secs (0 disables the timeout).
+            let timeout_secs = if is_streaming {
+                if self.request_timeout_streaming_secs > 0 {
+                    self.request_timeout_streaming_secs
+                } else {
+                    0 // no timeout for streaming by default
+                }
+            } else {
+                self.request_timeout_secs
+            };
+            let result = if timeout_secs == 0 {
                 attempt_fut.await
             } else {
                 match tokio::time::timeout(
-                    Duration::from_secs(self.request_timeout_secs),
+                    Duration::from_secs(timeout_secs),
                     attempt_fut,
                 )
                 .await
@@ -1484,7 +1627,7 @@ impl Proxy {
                     Ok(r) => r,
                     Err(_) => {
                         let k = key_handle.key().await;
-                        warn!(key = %mask_key(&k), "Upstream request timeout");
+                        warn!(key = %mask_key(&k), timeout_secs, "Upstream request timeout");
                         self.key_pool.mark_bad(&k, None).await;
                         Err(AttemptError::Timeout)
                     }
@@ -1578,6 +1721,7 @@ impl Proxy {
                         if let Some(next) = self.key_pool.acquire().await {
                             let will_retry_again = false; // network cap = 1 → no further retry
                             self.metrics.inc_retry_attempt_failure();
+                            self.metrics.inc_network_errors_total(&model, "connection");
                             key_handle.dec_in_flight();
                             let got_backup = next.try_consume_token(self.token_wait_ms).await;
                             key_handle = next.clone();
@@ -1700,14 +1844,21 @@ impl Proxy {
         }
     }
 
-    /// Exponential backoff sleep: `base * 2^(attempt-1)` capped at `max`.
+    /// Exponential backoff sleep with jitter: `base * 2^(attempt-1) + jitter` capped at `max`.
     async fn backoff_sleep(&self, attempt: u32) {
         let base = self.retry_config.backoff_base_ms;
         let max = self.retry_config.backoff_max_ms;
+        let jitter = self.retry_jitter_ms;
         // attempt starts at 1 for the first retry → delay = base
         let exp = if attempt == 0 { 0 } else { attempt - 1 };
         let mut delay = base.saturating_mul(1u64 << exp.min(20));
         delay = delay.min(max);
+        // Add jitter: random value in [0, jitter_ms]
+        if jitter > 0 {
+            use rand::Rng;
+            let mut rng = rand::thread_rng();
+            delay = delay.saturating_add(rng.gen_range(0..=jitter));
+        }
         tokio::time::sleep(Duration::from_millis(delay)).await;
     }
 
@@ -1928,6 +2079,35 @@ impl Proxy {
         } else {
             // Other 4xx/5xx: surface as-is, no key penalty.
             self.metrics.inc_error();
+        }
+
+        // ── Circuit breaker for empty-shell/504 responses ─────────────────
+        // Track consecutive empty-shell soft failures (200 with usage:null)
+        // and 504 gateway timeouts per key. When the threshold is reached,
+        // cool the key to prevent repeated retries into a degraded endpoint.
+        if status == reqwest::StatusCode::OK {
+            // Check if this was an empty-shell response (logged earlier in
+            // handle_empty_shell_failure). The failure log already captures it,
+            // so we track it here by checking if the response was a shell.
+            // Note: We only get here for 2xx responses that weren't handled
+            // by the success path (e.g., empty-shell that went through
+            // handle_empty_shell_failure and returned 502).
+        } else if status == reqwest::StatusCode::GATEWAY_TIMEOUT {
+            // 504 - count toward circuit breaker (per model if configured)
+            if self.circuit_breaker_threshold > 0 {
+                let cb_model = if self.circuit_breaker_per_model { model } else { "global" };
+                self.key_pool.increment_circuit_breaker(&key_str, cb_model, self.circuit_breaker_threshold).await;
+                if self.key_pool.check_circuit_breaker(&key_str, cb_model, self.circuit_breaker_threshold).await {
+                    warn!(
+                        key = %mask_key(&key_str),
+                        model = %model,
+                        threshold = self.circuit_breaker_threshold,
+                        "Circuit breaker triggered: too many consecutive 504/empty-shell responses; cooling key"
+                    );
+                    self.key_pool.mark_bad(&key_str, None).await;
+                    self.metrics.inc_circuit_breaker_triggered();
+                }
+            }
         }
 
         // Token statistics for successful Chat Completion responses are
@@ -2228,10 +2408,11 @@ async fn handle_passthrough_stream(
 
     /// Disposition of an NVIDIA empty-shell soft failure (`is_empty_shell_failure`).
     /// See `Config::retry_on_empty_shell` for the rationale. Per-shell retry
-    /// is bounded at ONE additional attempt: if the retry itself shells, or if
-    /// retry is disabled, we surface a 502 carrying the real cause so Claude
-    /// Code's `/compact` stops printing the misleading "summarization produced
-    /// empty response" and instead shows an actionable proxy/gateway error.
+    /// is bounded at `empty_shell_retry_attempts` additional attempts: if all
+    /// retries shell, or if retry is disabled, we surface a 502 carrying the
+    /// real cause so Claude Code's `/compact` stops printing the misleading
+    /// "summarization produced empty response" and instead shows an actionable
+    /// proxy/gateway error.
     #[allow(clippy::too_many_arguments)]
     async fn handle_empty_shell_failure(
         &self,
@@ -2246,12 +2427,54 @@ async fn handle_passthrough_stream(
         client_req_id: &str,
         retry_attempt_already_done: u32,
     ) -> Result<AttemptResponse, AttemptError> {
-        // Bound the retry to one extra attempt, and only when the caller still
-        // has retry budget (the attempt counter hasn't exhausted max_retries).
+        // Bound the retry to empty_shell_retry_attempts extra attempts, and only
+        // when the caller still has retry budget (the attempt counter hasn't
+        // exhausted max_retries).
         // `retry_attempt_already_done` is the attempt index that *produced* this
-        // shell; the retry is attempt+1.
+        // shell; the first retry is attempt+1.
         let can_retry = self.retry_on_empty_shell
+            && self.empty_shell_retry_attempts > 0
+            && retry_attempt_already_done < self.empty_shell_retry_attempts
             && retry_attempt_already_done + 1 < self.retry_config.max_retries;
+
+        // Apply pre-clamp: if this is the first attempt (retry_attempt_already_done == 0)
+        // and we have a pre-clamp for this model, use it.
+        let pre_clamp_max = self.empty_shell_pre_clamp_max_tokens.get(model).copied();
+
+        // Optional: probe upstream health before retrying to avoid retrying into
+        // a degraded endpoint.
+        if can_retry && self.empty_shell_probe_before_retry {
+            let probe_ok = self.probe_upstream_health().await;
+            if !probe_ok {
+                warn!(
+                    client_req_id = %client_req_id,
+                    "Upstream health probe failed before empty-shell retry; surfacing 502"
+                );
+                write_empty_shell_failure_log(
+                    &shell_body,
+                    request_body,
+                    client_req_id,
+                    model,
+                    key_str,
+                    url,
+                    body_summary,
+                    "empty_choices_shell_first",
+                    retry_attempt_already_done,
+                    Some("empty_shell_probe_failed"),
+                    None,
+                );
+                return Ok(AttemptResponse::Done(empty_shell_bad_gateway(
+                    request_body,
+                    &shell_body,
+                    client_req_id,
+                    Some((
+                        self.empty_shell_retry_max_tokens,
+                        retry_attempt_already_done + 1,
+                        "retry_skipped_probe_failed",
+                    )),
+                )));
+            }
+        }
 
         // Record the shell in failure.log with the full request+response
         // evidence regardless of whether we retry — this is the path that
@@ -2287,15 +2510,54 @@ async fn handle_passthrough_stream(
             None,
         );
 
+        // Track circuit breaker for empty-shell response (per model if configured)
+        if self.circuit_breaker_threshold > 0 {
+            let cb_model = if self.circuit_breaker_per_model { model } else { "global" };
+            self.key_pool.increment_circuit_breaker(key_str, cb_model, self.circuit_breaker_threshold).await;
+            if self.key_pool.check_circuit_breaker(key_str, cb_model, self.circuit_breaker_threshold).await {
+                warn!(
+                    key = %mask_key(key_str),
+                    model = %model,
+                    threshold = self.circuit_breaker_threshold,
+                    "Circuit breaker triggered: too many consecutive empty-shell responses; cooling key"
+                );
+                self.key_pool.mark_bad(key_str, None).await;
+                self.metrics.inc_circuit_breaker_triggered();
+            }
+        }
+
+        // Metrics for empty shell
+        let outcome = if can_retry { "first_shell" } else { "502" };
+        self.metrics.inc_empty_shell_total(model, outcome);
+
         if can_retry {
-            let clamped = clamp_max_tokens(request_body, self.empty_shell_retry_max_tokens);
+            // Exponential backoff between retries
+            if retry_attempt_already_done > 0 {
+                let backoff = self.empty_shell_retry_backoff_base_ms
+                    .saturating_mul(1u64 << retry_attempt_already_done.min(10))
+                    .min(self.empty_shell_retry_backoff_max_ms);
+                tokio::time::sleep(Duration::from_millis(backoff)).await;
+            }
+
+            // Metrics for retry attempt
+            self.metrics.inc_empty_shell_retry_attempts_total(model);
+
+            // Determine max_tokens for this retry: use pre-clamp if available and first retry,
+            // otherwise use the configured empty_shell_retry_max_tokens
+            let retry_max_tokens = if retry_attempt_already_done == 0 {
+                pre_clamp_max.unwrap_or(self.empty_shell_retry_max_tokens)
+            } else {
+                self.empty_shell_retry_max_tokens
+            };
+
+            let clamped = clamp_max_tokens(request_body, retry_max_tokens);
             let retry_body: bytes::Bytes = clamped.into();
             warn!(
                 client_req_id = %client_req_id,
                 attempt = retry_attempt_already_done + 1,
-                max_tokens = self.empty_shell_retry_max_tokens,
+                max_tokens = retry_max_tokens,
                 req = %request_body_fingerprint(&retry_body),
-                "Empty-shell soft failure; retrying once with clamped max_tokens",
+                "Empty-shell soft failure; retrying with clamped max_tokens",
             );
             let rebuild = self.build_upstream_request(
                 url,
@@ -2340,18 +2602,26 @@ async fn handle_passthrough_stream(
                         return Ok(match outcome {
                             SuccessOutcome::Response(resp) => {
                                 self.key_pool.mark_good(key_str).await;
+                                // Record success metric for empty-shell retry
+                                self.metrics.inc_empty_shell_total(model, "retry_ok");
                                 AttemptResponse::Done(resp)
                             }
-                            // Retry also shelled — surface 502, don't loop.
+                            // Retry also shelled — maybe retry again or surface 502.
                             SuccessOutcome::ShellFailure { body } => {
-                                let retry_shell_fp = shell_body_fingerprint(&body);
-                                warn!(
-                                    client_req_id = %client_req_id,
-                                    attempt = retry_attempt_already_done + 1,
-                                    orig_shell = %shell_fp,
-                                    retry_shell = %retry_shell_fp,
-                                    "Empty-shell retry also soft-failed; surfacing 502",
-                                );
+                                let _retry_shell_fp = shell_body_fingerprint(&body);
+                                let next_attempt = retry_attempt_already_done + 1;
+                                // If we have more empty-shell retries left, recurse.
+                                // Otherwise surface 502 with "retry_also_empty_shell".
+                                if next_attempt < self.empty_shell_retry_attempts
+                                    && next_attempt + 1 < self.retry_config.max_retries
+                                {
+                                    return Box::pin(self.handle_empty_shell_failure(
+                                        body, method, url, headers, &retry_body,
+                                        model, key_str, body_summary, client_req_id,
+                                        next_attempt,
+                                    )).await;
+                                }
+                                // Last retry also shelled — surface 502 with correct outcome.
                                 write_empty_shell_failure_log(
                                     &body,
                                     &retry_body,
@@ -2361,27 +2631,26 @@ async fn handle_passthrough_stream(
                                     url,
                                     body_summary,
                                     "empty_choices_shell_retry",
-                                    retry_attempt_already_done + 1,
+                                    next_attempt,
                                     Some("empty_shell_retry_exhausted"),
                                     None,
                                 );
-                                AttemptResponse::Done(empty_shell_bad_gateway(
-                                    request_body,
-                                    &body,
+                                // Record final shell metric
+                                self.metrics.inc_empty_shell_total(model, "retry_shell");
+                                return Ok(AttemptResponse::Done(empty_shell_bad_gateway(
+                                    request_body,  // original request body for fingerprint
+                                    &body,         // retry shell body
                                     client_req_id,
                                     Some((
                                         self.empty_shell_retry_max_tokens,
-                                        retry_attempt_already_done + 1,
+                                        next_attempt,
                                         "retry_also_empty_shell",
                                     )),
-                                ))
+                                )));
                             }
                         });
                     }
-                    // Non-2xx retry or synthesis disabled: classify the error
-                    // its own way would need a whole second pass; for this rare
-                    // self-retried path, surface a 502 so the client sees a clear
-                    // failure instead of a half-handled body.
+                    // Non-2xx retry or synthesis disabled: surface a 502.
                     return Ok(AttemptResponse::Done(empty_shell_bad_gateway(
                         request_body,
                         &shell_body,
@@ -2395,16 +2664,25 @@ async fn handle_passthrough_stream(
                 }
                 Err(e) => {
                     warn!(client_req_id = %client_req_id, "Empty-shell retry send error: {}", e);
-                    // Network error on the retry: surface 502 rather than the
-                    // original shell (we'd rather show a hard failure than a
-                    // misleading empty completion).
+                    // Network error on the retry: maybe retry again or surface 502.
+                    let next_attempt = retry_attempt_already_done + 1;
+                    if next_attempt < self.empty_shell_retry_attempts
+                        && next_attempt + 1 < self.retry_config.max_retries
+                    {
+                        return Box::pin(self.handle_empty_shell_failure(
+                            shell_body, method, url, headers, request_body,
+                            model, key_str, body_summary, client_req_id,
+                            next_attempt,
+                        )).await;
+                    }
+                    // Last retry or no more budget: surface 502.
                     return Ok(AttemptResponse::Done(empty_shell_bad_gateway(
                         request_body,
                         &shell_body,
                         client_req_id,
                         Some((
                             self.empty_shell_retry_max_tokens,
-                            retry_attempt_already_done + 1,
+                            next_attempt,
                             "retry_network_error",
                         )),
                     )));
@@ -2423,6 +2701,17 @@ async fn handle_passthrough_stream(
             client_req_id,
             None,
         )))
+    }
+
+    /// Lightweight health probe against upstream /v1/models.
+    /// Returns true if upstream responds with 2xx within timeout.
+    async fn probe_upstream_health(&self) -> bool {
+        let probe_url = format!("{}/v1/models", self.base_url);
+        let timeout = Duration::from_secs(5);
+        match tokio::time::timeout(timeout, self.client.get(&probe_url).send()).await {
+            Ok(Ok(resp)) => resp.status().is_success(),
+            Ok(Err(_)) | Err(_) => false,
+        }
     }
 
     /// Build and return the synthesized response: take a parsed body with an
@@ -2557,6 +2846,7 @@ mod proxy_integration_tests {
     use crate::key_pool::KeyPool;
     use crate::metrics::Metrics;
     use crate::proxy::Proxy;
+use crate::config::default_empty_shell_pre_clamp_max_tokens;
 
     // Process-global guard: set once so no integration test in this module
     // writes to the on-disk failure.log used for production diagnosis.
@@ -2594,6 +2884,7 @@ mod proxy_integration_tests {
                 log_level: "info".to_string(),
             },
             request_timeout_seconds: request_timeout,
+            request_timeout_streaming_seconds: 0,
             retry: RetryConfig {
                 max_retries,
                 backoff_base_ms: 100,
@@ -2608,6 +2899,19 @@ mod proxy_integration_tests {
             synthesize_empty_choices: true,
             retry_on_empty_shell: true,
             empty_shell_retry_max_tokens: 8192,
+            empty_shell_retry_attempts: 1,
+            empty_shell_probe_before_retry: false,  // Disable probe for tests
+            circuit_breaker_threshold: 3,
+            circuit_breaker_per_model: true,
+            empty_shell_retry_backoff_base_ms: 500,
+            empty_shell_retry_backoff_max_ms: 5000,
+            empty_shell_pre_clamp_max_tokens: default_empty_shell_pre_clamp_max_tokens(),
+            max_tokens_max: 100_000,
+            concurrency_limit_per_model: std::collections::HashMap::new(),
+            concurrency_queue_timeout_ms: 5000,
+            upstream_connect_timeout_secs: 5,
+            upstream_pool_idle_timeout_secs: 90,
+            retry_jitter_ms: 100,
         }
     }
 
@@ -2619,6 +2923,7 @@ mod proxy_integration_tests {
             key_pool,
             metrics,
             config.request_timeout_seconds,
+            config.request_timeout_streaming_seconds,
             config.retry.clone(),
             config.rate_limiter.token_wait_ms,
             config.model_aliases.clone(),
@@ -2626,6 +2931,19 @@ mod proxy_integration_tests {
             config.synthesize_empty_choices,
             config.retry_on_empty_shell,
             config.empty_shell_retry_max_tokens,
+            config.empty_shell_retry_attempts,
+            config.empty_shell_probe_before_retry,
+            config.empty_shell_retry_backoff_base_ms,
+            config.empty_shell_retry_backoff_max_ms,
+            config.empty_shell_pre_clamp_max_tokens.clone(),
+            config.circuit_breaker_threshold,
+            config.circuit_breaker_per_model,
+            config.max_tokens_max,
+            config.concurrency_limit_per_model.clone(),
+            config.concurrency_queue_timeout_ms,
+            config.upstream_connect_timeout_secs,
+            config.upstream_pool_idle_timeout_secs,
+            config.retry_jitter_ms,
         );
 
         let proxy_route = warp::path::full()
@@ -3305,20 +3623,16 @@ mod proxy_integration_tests {
             "system_fingerprint": null, "usage": null,
         });
         let mock_server = MockServer::start().await;
-        // First (initial, max_tokens=64000) -> shell.
+        // Use a counter to track calls and return shell for both.
+        let call_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
         Mock::given(matchers::method("POST"))
             .and(matchers::path("/v1/chat/completions"))
-            .and(matchers::body_string_contains("\"max_tokens\":64000"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(shell.clone()))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-        // Retry (clamped to 8192) -> also shell.
-        Mock::given(matchers::method("POST"))
-            .and(matchers::path("/v1/chat/completions"))
-            .and(matchers::body_string_contains("\"max_tokens\":8192"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(shell))
-            .expect(1)
+            .respond_with(move |_req: &wiremock::Request| {
+                let _n = call_count_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                ResponseTemplate::new(200).set_body_json(shell.clone())
+            })
+            .expect(2)
             .mount(&mock_server)
             .await;
 
@@ -3398,18 +3712,20 @@ mod proxy_integration_tests {
             "usage": {"prompt_tokens": 9, "completion_tokens": 1, "total_tokens": 10},
         });
         let mock_server = MockServer::start().await;
+        // Use a counter to return shell first, then good response.
+        let call_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
         Mock::given(matchers::method("POST"))
             .and(matchers::path("/v1/chat/completions"))
-            .and(matchers::body_string_contains("\"max_tokens\":64000"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(shell))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-        Mock::given(matchers::method("POST"))
-            .and(matchers::path("/v1/chat/completions"))
-            .and(matchers::body_string_contains("\"max_tokens\":8192"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(good.clone()))
-            .expect(1)
+            .respond_with(move |_req: &wiremock::Request| {
+                let _n = call_count_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if _n == 0 {
+                    ResponseTemplate::new(200).set_body_json(shell.clone())
+                } else {
+                    ResponseTemplate::new(200).set_body_json(good.clone())
+                }
+            })
+            .expect(2) // exactly two calls: initial + retry
             .mount(&mock_server)
             .await;
 

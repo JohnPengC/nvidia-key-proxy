@@ -67,6 +67,7 @@ impl AppState {
         let key_pool = Arc::new(KeyPool::new(&config, metrics.clone()));
 
         let request_timeout = config.request_timeout_seconds;
+        let request_timeout_streaming = config.request_timeout_streaming_seconds;
         let retry_config = config.retry.clone();
         let model_aliases = config.model_aliases.clone();
         let proxy = Proxy::new(
@@ -74,6 +75,7 @@ impl AppState {
             key_pool.clone(),
             metrics.clone(),
             request_timeout,
+            request_timeout_streaming,
             retry_config,
             config.rate_limiter.token_wait_ms,
             model_aliases,
@@ -81,6 +83,19 @@ impl AppState {
             config.synthesize_empty_choices,
             config.retry_on_empty_shell,
             config.empty_shell_retry_max_tokens,
+            config.empty_shell_retry_attempts,
+            config.empty_shell_probe_before_retry,
+            config.empty_shell_retry_backoff_base_ms,
+            config.empty_shell_retry_backoff_max_ms,
+            config.empty_shell_pre_clamp_max_tokens.clone(),
+            config.circuit_breaker_threshold,
+            config.circuit_breaker_per_model,
+            config.max_tokens_max,
+            config.concurrency_limit_per_model.clone(),
+            config.concurrency_queue_timeout_ms,
+            config.upstream_connect_timeout_secs,
+            config.upstream_pool_idle_timeout_secs,
+            config.retry_jitter_ms,
         );
         let health_checker = Arc::new(HealthChecker::new(
             key_pool.clone(),
