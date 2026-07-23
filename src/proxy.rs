@@ -84,10 +84,16 @@ pub struct Proxy {
     empty_shell_probe_before_retry: bool,
     /// Per-model max_tokens ceiling for pre-clamping on first attempt.
     empty_shell_pre_clamp_max_tokens: std::collections::HashMap<String, u64>,
-    /// Circuit breaker threshold for consecutive empty-shell/504 responses.
+    /// Circuit breaker threshold for consecutive empty-shell/504/503 responses.
     circuit_breaker_threshold: u32,
     /// Whether circuit breaker tracks failures per (key, model) pair.
     circuit_breaker_per_model: bool,
+    /// Retry on 503 Service Unavailable (NVIDIA Worker local request limit reached).
+    /// When enabled, 503 responses trigger a retry against another key with
+    /// exponential backoff (uses same retry budget as 401 retries).
+    retry_on_503: bool,
+    /// Before retrying a 503 failure, probe upstream /v1/models.
+    probe_before_503_retry: bool,
     /// Max tokens ceiling for validation. Requests with max_tokens > this have
     /// the field dropped.
     max_tokens_max: u64,
@@ -946,6 +952,8 @@ impl Proxy {
         empty_shell_pre_clamp_max_tokens: std::collections::HashMap<String, u64>,
         circuit_breaker_threshold: u32,
         circuit_breaker_per_model: bool,
+        retry_on_503: bool,
+        probe_before_503_retry: bool,
         max_tokens_max: u64,
         concurrency_limit_per_model: std::collections::HashMap<String, u32>,
         concurrency_queue_timeout_ms: u64,
@@ -980,6 +988,8 @@ impl Proxy {
             empty_shell_pre_clamp_max_tokens,
             circuit_breaker_threshold,
             circuit_breaker_per_model,
+            retry_on_503,
+            probe_before_503_retry,
             max_tokens_max,
             concurrency_limit_per_model,
             concurrency_queue_timeout_ms,
@@ -2033,10 +2043,15 @@ impl Proxy {
             }
         } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS
             || status == reqwest::StatusCode::FORBIDDEN
+            || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
         {
-            // 429 and 403 are deterministic upstream decisions
-            // (rate limit / forbidden). Honor Retry-After if present, else
-            // surface the response as-is.
+            // 429, 403, and 503 are deterministic upstream decisions.
+            // For 429/403: honor Retry-After if present, else surface as-is.
+            // For 503 (Worker local total request limit reached): this is a
+            // transient capacity issue — if we have retry budget, try another key.
+            // Only 403 "Authorization failed" is an account-level ban (immediate cooldown).
+            let is_503 = status == reqwest::StatusCode::SERVICE_UNAVAILABLE;
+
             if let Some(ra) = retry_after {
                 warn!(
                     key = %mask_key(&key_str),
@@ -2046,12 +2061,43 @@ impl Proxy {
                     status.as_u16()
                 );
                 self.key_pool.mark_bad(&key_str, Some(ra)).await;
+            } else if is_503 {
+                // 503 without Retry-After: transient capacity exhaustion.
+                // If we have retry budget, switch to another key.
+                if !is_last_attempt && self.retry_on_503 {
+                    // Optional health probe before retrying
+                    if self.probe_before_503_retry {
+                        let probe_ok = self.probe_upstream_health().await;
+                        if !probe_ok {
+                            warn!(
+                                client_req_id = %client_req_id,
+                                "Upstream health probe failed before 503 retry; passing 503 through"
+                            );
+                            self.metrics.inc_error();
+                            // Fall through to deliver the 503 response
+                        } else {
+                            // Probe succeeded, proceed with retry
+                            self.key_pool
+                                .mark_failure(&key_str, self.retry_config.auth_fail_threshold)
+                                .await;
+                            return Ok(AttemptResponse::Retry);
+                        }
+                    } else {
+                        self.key_pool
+                            .mark_failure(&key_str, self.retry_config.auth_fail_threshold)
+                            .await;
+                        return Ok(AttemptResponse::Retry);
+                    }
+                }
+                warn!(
+                    key = %mask_key(&key_str),
+                    attempt_limit = self.retry_config.max_retries,
+                    "503 retry budget exhausted or retry disabled; passing through"
+                );
+                self.metrics.inc_error();
+                // Fall through: deliver this response.
             } else {
-                // 403 "Authorization failed" is an account/region-level ban,
-                // not a transient hiccup — cool the key immediately rather
-                // than waiting for `auth_fail_threshold` failures to accrue.
-                // 429 without Retry-After, and other 403 variants, still use
-                // `mark_failure` (decrease weight, disable after threshold).
+                // 429/403 without Retry-After
                 let body_str = std::str::from_utf8(&body_bytes).unwrap_or("");
                 let is_auth_ban = status == reqwest::StatusCode::FORBIDDEN
                     && body_str.contains("Authorization failed");
@@ -2069,7 +2115,6 @@ impl Proxy {
                         "Upstream {} without Retry-After; decreasing weight, may disable after repeated failures",
                         status.as_u16()
                     );
-                    // Record failure and potentially disable the key after threshold.
                     self.key_pool
                         .mark_failure(&key_str, self.retry_config.auth_fail_threshold)
                         .await;
@@ -2081,10 +2126,11 @@ impl Proxy {
             self.metrics.inc_error();
         }
 
-        // ── Circuit breaker for empty-shell/504 responses ─────────────────
+        // ── Circuit breaker for empty-shell/504/503 responses ─────────────────
         // Track consecutive empty-shell soft failures (200 with usage:null)
-        // and 504 gateway timeouts per key. When the threshold is reached,
-        // cool the key to prevent repeated retries into a degraded endpoint.
+        // and 504 gateway timeouts / 503 service unavailable per key.
+        // When the threshold is reached, cool the key to prevent repeated
+        // retries into a degraded endpoint.
         if status == reqwest::StatusCode::OK {
             // Check if this was an empty-shell response (logged earlier in
             // handle_empty_shell_failure). The failure log already captures it,
@@ -2092,8 +2138,12 @@ impl Proxy {
             // Note: We only get here for 2xx responses that weren't handled
             // by the success path (e.g., empty-shell that went through
             // handle_empty_shell_failure and returned 502).
-        } else if status == reqwest::StatusCode::GATEWAY_TIMEOUT {
-            // 504 - count toward circuit breaker (per model if configured)
+        } else if status == reqwest::StatusCode::GATEWAY_TIMEOUT
+            || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+        {
+            // 504 (Gateway Timeout) or 503 (Service Unavailable: Worker local
+            // total request limit reached) - count toward circuit breaker
+            // (per model if configured)
             if self.circuit_breaker_threshold > 0 {
                 let cb_model = if self.circuit_breaker_per_model { model } else { "global" };
                 self.key_pool.increment_circuit_breaker(&key_str, cb_model, self.circuit_breaker_threshold).await;
@@ -2102,7 +2152,8 @@ impl Proxy {
                         key = %mask_key(&key_str),
                         model = %model,
                         threshold = self.circuit_breaker_threshold,
-                        "Circuit breaker triggered: too many consecutive 504/empty-shell responses; cooling key"
+                        status = %status.as_u16(),
+                        "Circuit breaker triggered: too many consecutive 503/504/empty-shell responses; cooling key"
                     );
                     self.key_pool.mark_bad(&key_str, None).await;
                     self.metrics.inc_circuit_breaker_triggered();
@@ -2903,6 +2954,8 @@ use crate::config::default_empty_shell_pre_clamp_max_tokens;
             empty_shell_probe_before_retry: false,  // Disable probe for tests
             circuit_breaker_threshold: 3,
             circuit_breaker_per_model: true,
+            retry_on_503: true,
+            probe_before_503_retry: false,  // Disable probe for tests
             empty_shell_retry_backoff_base_ms: 500,
             empty_shell_retry_backoff_max_ms: 5000,
             empty_shell_pre_clamp_max_tokens: default_empty_shell_pre_clamp_max_tokens(),
@@ -2938,6 +2991,8 @@ use crate::config::default_empty_shell_pre_clamp_max_tokens;
             config.empty_shell_pre_clamp_max_tokens.clone(),
             config.circuit_breaker_threshold,
             config.circuit_breaker_per_model,
+            config.retry_on_503,
+            config.probe_before_503_retry,
             config.max_tokens_max,
             config.concurrency_limit_per_model.clone(),
             config.concurrency_queue_timeout_ms,

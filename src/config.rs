@@ -105,6 +105,19 @@ pub struct Config {
     #[serde(default = "default_circuit_breaker_per_model")]
     pub circuit_breaker_per_model: bool,
 
+    /// Retry on 503 Service Unavailable (NVIDIA Worker local request limit reached).
+    /// When enabled, 503 responses trigger a retry against another key with
+    /// exponential backoff (uses same retry budget as 401 retries).
+    /// Default true. Override via `NVIDIA_RETRY_ON_503`.
+    #[serde(default = "default_retry_on_503")]
+    pub retry_on_503: bool,
+
+    /// Before retrying a 503 failure, do a lightweight health probe
+    /// against /v1/models to avoid retrying into a degraded upstream.
+    /// Default true. Override via `NVIDIA_PROBE_BEFORE_503_RETRY`.
+    #[serde(default = "default_probe_before_503_retry")]
+    pub probe_before_503_retry: bool,
+
     /// Number of retry attempts for empty-shell soft failures.
     /// 2 = original + two retries. 0 = no retry (falls back to 502).
     /// Default 2. Override via `NVIDIA_EMPTY_SHELL_RETRY_ATTEMPTS`.
@@ -227,6 +240,14 @@ fn default_circuit_breaker_threshold() -> u32 {
 }
 
 fn default_circuit_breaker_per_model() -> bool {
+    true
+}
+
+fn default_retry_on_503() -> bool {
+    true
+}
+
+fn default_probe_before_503_retry() -> bool {
     true
 }
 
@@ -505,6 +526,8 @@ impl Config {
             empty_shell_pre_clamp_max_tokens: default_empty_shell_pre_clamp_max_tokens(),
             circuit_breaker_threshold: default_circuit_breaker_threshold(),
             circuit_breaker_per_model: default_circuit_breaker_per_model(),
+            retry_on_503: default_retry_on_503(),
+            probe_before_503_retry: default_probe_before_503_retry(),
             max_tokens_max: default_max_tokens_max(),
             concurrency_limit_per_model: std::collections::HashMap::new(),
             concurrency_queue_timeout_ms: default_concurrency_queue_timeout_ms(),
@@ -819,6 +842,16 @@ impl Config {
                         config.max_tokens_max = v;
                     }
                 }
+                "retry_on_503" => {
+                    if let Ok(v) = value.parse::<bool>() {
+                        config.retry_on_503 = v;
+                    }
+                }
+                "probe_before_503_retry" => {
+                    if let Ok(v) = value.parse::<bool>() {
+                        config.probe_before_503_retry = v;
+                    }
+                }
                 "request_timeout_streaming_seconds" => {
                     if let Ok(v) = value.parse::<u64>() {
                         config.request_timeout_streaming_seconds = v;
@@ -901,6 +934,8 @@ mod config_validation_tests {
             empty_shell_pre_clamp_max_tokens: default_empty_shell_pre_clamp_max_tokens(),
             circuit_breaker_threshold: 3,
             circuit_breaker_per_model: true,
+            retry_on_503: true,
+            probe_before_503_retry: true,
             max_tokens_max: 100_000,
             concurrency_limit_per_model: std::collections::HashMap::new(),
             concurrency_queue_timeout_ms: 5000,

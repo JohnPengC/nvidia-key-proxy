@@ -90,6 +90,8 @@ impl AppState {
             config.empty_shell_pre_clamp_max_tokens.clone(),
             config.circuit_breaker_threshold,
             config.circuit_breaker_per_model,
+            config.retry_on_503,
+            config.probe_before_503_retry,
             config.max_tokens_max,
             config.concurrency_limit_per_model.clone(),
             config.concurrency_queue_timeout_ms,
