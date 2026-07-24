@@ -92,6 +92,7 @@ impl AppState {
             config.circuit_breaker_per_model,
             config.retry_on_503,
             config.probe_before_503_retry,
+            config.retry_on_500,
             config.max_tokens_max,
             config.concurrency_limit_per_model.clone(),
             config.concurrency_queue_timeout_ms,

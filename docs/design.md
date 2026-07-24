@@ -156,9 +156,11 @@ request_timeout_seconds = 600
 # disable via NVIDIA_RETRY_ON_EMPTY_SHELL=false.
 retry_on_empty_shell = true
 
-# max_tokens used for that single post-shell retry (the original request is
-# forwarded unchanged first). 8192 is conservative across GLM-family models on
-# build.integrate. Env override: NVIDIA_EMPTY_SHELL_RETRY_MAX_TOKENS.
+# max_tokens used for the post-shell retry. The first upstream call may itself
+# be pre-clamped (see `empty_shell_pre_clamp_max_tokens` below) so the budget
+# fits without burning a round-trip into a guaranteed shell. 8192 is
+# conservative across GLM-family models on build.integrate.
+# Env override: NVIDIA_EMPTY_SHELL_RETRY_MAX_TOKENS.
 empty_shell_retry_max_tokens = 8192
 
 # Number of retry attempts for empty-shell soft failures.
@@ -174,13 +176,24 @@ empty_shell_retry_backoff_base_ms = 500
 # Default 5000. Env override: NVIDIA_EMPTY_SHELL_RETRY_BACKOFF_MAX_MS.
 empty_shell_retry_backoff_max_ms = 5000
 
-# Per-model max_tokens ceiling for pre-clamping on first attempt.
-# When a request targets a model in this map and max_tokens exceeds
-# the ceiling, the proxy clamps it before the first upstream call.
-# Reduces empty-shell occurrences for known problematic models.
-# Default includes z-ai/glm-5.2 → 32000.
+# Per-model max_tokens ceiling for pre-clamping on the *first* upstream call.
+# When a request targets a model in this map and max_tokens exceeds the
+# ceiling, the proxy clamps it before the request goes out — for every
+# request, streaming included. NVIDIA's GLM-class models return an HTTP-200
+# "empty-shell" body (choices:[], usage:null) when `prompt + max_tokens`
+# exceeds the remaining context budget; clamping at the entrance makes the
+# budget fit so inference actually runs, instead of burning a round-trip into
+# a guaranteed shell. Default includes z-ai/glm-5.2 → 32000.
 # Override via NVIDIA_EMPTY_SHELL_PRE_CLAMP_MAX_TOKENS (JSON map).
 empty_shell_pre_clamp_max_tokens = { "z-ai/glm-5.2" = 32000 }
+
+# Retry on 500 Internal Server Error. GLM-class models intermittently return
+# {"message":"Failed to generate completions","type":"Internal Server Error","code":500}
+# as a transient per-request worker failure — the same prompt typically succeeds
+# on another key seconds later. When enabled, 500 triggers a retry against
+# another key using the same backoff/retry budget as 401/503. Default true.
+# Env override: NVIDIA_RETRY_ON_500.
+retry_on_500 = true
 
 # Optional: before retrying an empty-shell failure, do a lightweight health
 # probe against /v1/models to avoid retrying into a degraded upstream.
@@ -249,9 +262,9 @@ Analysis of `failure.log` revealed four dominant error classes. All are addresse
 
 | Category | Count | Root Cause | Fix |
 |---|---|---|---|
-| `empty_choices_shell_first` | ~30% | NVIDIA returns 200 with `choices:[]`, `usage:null`, `id:""` — no inference ran. | **Retry with clamped `max_tokens`** (config `empty_shell_retry_max_tokens`, default 8192). Optional upstream health probe before retry (`empty_shell_probe_before_retry`). Configurable attempts (`empty_shell_retry_attempts`, default 2). Exponential backoff between retries (`empty_shell_retry_backoff_base_ms` / `..._max_ms`). Per-model pre‑clamp on first attempt (`empty_shell_pre_clamp_max_tokens`, default GLM‑5.2 → 32000). Per‑model circuit breaker (`circuit_breaker_per_model`, default true). Surfaces actionable 502 instead of misleading "summarization produced empty response". |
+| `empty_choices_shell_first` | ~30% | NVIDIA returns 200 with `choices:[]`, `usage:null`, `id:""` — no inference ran. | **Pre-clamp `max_tokens` on the first upstream call** (per-model, `empty_shell_pre_clamp_max_tokens`, default GLM‑5.2 → 32000; covers streaming) so the `prompt + max_tokens` budget fits. If a shell still returns, **retry with `max_tokens` clamped to `empty_shell_retry_max_tokens`** (default 8192) — configurable attempts (`empty_shell_retry_attempts`, default 2), exponential backoff (`empty_shell_retry_backoff_base_ms` / `..._max_ms`), optional upstream health probe before retry (`empty_shell_probe_before_retry`). Per‑model circuit breaker (`circuit_breaker_per_model`, default true). Surfaces actionable 502 instead of misleading "summarization produced empty response". |
 | `timeout` | ~15% | 300s hard timeout too short for long-context non-streaming. | **Default `request_timeout_seconds` raised to 600s**. Streaming requests bypass this entirely. New `request_timeout_streaming_seconds` for separate streaming timeout. Warn threshold raised to 30s. |
-| `upstream_5xx` (504/503) | ~10% | Gateway timeout on streaming / resource exhausted. | Client `connect_timeout` (5s) unchanged; per-request timeout now only for non-streaming. Streaming path unbounded by default. |
+| `upstream_5xx` (504/503/500) | ~10% | Gateway timeout / resource exhausted / transient `{"message":"Failed to generate completions"}` 500. | Client `connect_timeout` (5s) unchanged; per-request timeout now only for non-streaming. Streaming path unbounded by default. **503 retries** another key with backoff (`retry_on_503`, default true, optional `probe_before_503_retry`). **500 retries** another key with the same backoff/retry budget (`retry_on_500`, default true) — GLM 500s are transient per-request failures, not deterministic bans. |
 | `upstream_4xx` (400 `max_tokens < 1`) | ~2% | Client-computed `max_tokens` underflow (large context + reserved tokens). | **Proxy drops invalid `max_tokens`** (≤0, >100k, non-numeric). Ceiling configurable via `max_tokens_max` (default 100_000) or `MAX_TOKENS_MAX` env. |
 
 ### Future Enhancements

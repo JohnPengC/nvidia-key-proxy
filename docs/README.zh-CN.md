@@ -94,10 +94,26 @@
    # 默认 true。环境变量：NVIDIA_EMPTY_SHELL_PROBE_BEFORE_RETRY。
    # empty_shell_probe_before_retry = true
 
+   # 可选：逐模型 max_tokens 首轮预夹紧上限。请求命中此表时，代理在
+   # 首次发往上游前就把 max_tokens 夹紧到该上限——对所有请求生效，
+   # 包括流式。NVIDIA GLM 系模型在 `prompt + max_tokens` 超出剩余
+   # 上下文预算时会返回 200 的"空壳"body；在入口预夹紧让预算够用，
+   # 推理真正跑起来，而不是白白浪费一个往返换来必发的空壳。
+   # 默认含 z-ai/glm-5.2 → 32000。
+   # 环境变量：NVIDIA_EMPTY_SHELL_PRE_CLAMP_MAX_TOKENS（JSON map）。
+   # empty_shell_pre_clamp_max_tokens = { "z-ai/glm-5.2" = 32000 }
+
    # 可选：熔断阈值。同一 key/model 连续 N 次 empty-shell/504 后，
    # 该 key 冷却 cooldown.base_seconds。0 = 禁用。默认 3。
    # 环境变量：NVIDIA_CIRCUIT_BREAKER_THRESHOLD。
    # circuit_breaker_threshold = 3
+
+   # 500 Internal Server Error 重试。GLM 系模型会偶发返回
+   # {"message":"Failed to generate completions",...} 作为瞬时单请求 worker
+   # 失败（同一 prompt 通常在换 key 几秒后成功）。开启时，500 会换 key
+   # 重试，沿用 401/503 同一套退避与重试预算。默认 true。
+   # 环境变量：NVIDIA_RETRY_ON_500。
+   # retry_on_500 = true
 
    [observability]
    enable_metrics = true
@@ -127,8 +143,11 @@
 | `empty_shell_retry_max_tokens` | empty-shell 重试时的 max_tokens 夹紧值 | `8192` |
 | `empty_shell_retry_attempts` | empty-shell 重试次数（0 = 不重试） | `1` |
 | `empty_shell_probe_before_retry` | 重试前探测 /v1/models | `true` |
+| `empty_shell_pre_clamp_max_tokens` | 逐模型 max_tokens 上限，在首次发往上游前夹紧（含流式） | `{"z-ai/glm-5.2": 32000, "nvidia/nemotron-3-ultra-550b-a55b": 8192}` |
 | `circuit_breaker_threshold` | 连续 shell/504 多少次后冷却（0 = 禁用） | `3` |
 | `max_tokens_max` | max_tokens 校验上限；超出则丢弃字段 | `100_000` |
+| `retry_on_503` | 503（Worker 资源耗尽）换 key 重试 | `true` |
+| `retry_on_500` | 500 `Failed to generate completions` 换 key 重试 | `true` |
 | `allow_local_base_url` | 允许 loopback/localhost base_url（仅测试） | `false` |
 | `auth` | 前门+管理鉴权配置（见下） | 禁用 |
 
@@ -185,9 +204,9 @@
 
 | 错误类别 | 占比 | 根因 | 修复 |
 |---|---|---|---|
-| `empty_choices_shell_first` | 41.9% | NVIDIA 返回 200 但 `choices:[]`、`usage:null`、`id:""` —— 未跑推理。 | **重试并夹紧 `max_tokens`**（配置 `empty_shell_retry_max_tokens`，默认 8192）。重试前可选探测上游 `/v1/models`（`empty_shell_probe_before_retry`）。可配置重试次数（`empty_shell_retry_attempts`，默认 1）。返回可行动的 502，而非误导性的 "summarization produced empty response"。 |
+| `empty_choices_shell_first` | 41.9% | NVIDIA 返回 200 但 `choices:[]`、`usage:null`、`id:""` —— 未跑推理。 | **在首次发往上游前预夹紧 `max_tokens`**（逐模型 `empty_shell_pre_clamp_max_tokens`，默认 GLM-5.2 → 32000；含流式），让 `prompt + max_tokens` 预算够用。若仍返回空壳，则**重试并夹紧到 `empty_shell_retry_max_tokens`**（默认 8192），重试前可选探测上游（`empty_shell_probe_before_retry`），次数可配（`empty_shell_retry_attempts`，默认 1）。返回可行动的 502，而非误导性的 "summarization produced empty response"。 |
 | `timeout` | 37.2% | 300s 硬超时对长上下文非流式太短。 | **默认 `request_timeout_seconds` 提升至 600s**。流式请求完全绕过。新增 `request_timeout_streaming_seconds` 单独配置流式超时。警告阈值提至 30s。 |
-| `upstream_5xx` (504) | 14.0% | 流式网关超时。 | Client `connect_timeout` (5s) 不变；请求级超时仅对非流式生效。流式路径默认无界。 |
+| `upstream_5xx` (503/504/500) | 14.0% | 流式网关超时 / 资源耗尽 / 瞬时 `{"message":"Failed to generate completions"}` 500。 | Client `connect_timeout` (5s) 不变；请求级超时仅对非流式生效。流式路径默认无界。**503** 换 key 退避重试（`retry_on_503`，默认 true，可选 `probe_before_503_retry`）。**500** 同套退避/预算换 key 重试（`retry_on_500`，默认 true）——GLM 的 500 是瞬时单请求失败，并非确定性封禁。 |
 | `upstream_4xx` (400 `max_tokens < 1`) | 2.3% | 客户端计算 `max_tokens` 下溢（大上下文 + 预留 token）。 | **代理丢弃无效 `max_tokens`**（≤0、>100k、非数值）。上限可配置 `max_tokens_max`（默认 100_000）或 `MAX_TOKENS_MAX` 环境变量。 |
 
 ## 请求校验

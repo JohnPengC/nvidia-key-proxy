@@ -28,10 +28,25 @@ synthesize_empty_choices = true
 # disable via NVIDIA_RETRY_ON_EMPTY_SHELL=false.
 retry_on_empty_shell = true
 
-# max_tokens used for that single post-shell retry (the original request is
-# forwarded unchanged first). 8192 is conservative across GLM-family models on
-# build.integrate. Env override: NVIDIA_EMPTY_SHELL_RETRY_MAX_TOKENS.
+# max_tokens used for the post-shell retry. The first upstream call may itself
+# be pre-clamped by `empty_shell_pre_clamp_max_tokens` (below) so the budget
+# fits without burning a round-trip into a guaranteed shell. 8192 is
+# conservative across GLM-family models on build.integrate.
+# Env override: NVIDIA_EMPTY_SHELL_RETRY_MAX_TOKENS.
 empty_shell_retry_max_tokens = 8192
+
+# Per-model max_tokens ceiling clamped on the *first* upstream call (streaming
+# included). NVIDIA's GLM-class models return a 200 "empty-shell" body when
+# `prompt + max_tokens` exceeds the remaining context budget; clamping at the
+# entrance makes the budget fit so inference actually runs. Optional, empty =
+# no pre-clamp. Default includes z-ai/glm-5.2 → 32000.
+# Override via NVIDIA_EMPTY_SHELL_PRE_CLAMP_MAX_TOKENS (JSON map).
+# empty_shell_pre_clamp_max_tokens = { "z-ai/glm-5.2" = 32000 }
+
+# Retry 500 Internal Server Error (transient GLM "Failed to generate
+# completions") against another key with backoff. Default true.
+# Env override: NVIDIA_RETRY_ON_500.
+# retry_on_500 = true
 
 # API keys – can also be set via NVIDIA_KEYS env var (comma-separated)
 keys = [

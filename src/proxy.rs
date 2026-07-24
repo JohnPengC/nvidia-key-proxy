@@ -94,6 +94,11 @@ pub struct Proxy {
     retry_on_503: bool,
     /// Before retrying a 503 failure, probe upstream /v1/models.
     probe_before_503_retry: bool,
+    /// Retry on 500 Internal Server Error (GLM "Failed to generate
+    /// completions" transient per-request worker failure). Mirrors
+    /// `retry_on_503`: retry against another key with backoff when budget
+    /// remains.
+    retry_on_500: bool,
     /// Max tokens ceiling for validation. Requests with max_tokens > this have
     /// the field dropped.
     max_tokens_max: u64,
@@ -954,6 +959,7 @@ impl Proxy {
         circuit_breaker_per_model: bool,
         retry_on_503: bool,
         probe_before_503_retry: bool,
+        retry_on_500: bool,
         max_tokens_max: u64,
         concurrency_limit_per_model: std::collections::HashMap<String, u32>,
         concurrency_queue_timeout_ms: u64,
@@ -990,6 +996,7 @@ impl Proxy {
             circuit_breaker_per_model,
             retry_on_503,
             probe_before_503_retry,
+            retry_on_500,
             max_tokens_max,
             concurrency_limit_per_model,
             concurrency_queue_timeout_ms,
@@ -1403,6 +1410,48 @@ impl Proxy {
                 }
             }
 
+            // Pre-clamp max_tokens on the *first* upstream attempt for models
+            // listed in `empty_shell_pre_clamp_max_tokens`. NVIDIA's GLM-class
+            // models return an HTTP-200 "empty-shell" body (choices:[],
+            // usage:null — no inference ran) when `prompt + max_tokens` exceeds
+            // the model's remaining context budget, instead of a clean 400.
+            // Clamping `max_tokens` before the request goes out makes the
+            // budget fit so inference actually runs, instead of burning one
+            // round-trip into a guaranteed shell and then retrying.
+            //
+            // This runs for *every* request — streaming included. Streaming
+            // empty-shells and the 400 "context length exceeded" we saw in
+            // failure.log both came from streaming requests whose max_tokens
+            // (64000+) left no room for output once the ~100K-token prompt was
+            // counted in; pre-clamping at the entrance closes that path.
+            // Post-shell retry-clamping (`handle_empty_shell_failure`) still
+            // runs as a backstop for requests that shell despite this.
+            if let Some(target) = obj
+                .get("model")
+                .and_then(|m| m.as_str())
+                .and_then(|m| self.empty_shell_pre_clamp_max_tokens.get(m).copied())
+            {
+                let current = obj.get("max_tokens").and_then(|n| match n {
+                    serde_json::Value::Number(num) => num.as_u64(),
+                    serde_json::Value::String(s) => s.parse::<u64>().ok(),
+                    _ => None,
+                });
+                if let Some(cur) = current {
+                    if cur > target {
+                        info!(
+                            client_req_id = %client_req_id,
+                            max_tokens_before = cur,
+                            max_tokens_after = target,
+                            "Pre-clamping max_tokens to fit model context budget",
+                        );
+                        obj.insert(
+                            "max_tokens".to_string(),
+                            serde_json::Value::Number(serde_json::Number::from(target)),
+                        );
+                    }
+                }
+            }
+
             // stream_options.include_usage injection (streaming token usage):
             // NVIDIA/OpenAI only emit `usage` at the end of an SSE stream when
             // the request carries `stream_options.include_usage: true`. Inject
@@ -1657,7 +1706,8 @@ impl Proxy {
                     return Ok(resp);
                 }
                 Ok(AttemptResponse::Retry) => {
-                    // 401 without Retry-After: caller still has retry budget.
+                    // Retryable upstream status (401 without Retry-After, 503,
+                    // or 500) — caller still has retry budget.
                     if attempt < self.retry_config.max_retries {
                         if let Some(next) = self.key_pool.acquire().await {
                             let will_retry_again = attempt + 1 < self.retry_config.max_retries;
@@ -1673,7 +1723,7 @@ impl Proxy {
                                 warn!("Token starved on retry key; giving up");
                                 self.metrics.inc_error();
                                 return Err(warp::reject::custom(BadGateway {
-                                    msg: "Upstream 401".into(),
+                                    msg: "Upstream retry failed".into(),
                                 }));
                             }
                             attempt += 1;
@@ -1683,17 +1733,17 @@ impl Proxy {
                             warn!(
                                 client_req_id = %client_req_id,
                                 attempt = attempt,
-                                "Retrying after upstream 401 with a different key"
+                                "Retrying upstream attempt with a different key"
                             );
                             continue;
                         }
-                        warn!(client_req_id = %client_req_id, attempt = attempt, "No other keys available; passing 401 through");
+                        warn!(client_req_id = %client_req_id, attempt = attempt, "No other keys available; surfacing retryable error");
                     }
                     // Defensive fallback (helper should have returned Done on last attempt).
                     key_handle.dec_in_flight();
                     self.metrics.inc_error();
                     return Err(warp::reject::custom(BadGateway {
-                        msg: "Upstream 401".into(),
+                        msg: "Upstream retryable error".into(),
                     }));
                 }
                 Err(AttemptError::Network(e)) => {
@@ -2041,6 +2091,34 @@ impl Proxy {
                 self.metrics.inc_error();
                 // Fall through: deliver this response.
             }
+        } else if status == reqwest::StatusCode::INTERNAL_SERVER_ERROR {
+            // 500 from NVIDIA/GLM-class models (`{"message":"Failed to
+            // generate completions",...}`) is a transient per-request worker
+            // failure — observed in failure.log for z-ai/glm-5.2, same prompt
+            // succeeding seconds later on another key. Retry against another
+            // key (mirrors the 503 path) when budget remains and retry_on_500
+            // is enabled. No Retry-After honored here because NVIDIA's 500
+            // carries none; mark the key down-weighted rather than bad.
+            if !is_last_attempt && self.retry_on_500 {
+                self.key_pool
+                    .mark_failure(&key_str, self.retry_config.auth_fail_threshold)
+                    .await;
+                warn!(
+                    client_req_id = %client_req_id,
+                    key = %mask_key(&key_str),
+                    status = %status,
+                    "Upstream 500 (Failed to generate completions); retrying on another key"
+                );
+                self.metrics.inc_error();
+                return Ok(AttemptResponse::Retry);
+            }
+            warn!(
+                key = %mask_key(&key_str),
+                attempt_limit = self.retry_config.max_retries,
+                "500 retry budget exhausted or retry disabled; passing through"
+            );
+            self.metrics.inc_error();
+            // Fall through: deliver this response.
         } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS
             || status == reqwest::StatusCode::FORBIDDEN
             || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
@@ -2488,9 +2566,9 @@ async fn handle_passthrough_stream(
             && retry_attempt_already_done < self.empty_shell_retry_attempts
             && retry_attempt_already_done + 1 < self.retry_config.max_retries;
 
-        // Apply pre-clamp: if this is the first attempt (retry_attempt_already_done == 0)
-        // and we have a pre-clamp for this model, use it.
-        let pre_clamp_max = self.empty_shell_pre_clamp_max_tokens.get(model).copied();
+        // Pre-clamp is applied to the *first* upstream call in
+        // `forward_upstream`, not here on the retry. See the retry-budget
+        // comment below for why the retry uses `empty_shell_retry_max_tokens`.
 
         // Optional: probe upstream health before retrying to avoid retrying into
         // a degraded endpoint.
@@ -2593,13 +2671,15 @@ async fn handle_passthrough_stream(
             // Metrics for retry attempt
             self.metrics.inc_empty_shell_retry_attempts_total(model);
 
-            // Determine max_tokens for this retry: use pre-clamp if available and first retry,
-            // otherwise use the configured empty_shell_retry_max_tokens
-            let retry_max_tokens = if retry_attempt_already_done == 0 {
-                pre_clamp_max.unwrap_or(self.empty_shell_retry_max_tokens)
-            } else {
-                self.empty_shell_retry_max_tokens
-            };
+            // Determine max_tokens for this retry. The first upstream call
+            // already had pre-clamp applied (see `forward_upstream`), so when
+            // it still shelled every retry drops straight to the configured
+            // `empty_shell_retry_max_tokens` (8192) — re-applying the same
+            // pre-clamp ceiling would just reproduce the shell that already
+            // failed. When pre-clamping isn't configured for this model the
+            // original max_tokens is whatever the client sent, so this first
+            // clamp is what introduces the budget reduction.
+            let retry_max_tokens = self.empty_shell_retry_max_tokens;
 
             let clamped = clamp_max_tokens(request_body, retry_max_tokens);
             let retry_body: bytes::Bytes = clamped.into();
@@ -2956,6 +3036,7 @@ use crate::config::default_empty_shell_pre_clamp_max_tokens;
             circuit_breaker_per_model: true,
             retry_on_503: true,
             probe_before_503_retry: false,  // Disable probe for tests
+            retry_on_500: true,
             empty_shell_retry_backoff_base_ms: 500,
             empty_shell_retry_backoff_max_ms: 5000,
             empty_shell_pre_clamp_max_tokens: default_empty_shell_pre_clamp_max_tokens(),
@@ -2993,6 +3074,7 @@ use crate::config::default_empty_shell_pre_clamp_max_tokens;
             config.circuit_breaker_per_model,
             config.retry_on_503,
             config.probe_before_503_retry,
+            config.retry_on_500,
             config.max_tokens_max,
             config.concurrency_limit_per_model.clone(),
             config.concurrency_queue_timeout_ms,
@@ -3206,6 +3288,122 @@ use crate::config::default_empty_shell_pre_clamp_max_tokens;
             .unwrap();
 
         assert_eq!(resp.status(), 401);
+    }
+
+    /// A 500 "Failed to generate completions" from the upstream should be
+    /// retried (when `retry_on_500` is on) and succeed once the retry returns
+    /// a normal completion. Mirrors the 401 retry test but asserts the
+    /// retry-then-recover path for NVIDIA's transient GLM 500.
+    #[tokio::test]
+    async fn internal_500_retries_then_succeeds() {
+        let mock_server = MockServer::start().await;
+        let shell_seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let shell_seen_c = shell_seen.clone();
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/v1/chat/completions"))
+            .respond_with(move |_req: &wiremock::Request| {
+                let n = shell_seen_c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n == 0 {
+                    // First attempt: transient 500.
+                    ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                        "message": "Failed to generate completions",
+                        "type": "Internal Server Error",
+                        "code": 500,
+                    }))
+                } else {
+                    // Retry: a normal non-empty completion.
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "id": "cc-500",
+                        "object": "chat.completion",
+                        "model": "z-ai/glm-5.2",
+                        "created": 1,
+                        "choices": [{
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "ok"},
+                            "finish_reason": "stop",
+                        }],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
+                    }))
+                }
+            })
+            .expect(2)
+            .mount(&mock_server)
+            .await;
+
+        let addr = start_proxy(test_config(&mock_server.uri(), 3, 60)).await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://{}/v1/chat/completions", addr))
+            .header("content-type", "application/json")
+            .body(r#"{"model":"z-ai/glm-5.2","messages":[{"role":"user","content":"hi"}],"stream":false}"#)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            200,
+            "500 should have been retried to a successful completion"
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["id"].as_str(), Some("cc-500"));
+        assert_eq!(
+            shell_seen.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "exactly two upstream calls (initial 500 + retry 200)"
+        );
+    }
+
+    /// A streaming request to a model in `empty_shell_pre_clamp_max_tokens`
+    /// with `max_tokens` above the ceiling must be clamped *before* the first
+    /// upstream call — proving the pre-clamp path now covers streaming,
+    /// not just the post-shell retry. We assert the upstream body carries the
+    /// clamped value (32000), not the client's 64000.
+    #[tokio::test]
+    async fn pre_clamp_applies_to_streaming_first_call() {
+        let mock_server = MockServer::start().await;
+        let seen_mt = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
+        let seen_mt_c = seen_mt.clone();
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/v1/chat/completions"))
+            .respond_with(move |req: &wiremock::Request| {
+                // Parse the posted body to record the max_tokens NVIDIA sees.
+                let raw = std::str::from_utf8(&req.body).unwrap_or("");
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) {
+                    if let Some(mt) = v.get("max_tokens").and_then(|x| x.as_u64()) {
+                        seen_mt_c.lock().unwrap().push(mt);
+                    }
+                }
+                // A normal streaming response so the request completes.
+                ResponseTemplate::new(200).insert_header("content-type", "text/event-stream")
+                    .set_body_string("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n")
+            })
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let addr = start_proxy(test_config(&mock_server.uri(), 3, 60)).await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://{}/v1/chat/completions", addr))
+            .header("content-type", "application/json")
+            .body(r#"{"model":"z-ai/glm-5.2","max_tokens":64000,"messages":[{"role":"user","content":"hi"}],"stream":true}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        // Drain the SSE stream so the upstream worker is released.
+        use futures_util::StreamExt;
+        let mut s = resp.bytes_stream();
+        while let Some(_c) = s.next().await {}
+
+        let observed = seen_mt.lock().unwrap().clone();
+        assert_eq!(
+            observed,
+            vec![32000],
+            "streaming first call max_tokens should be pre-clamped 64000 -> 32000, got {:?}",
+            observed
+        );
     }
 
     #[tokio::test]
@@ -3730,12 +3928,16 @@ use crate::config::default_empty_shell_pre_clamp_max_tokens;
             "retry.outcome should report the shell, got: {body}"
         );
         // Request fingerprint and upstream shell structured in the error.
+        // The first upstream call was pre-clamped (glm-5.2 → 32000) before it
+        // went out, so the fingerprint records the *clamped* 32000, not the
+        // client's original 64000 — the whole point of pre-clamp is to avoid
+        // the shell ever happening; when it still does, the retry drops to 8192.
         let req_fp = body["error"]["request_fingerprint"]
             .as_str()
             .unwrap_or("");
         assert!(
-            req_fp.contains("max_tokens=64000") && req_fp.contains("messages=0"),
-            "request_fingerprint should capture the request's max_tokens + message count, got: {req_fp}"
+            req_fp.contains("max_tokens=32000") && req_fp.contains("messages=0"),
+            "request_fingerprint should capture the pre-clamped max_tokens + message count, got: {req_fp}"
         );
         assert_eq!(
             body["error"]["upstream_shell"]["status"].as_u64(),

@@ -55,6 +55,7 @@ fn test_config() -> Config {
         circuit_breaker_per_model: true,
         retry_on_503: true,
         probe_before_503_retry: true,
+        retry_on_500: true,
         max_tokens_max: 100_000,
         concurrency_limit_per_model: std::collections::HashMap::new(),
         concurrency_queue_timeout_ms: 5000,

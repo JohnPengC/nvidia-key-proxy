@@ -118,6 +118,16 @@ pub struct Config {
     #[serde(default = "default_probe_before_503_retry")]
     pub probe_before_503_retry: bool,
 
+    /// Retry on 500 Internal Server Error. NVIDIA/GLM-class models
+    /// intermittently return `{"message":"Failed to generate
+    /// completions","type":"Internal Server Error","code":500}` — a
+    /// transient per-request worker failure (same prompt succeeds on the
+    /// next key seconds later). When enabled, 500 responses trigger a
+    /// retry against another key using the same retry budget as 401/503.
+    /// Default true. Override via `NVIDIA_RETRY_ON_500`.
+    #[serde(default = "default_retry_on_500")]
+    pub retry_on_500: bool,
+
     /// Number of retry attempts for empty-shell soft failures.
     /// 2 = original + two retries. 0 = no retry (falls back to 502).
     /// Default 2. Override via `NVIDIA_EMPTY_SHELL_RETRY_ATTEMPTS`.
@@ -248,6 +258,10 @@ fn default_retry_on_503() -> bool {
 }
 
 fn default_probe_before_503_retry() -> bool {
+    true
+}
+
+fn default_retry_on_500() -> bool {
     true
 }
 
@@ -528,6 +542,7 @@ impl Config {
             circuit_breaker_per_model: default_circuit_breaker_per_model(),
             retry_on_503: default_retry_on_503(),
             probe_before_503_retry: default_probe_before_503_retry(),
+            retry_on_500: default_retry_on_500(),
             max_tokens_max: default_max_tokens_max(),
             concurrency_limit_per_model: std::collections::HashMap::new(),
             concurrency_queue_timeout_ms: default_concurrency_queue_timeout_ms(),
@@ -852,6 +867,11 @@ impl Config {
                         config.probe_before_503_retry = v;
                     }
                 }
+                "retry_on_500" => {
+                    if let Ok(v) = value.parse::<bool>() {
+                        config.retry_on_500 = v;
+                    }
+                }
                 "request_timeout_streaming_seconds" => {
                     if let Ok(v) = value.parse::<u64>() {
                         config.request_timeout_streaming_seconds = v;
@@ -936,6 +956,7 @@ mod config_validation_tests {
             circuit_breaker_per_model: true,
             retry_on_503: true,
             probe_before_503_retry: true,
+            retry_on_500: true,
             max_tokens_max: 100_000,
             concurrency_limit_per_model: std::collections::HashMap::new(),
             concurrency_queue_timeout_ms: 5000,
