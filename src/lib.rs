@@ -88,6 +88,7 @@ impl AppState {
             config.empty_shell_retry_backoff_base_ms,
             config.empty_shell_retry_backoff_max_ms,
             config.empty_shell_pre_clamp_max_tokens.clone(),
+            config.empty_shell_no_retry_prompt_tokens,
             config.circuit_breaker_threshold,
             config.circuit_breaker_per_model,
             config.retry_on_503,

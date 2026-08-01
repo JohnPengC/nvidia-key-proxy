@@ -153,6 +153,20 @@ pub struct Config {
     #[serde(default = "default_empty_shell_pre_clamp_max_tokens")]
     pub empty_shell_pre_clamp_max_tokens: std::collections::HashMap<String, u64>,
 
+    /// Prompt-token threshold above which an empty-shell soft failure is NOT
+    /// retried with a clamped max_tokens. failure.log showed clamp-retry on
+    /// very long contexts (est_prompt_tokens 107k+) recovered 0% (49/49
+    /// re-shelled): the shell there isn't caused by an oversized output budget
+    /// but by `prompt + any max_tokens` exceeding the model's context window, so
+    /// shrinking max_tokens can't help. Above this threshold the proxy skips
+    /// the retry round-trip and surfaces 502 immediately with reason
+    /// `empty_shell_no_retry_prompt_too_large`, avoiding wasted upstream calls.
+    /// 0 disables this bypass (always retry per the existing policy).
+    /// Default 90000 (well below the 107k failure-log floor for shells).
+    /// Override via `NVIDIA_EMPTY_SHELL_NO_RETRY_PROMPT_TOKENS`.
+    #[serde(default = "default_empty_shell_no_retry_prompt_tokens")]
+    pub empty_shell_no_retry_prompt_tokens: u64,
+
     /// Optional ceiling for max_tokens validation. Any request with max_tokens
     /// > this value will have the field dropped (model default used). Default
     /// 100000. Override via `MAX_TOKENS_MAX` env var.
@@ -248,6 +262,10 @@ fn default_empty_shell_retry_backoff_base_ms() -> u64 {
 
 fn default_empty_shell_retry_backoff_max_ms() -> u64 {
     5000
+}
+
+fn default_empty_shell_no_retry_prompt_tokens() -> u64 {
+    90000
 }
 
 fn default_circuit_breaker_threshold() -> u32 {
@@ -363,6 +381,10 @@ impl fmt::Debug for Config {
             .field(
                 "empty_shell_pre_clamp_max_tokens",
                 &self.empty_shell_pre_clamp_max_tokens,
+            )
+            .field(
+                "empty_shell_no_retry_prompt_tokens",
+                &self.empty_shell_no_retry_prompt_tokens,
             )
             .field(
                 "circuit_breaker_threshold",
@@ -543,6 +565,7 @@ impl Config {
             empty_shell_retry_backoff_base_ms: default_empty_shell_retry_backoff_base_ms(),
             empty_shell_retry_backoff_max_ms: default_empty_shell_retry_backoff_max_ms(),
             empty_shell_pre_clamp_max_tokens: default_empty_shell_pre_clamp_max_tokens(),
+            empty_shell_no_retry_prompt_tokens: default_empty_shell_no_retry_prompt_tokens(),
             circuit_breaker_threshold: default_circuit_breaker_threshold(),
             circuit_breaker_per_model: default_circuit_breaker_per_model(),
             retry_on_503: default_retry_on_503(),
@@ -857,6 +880,11 @@ impl Config {
                         config.empty_shell_pre_clamp_max_tokens = map;
                     }
                 }
+                "empty_shell_no_retry_prompt_tokens" => {
+                    if let Ok(v) = value.parse::<u64>() {
+                        config.empty_shell_no_retry_prompt_tokens = v;
+                    }
+                }
                 "max_tokens_max" => {
                     if let Ok(v) = value.parse::<u64>() {
                         config.max_tokens_max = v;
@@ -957,6 +985,7 @@ mod config_validation_tests {
             empty_shell_retry_backoff_base_ms: 500,
             empty_shell_retry_backoff_max_ms: 5000,
             empty_shell_pre_clamp_max_tokens: default_empty_shell_pre_clamp_max_tokens(),
+            empty_shell_no_retry_prompt_tokens: default_empty_shell_no_retry_prompt_tokens(),
             circuit_breaker_threshold: 3,
             circuit_breaker_per_model: true,
             retry_on_503: true,

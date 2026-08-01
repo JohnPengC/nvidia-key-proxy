@@ -59,8 +59,12 @@
 ## 五、后续动作指针
 
 - **A** 负值 max_tokens：代理侧已修（`82e35cd` 核对 `proxy.rs:1320-1360`），07-25 后归零。✅ 无需改动。
-- **C** 空壳阈值：>107k 必触发；clamp-重试无效。需新增"主动 compact / 上下文回收"，并停止对 >107k 的 glm-5.2 clamp 重试。
-- **D** 现有加固是否覆盖这条 case：**未覆盖——pre-clamp 配置阈值=客户常见值，等于不生效**。证据见下。
+- **C** 空壳阈值：>107k 必触发；clamp-重试无效。
+  - 修复方向 3（超长上下文跳过 clamp-重试、直接 502）✅ 已实施——见下 §七。
+  - 修复方向 2 的"主动 compact"仍待办：需在代理实现真正的会话压缩，超出本轮加固范畴。
+- **D** 现有加固是否覆盖这条 case：**未覆盖——pre-clamp 配置阈值=客户常见值，等于不生效**。证据见下 §六。
+  - ✅ 已修：guard `>` → `>=`、glm-5.2 pre-clamp target 32000 → 8192（见 §六）。
+- **根因 3** `/v1/props` 404：未处理。可在代理层拒绝未知 GET endpoint 省 key 占用——低优先级，待办。
 
 ## 六、D：现有 pre-clamp / clamp-retry 覆盖性验证（核心发现）
 
@@ -79,9 +83,25 @@ cur(32000) == target(32000) → 条件不成立 → **pre-clamp 从不对那 216
 guard `cur > target` 把等号情形漏掉，等于在唯一高频的 case 上没有任何提前防护。
 
 **修复方向**（按效费比排序）：
-1. 把 pre-clamp 判定改为 `cur >= 某个明确小于窗口的安全上限`，或把 `empty_shell_pre_clamp_max_tokens["z-ai/glm-5.2"]`
-   下调到 **明显小于 32000** 的安全值（如 8000–12000），并改为 `cur >= target` 触发——确保等号与略小都被 clamp。
-2. 长 prompt 不应靠砍 max_tokens 救：est_prompt_tokens 超过 ~90k 即应 **在上游前主动 compact**
-   或直接 502 退回，避免烧一整轮 round-trip 去撞必然的空壳。
-3. clamp-重试对超长上下文已证明 0% 有效；若重启空壳重试，应加"est_prompt_tokens 超阈值则不重试、直接 502"的旁路，
-   避免无谓消耗 key 与配额。
+1. ✅ **已实施**：guard `cur > target` → `cur >= target`；glm-5.2 pre-clamp target 32000 → 8192
+   （`config.rs` 默认 + `config.toml` + `config.toml.example` 同步；含两处测试断言更新；
+   提交于 `e623607`）。
+2. ⏳ **待办**：长 prompt 在上游前主动 compact（真实会话压缩，超本轮范畴）。
+3. ✅ **已实施**：见 §七——超长上下文跳过 clamp-重试、直接 502 旁路。
+
+## 七、长上下文跳过 clamp-重试旁路（修复方向 3，已实施）
+
+**配置项** `empty_shell_no_retry_prompt_tokens`（默认 **90000**，env
+`NVIDIA_EMPTY_SHELL_NO_RETRY_PROMPT_TOKENS`；0 关闭旁路、永远重试）。
+
+**逻辑**（`proxy.rs` `handle_empty_shell_failure`）：首次空壳且 `estimate_prompt_tokens(request_body) ≥ 阈值`
+时，跳过 clamp-重试、直接 502，并把 failure.log 的 `retry_reason` 标为
+`empty_shell_no_retry_prompt_too_large`。`estimate_prompt_tokens` = Σ message content chars / 4，
+与 `request_body_fingerprint` 的 `est_prompt_tokens` 同一启发式。
+
+**依据**：failure.log 216/216 首次空壳 est_prompt_tokens 全 ≥107,485，clamp-重试恢复率 0%。
+阈值取 90k（显低于下界 107k）留余量，避免误杀临界附近本可重试成功的请求。仅对首次空壳
+（`retry_attempt_already_done == 0`）短路：已提交重试链不撤回。
+
+**测试**：`empty_shell_skips_retry_when_prompt_exceeds_no_retry_threshold`——构造 prompt 估算超阈值，
+断言单次上游调用、502、`retry.attempted=false`、detail 不含 retry-clamp 标记。67 lib + 9 integration 全过。
