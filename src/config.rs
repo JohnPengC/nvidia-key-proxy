@@ -145,10 +145,10 @@ pub struct Config {
     pub empty_shell_retry_backoff_max_ms: u64,
 
     /// Per-model max_tokens ceiling for pre-clamping on first attempt.
-    /// When a request targets a model in this map and max_tokens exceeds
+    /// When a request targets a model in this map and max_tokens is at or above
     /// the ceiling, the proxy clamps it before the first upstream call.
     /// Reduces empty-shell occurrences for known problematic models.
-    /// Default includes z-ai/glm-5.2 → 32000.
+    /// Default includes z-ai/glm-5.2 → 8192.
     /// Override via `NVIDIA_EMPTY_SHELL_PRE_CLAMP_MAX_TOKENS` (JSON map).
     #[serde(default = "default_empty_shell_pre_clamp_max_tokens")]
     pub empty_shell_pre_clamp_max_tokens: std::collections::HashMap<String, u64>,
@@ -201,7 +201,12 @@ pub struct Config {
 /// Public wrapper to get the default pre-clamp map (used in tests).
 pub fn default_empty_shell_pre_clamp_max_tokens() -> std::collections::HashMap<String, u64> {
     let mut m = std::collections::HashMap::new();
-    m.insert("z-ai/glm-5.2".to_string(), 32000);
+    // 8192, not 32000: GLM-class models (~128k context) return an HTTP-200
+    // empty shell when `prompt + max_tokens` exceeds their remaining budget.
+    // failure.log showed all 216 first-attempt shells carried max_tokens=32000
+    // (the empty output budget once a ~107k+ prompt was counted in). Clamping
+    // to 8192 leaves room for output on prompts up to ~120k.
+    m.insert("z-ai/glm-5.2".to_string(), 8192);
     m
 }
 

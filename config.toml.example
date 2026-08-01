@@ -39,9 +39,9 @@ empty_shell_retry_max_tokens = 8192
 # included). NVIDIA's GLM-class models return a 200 "empty-shell" body when
 # `prompt + max_tokens` exceeds the remaining context budget; clamping at the
 # entrance makes the budget fit so inference actually runs. Optional, empty =
-# no pre-clamp. Default includes z-ai/glm-5.2 → 32000.
+# no pre-clamp. Default includes z-ai/glm-5.2 → 8192.
 # Override via NVIDIA_EMPTY_SHELL_PRE_CLAMP_MAX_TOKENS (JSON map).
-# empty_shell_pre_clamp_max_tokens = { "z-ai/glm-5.2" = 32000 }
+# empty_shell_pre_clamp_max_tokens = { "z-ai/glm-5.2" = 8192 }
 
 # Retry 500 Internal Server Error (transient GLM "Failed to generate
 # completions") against another key with backoff. Default true.

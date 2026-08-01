@@ -1437,7 +1437,17 @@ impl Proxy {
                     _ => None,
                 });
                 if let Some(cur) = current {
-                    if cur > target {
+                    // `>=` (not `>`): when cur == target the request is still at
+                    // the ceiling, and for GLM-class models the ceiling equals
+                    // the remaining context budget NVIDIA has once a large prompt
+                    // is counted in — so even cur==target leaves no room for
+                    // output and shells. Clamp at-or-above the ceiling so the
+                    // dominant case (client sends the exact ceiling value, e.g.
+                    // max_tokens=32000) is caught on the first attempt instead of
+                    // going out and shelling. failure.log showed 216/216
+                    // first-attempt shells carried max_tokens == the configured
+                    // 32000 target, i.e. the strict `>` never fired on them.
+                    if cur >= target {
                         info!(
                             client_req_id = %client_req_id,
                             max_tokens_before = cur,
@@ -3355,10 +3365,12 @@ use crate::config::default_empty_shell_pre_clamp_max_tokens;
     }
 
     /// A streaming request to a model in `empty_shell_pre_clamp_max_tokens`
-    /// with `max_tokens` above the ceiling must be clamped *before* the first
-    /// upstream call — proving the pre-clamp path now covers streaming,
+    /// with `max_tokens` at or above the ceiling must be clamped *before* the
+    /// first upstream call — proving the pre-clamp path now covers streaming,
     /// not just the post-shell retry. We assert the upstream body carries the
-    /// clamped value (32000), not the client's 64000.
+    /// clamped ceiling value (8192), not the client's 64000. The `>=` guard
+    /// also clamps when `cur == target` (see failure.log: 216/216 shells carried
+    /// max_tokens == the configured ceiling, which the old strict `>` missed).
     #[tokio::test]
     async fn pre_clamp_applies_to_streaming_first_call() {
         let mock_server = MockServer::start().await;
@@ -3400,8 +3412,8 @@ use crate::config::default_empty_shell_pre_clamp_max_tokens;
         let observed = seen_mt.lock().unwrap().clone();
         assert_eq!(
             observed,
-            vec![32000],
-            "streaming first call max_tokens should be pre-clamped 64000 -> 32000, got {:?}",
+            vec![8192],
+            "streaming first call max_tokens should be pre-clamped 64000 -> 8192, got {:?}",
             observed
         );
     }
@@ -3928,15 +3940,15 @@ use crate::config::default_empty_shell_pre_clamp_max_tokens;
             "retry.outcome should report the shell, got: {body}"
         );
         // Request fingerprint and upstream shell structured in the error.
-        // The first upstream call was pre-clamped (glm-5.2 → 32000) before it
-        // went out, so the fingerprint records the *clamped* 32000, not the
+        // The first upstream call was pre-clamped (glm-5.2 → 8192) before it
+        // went out, so the fingerprint records the *clamped* 8192, not the
         // client's original 64000 — the whole point of pre-clamp is to avoid
-        // the shell ever happening; when it still does, the retry drops to 8192.
+        // the shell ever happening; when it still does, the retry stays at 8192.
         let req_fp = body["error"]["request_fingerprint"]
             .as_str()
             .unwrap_or("");
         assert!(
-            req_fp.contains("max_tokens=32000") && req_fp.contains("messages=0"),
+            req_fp.contains("max_tokens=8192") && req_fp.contains("messages=0"),
             "request_fingerprint should capture the pre-clamped max_tokens + message count, got: {req_fp}"
         );
         assert_eq!(
