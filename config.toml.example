@@ -51,6 +51,15 @@ empty_shell_retry_max_tokens = 8192
 # Override via NVIDIA_EMPTY_SHELL_NO_RETRY_PROMPT_TOKENS.
 # empty_shell_no_retry_prompt_tokens = 90000
 
+# Hard ceiling on estimated prompt tokens: a request at/above this is rejected
+# with HTTP 413 before any upstream call, asking the client to compress its own
+# context. failure.log showed 107k+ prompts always shell; we refuse instead of
+# burning a key slot. Does NOT rewrite the client's messages. HARD limit above
+# the soft 90k knob (90k–120k gets one shot + 502-on-shell; 120k+ refused).
+# 0 disables. Default 120000.
+# Override via NVIDIA_REQUEST_MAX_PROMPT_TOKENS.
+# request_max_prompt_tokens = 120000
+
 # Retry 500 Internal Server Error (transient GLM "Failed to generate
 # completions") against another key with backoff. Default true.
 # Env override: NVIDIA_RETRY_ON_500.

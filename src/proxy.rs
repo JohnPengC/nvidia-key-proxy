@@ -87,6 +87,10 @@ pub struct Proxy {
     /// Prompt-token threshold above which an empty-shell retry is skipped
     /// (surfaces 502 immediately). See Config::empty_shell_no_retry_prompt_tokens.
     empty_shell_no_retry_prompt_tokens: u64,
+    /// Hard ceiling on estimated prompt tokens; at/above this a request is
+    /// rejected with 413 before any upstream call. See
+    /// Config::request_max_prompt_tokens.
+    request_max_prompt_tokens: u64,
     /// Circuit breaker threshold for consecutive empty-shell/504/503 responses.
     circuit_breaker_threshold: u32,
     /// Whether circuit breaker tracks failures per (key, model) pair.
@@ -981,6 +985,7 @@ impl Proxy {
         empty_shell_retry_backoff_max_ms: u64,
         empty_shell_pre_clamp_max_tokens: std::collections::HashMap<String, u64>,
         empty_shell_no_retry_prompt_tokens: u64,
+        request_max_prompt_tokens: u64,
         circuit_breaker_threshold: u32,
         circuit_breaker_per_model: bool,
         retry_on_503: bool,
@@ -1019,6 +1024,7 @@ impl Proxy {
             empty_shell_retry_backoff_max_ms,
             empty_shell_pre_clamp_max_tokens,
             empty_shell_no_retry_prompt_tokens,
+            request_max_prompt_tokens,
             circuit_breaker_threshold,
             circuit_breaker_per_model,
             retry_on_503,
@@ -1611,6 +1617,53 @@ impl Proxy {
             .as_ref()
             .and_then(|v| v.get("stream").and_then(|s| s.as_bool()))
             .unwrap_or(false);
+
+        // ── Hard prompt-size ceiling: reject before consuming a key/slot ──
+        // failure.log showed every first-attempt shell carried
+        // est_prompt_tokens >= 107,485 — beyond that, `prompt + any max_tokens`
+        // cannot fit glm-5.2's ~128k window and the call is guaranteed to shell
+        // (HTTP 200, choices:[], usage:null — no inference). Rather than burn
+        // a key slot and an upstream round-trip on a request that cannot
+        // succeed, refuse up front with 413 and tell the client to compress its
+        // own context. We do NOT rewrite the client's messages — the client
+        // owns its conversation history (Claude Code's /compact is its to run);
+        // the proxy's job is to fail loudly, not silently munge. Disabled when
+        // `request_max_prompt_tokens == 0`.
+        if self.request_max_prompt_tokens > 0 {
+            if let Some(est) = estimate_prompt_tokens(&body_bytes) {
+                if est >= self.request_max_prompt_tokens {
+                    warn!(
+                        client_req_id = %client_req_id,
+                        est_prompt_tokens = est,
+                        limit = self.request_max_prompt_tokens,
+                        model = %model,
+                        "Rejecting request: estimated prompt tokens exceed the hard ceiling; \
+                         client must compress its context"
+                    );
+                    self.metrics.inc_error();
+                    let err = serde_json::json!({
+                        "error": {
+                            "message": format!(
+                                "Estimated prompt tokens (~{}) reach or exceed the proxy's context \
+                                 ceiling ({}) for this model; the request cannot fit the model's \
+                                 context window and would be rejected upstream. Compress your \
+                                 conversation context (e.g. clear history / run /compact) and retry.",
+                                est, self.request_max_prompt_tokens
+                            ),
+                            "type": "request_too_large",
+                            "code": "prompt_tokens_exceeds_ceiling",
+                            "client_req_id": client_req_id,
+                            "est_prompt_tokens": est,
+                            "limit": self.request_max_prompt_tokens,
+                        }
+                    });
+                    return Ok(json_value_response(
+                        warp::http::StatusCode::PAYLOAD_TOO_LARGE,
+                        &err,
+                    ));
+                }
+            }
+        }
 
         // Build upstream URL
         let mut url = self.base_url.clone();
@@ -3111,6 +3164,7 @@ use crate::config::default_empty_shell_pre_clamp_max_tokens;
             empty_shell_retry_backoff_max_ms: 5000,
             empty_shell_pre_clamp_max_tokens: default_empty_shell_pre_clamp_max_tokens(),
             empty_shell_no_retry_prompt_tokens: 90000,
+            request_max_prompt_tokens: 120000,
             max_tokens_max: 100_000,
             concurrency_limit_per_model: std::collections::HashMap::new(),
             concurrency_queue_timeout_ms: 5000,
@@ -3142,6 +3196,7 @@ use crate::config::default_empty_shell_pre_clamp_max_tokens;
             config.empty_shell_retry_backoff_max_ms,
             config.empty_shell_pre_clamp_max_tokens.clone(),
             config.empty_shell_no_retry_prompt_tokens,
+            config.request_max_prompt_tokens,
             config.circuit_breaker_threshold,
             config.circuit_breaker_per_model,
             config.retry_on_503,
@@ -3538,6 +3593,66 @@ use crate::config::default_empty_shell_pre_clamp_max_tokens;
         assert!(
             !body["error"]["detail"].as_str().unwrap_or_default().contains("max_tokens=8192"),
             "retry-clamp detail must be absent when retry is skipped, got: {body}"
+        );
+    }
+
+    /// Hard ceiling: when estimated prompt tokens reach the proxy's
+    /// `request_max_prompt_tokens` ceiling, the request is rejected with 413
+    /// *before* any upstream call (no key slot, no round-trip), and the body
+    /// carries `type: request_too_large` + the est/limit so the client can act.
+    /// failure.log showed 107k+ prompts always shell; the 413 surfaces that
+    /// up front and asks the client to compress its own context. We set the
+    /// ceiling tiny (5) and send a message whose est_prompt_tokens (chars/4)
+    /// exceeds it, so the trigger fires without a megabyte-sized body.
+    #[tokio::test]
+    async fn oversized_prompt_request_rejected_with_413_before_upstream() {
+        let mock_server = MockServer::start().await;
+        // ZERO upstream calls expected — the bypass must fire before send().
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        let mut cfg = test_config(&mock_server.uri(), 3, 60);
+        cfg.request_max_prompt_tokens = 5; // tiny ceiling
+        let addr = start_proxy(cfg).await;
+        let client = reqwest::Client::new();
+        // content of 24 chars → est_prompt_tokens = 24/4 = 6 ≥ 5 (ceiling)
+        let resp = client
+            .post(format!("http://{}/v1/chat/completions", addr))
+            .header("content-type", "application/json")
+            .body(r#"{"model":"z-ai/glm-5.2","max_tokens":32000,"messages":[{"role":"user","content":"twenty four chars here!!"}],"stream":false}"#)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            413,
+            "oversized prompt must be rejected with 413 Payload Too Large, got: {:?}",
+            resp.status()
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            body["error"]["type"].as_str(),
+            Some("request_too_large"),
+            "error type should classify as request_too_large, got: {body}"
+        );
+        assert_eq!(
+            body["error"]["code"].as_str(),
+            Some("prompt_tokens_exceeds_ceiling"),
+            "error code should name the ceiling breach, got: {body}"
+        );
+        assert_eq!(
+            body["error"]["limit"].as_u64(),
+            Some(5),
+            "body should expose the configured ceiling, got: {body}"
+        );
+        assert!(
+            body["error"]["est_prompt_tokens"].as_u64().unwrap_or(0) >= 5,
+            "body should expose the estimated prompt tokens at/above the ceiling, got: {body}"
         );
     }
 

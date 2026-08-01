@@ -61,7 +61,10 @@
 - **A** 负值 max_tokens：代理侧已修（`82e35cd` 核对 `proxy.rs:1320-1360`），07-25 后归零。✅ 无需改动。
 - **C** 空壳阈值：>107k 必触发；clamp-重试无效。
   - 修复方向 3（超长上下文跳过 clamp-重试、直接 502）✅ 已实施——见下 §七。
-  - 修复方向 2 的"主动 compact"仍待办：需在代理实现真正的会话压缩，超出本轮加固范畴。
+  - 修复方向 2（长 prompt 在上游前主动 compact）：经核查，长 prompt 是 Claude Code 的
+    agentic 多轮对话历史（messages 345–553，末条多为 tool 结果），**非** `/compact` 请求，
+    Claude Code 自己没在压缩。代理擅自改写历史会让 client 与模型对"看过什么"不一致 →
+    采用"拒绝并明示"：✅ 已实施——见下 §八（413 上游前硬限）。
 - **D** 现有加固是否覆盖这条 case：**未覆盖——pre-clamp 配置阈值=客户常见值，等于不生效**。证据见下 §六。
   - ✅ 已修：guard `>` → `>=`、glm-5.2 pre-clamp target 32000 → 8192（见 §六）。
 - **根因 3** `/v1/props` 404：未处理。可在代理层拒绝未知 GET endpoint 省 key 占用——低优先级，待办。
@@ -86,7 +89,8 @@ guard `cur > target` 把等号情形漏掉，等于在唯一高频的 case 上�
 1. ✅ **已实施**：guard `cur > target` → `cur >= target`；glm-5.2 pre-clamp target 32000 → 8192
    （`config.rs` 默认 + `config.toml` + `config.toml.example` 同步；含两处测试断言更新；
    提交于 `e623607`）。
-2. ⏳ **待办**：长 prompt 在上游前主动 compact（真实会话压缩，超本轮范畴）。
+2. ⏳→✅ **改为拒绝并明示**：经核查长 prompt 是 Claude Code 的 agentic 多轮历史（非 `/compact`），
+   代理擅自压缩会让 client 与模型对"看过什么"不一致。已改为上游前硬限 413——见 §八。
 3. ✅ **已实施**：见 §七——超长上下文跳过 clamp-重试、直接 502 旁路。
 
 ## 七、长上下文跳过 clamp-重试旁路（修复方向 3，已实施）
@@ -105,3 +109,30 @@ guard `cur > target` 把等号情形漏掉，等于在唯一高频的 case 上�
 
 **测试**：`empty_shell_skips_retry_when_prompt_exceeds_no_retry_threshold`——构造 prompt 估算超阈值，
 断言单次上游调用、502、`retry.attempted=false`、detail 不含 retry-clamp 标记。67 lib + 9 integration 全过。
+
+## 八、长 prompt 上游前硬限 413（修复方向 2，已实施——改为拒绝并明示）
+
+**核查**：长 prompt 是 Claude Code 的 agentic 多轮对话历史（messages 345–553，末条多为 tool 结果），
+**非** `/compact` 请求；Claude Code 自己没在压缩。代理擅自改写这些历史会让 client 与模型对
+"看过什么"产生不一致 → 不做"代理自动压缩 messages"，改为把决定权交回 client。
+
+**配置项** `request_max_prompt_tokens`（默认 **120000**，env `NVIDIA_REQUEST_MAX_PROMPT_TOKENS`；
+0 关闭硬限）。这是**硬限**，位于软限（90k）之上：
+
+- `[0, 90k)`：正常路径，重试照常。
+- `[90k, 120k)`：发首次；若空壳则**不重试、502**（§七 软限）。
+- `≥ 120k`：**根本不发**，直接 **413**（§八 硬限），零上游调用、零 key 占用。
+
+**逻辑**（`proxy.rs` `forward_upstream`，body normalization 后、并发/key 获取前）：
+若 `request_max_prompt_tokens > 0` 且 `estimate_prompt_tokens(body) ≥ limit`，立即返
+`413 Payload Too Large` + JSON `{"error":{"type":"request_too_large","code":"prompt_tokens_exceeds_ceiling",
+"est_prompt_tokens":…,"limit":…, "message":"…compress your conversation context (e.g. clear history / run /compact) and retry."}}`。
+**不改写 client 的 messages**——仅失败并明示。
+
+**依据**：failure.log 216/216 首次空壳 `est_prompt_tokens` 全 ≥107,485。硬限 120k 略高于该下界，
+只在数据显示必失败时拒绝；`[90k,120k)` 给可能成功的请求保留一次机会。把"主动 compact"留作
+client（Claude Code）的职责，符合"不静默改写别人的成竹之作"原则。
+
+**测试**：`oversized_prompt_request_rejected_with_413_before_upstream`——设硬限=5、发 est≥5 的请求，
+断言 **零上游调用**（`expect(0)`）、413、`type=request_too_large`、`code=prompt_tokens_exceeds_ceiling`、
+body 含 limit/est。68 lib + 9 integration 全过，clippy 无新增警告。
