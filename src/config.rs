@@ -167,6 +167,29 @@ pub struct Config {
     #[serde(default = "default_empty_shell_no_retry_prompt_tokens")]
     pub empty_shell_no_retry_prompt_tokens: u64,
 
+    /// Hard ceiling on a request's estimated prompt tokens: a non-streaming or
+    /// streaming chat-completions request whose estimated prompt size is at or
+    /// above this limit is rejected up front with HTTP 413 (no upstream call),
+    /// asking the client to compress its context itself. failure.log showed
+    /// every first-attempt shell carried est_prompt_tokens >= 107,485 — once
+    /// the prompt is that large, `prompt + any max_tokens` cannot fit the
+    /// model's context window, so the call is guaranteed to shell. The proxy
+    /// refuses rather than burn an upstream round-trip and a key slot on a
+    /// request that cannot succeed. The Auto-compact is the client's job
+    /// (Claude Code owns its conversation history); we surface a clear 413
+    /// instead of silently rewriting the client's messages.
+    /// This is a *hard* limit, intentionally above
+    /// `empty_shell_no_retry_prompt_tokens` (the soft limit that still lets one
+    /// attempt run, just suppressing the retry): requests between the soft and
+    /// hard limits get one shot and, if they shell, surface 502 without retry;
+    /// requests at/above the hard limit are refused outright.
+    /// 0 disables the hard limit (always let the first call go out).
+    /// Default 120000 (just above the 107k shell floor, so only truly doomed
+    /// requests are refused).
+    /// Override via `NVIDIA_REQUEST_MAX_PROMPT_TOKENS`.
+    #[serde(default = "default_request_max_prompt_tokens")]
+    pub request_max_prompt_tokens: u64,
+
     /// Optional ceiling for max_tokens validation. Any request with max_tokens
     /// > this value will have the field dropped (model default used). Default
     /// 100000. Override via `MAX_TOKENS_MAX` env var.
@@ -266,6 +289,10 @@ fn default_empty_shell_retry_backoff_max_ms() -> u64 {
 
 fn default_empty_shell_no_retry_prompt_tokens() -> u64 {
     90000
+}
+
+fn default_request_max_prompt_tokens() -> u64 {
+    120000
 }
 
 fn default_circuit_breaker_threshold() -> u32 {
@@ -385,6 +412,10 @@ impl fmt::Debug for Config {
             .field(
                 "empty_shell_no_retry_prompt_tokens",
                 &self.empty_shell_no_retry_prompt_tokens,
+            )
+            .field(
+                "request_max_prompt_tokens",
+                &self.request_max_prompt_tokens,
             )
             .field(
                 "circuit_breaker_threshold",
@@ -566,6 +597,7 @@ impl Config {
             empty_shell_retry_backoff_max_ms: default_empty_shell_retry_backoff_max_ms(),
             empty_shell_pre_clamp_max_tokens: default_empty_shell_pre_clamp_max_tokens(),
             empty_shell_no_retry_prompt_tokens: default_empty_shell_no_retry_prompt_tokens(),
+            request_max_prompt_tokens: default_request_max_prompt_tokens(),
             circuit_breaker_threshold: default_circuit_breaker_threshold(),
             circuit_breaker_per_model: default_circuit_breaker_per_model(),
             retry_on_503: default_retry_on_503(),
@@ -885,6 +917,11 @@ impl Config {
                         config.empty_shell_no_retry_prompt_tokens = v;
                     }
                 }
+                "request_max_prompt_tokens" => {
+                    if let Ok(v) = value.parse::<u64>() {
+                        config.request_max_prompt_tokens = v;
+                    }
+                }
                 "max_tokens_max" => {
                     if let Ok(v) = value.parse::<u64>() {
                         config.max_tokens_max = v;
@@ -986,6 +1023,7 @@ mod config_validation_tests {
             empty_shell_retry_backoff_max_ms: 5000,
             empty_shell_pre_clamp_max_tokens: default_empty_shell_pre_clamp_max_tokens(),
             empty_shell_no_retry_prompt_tokens: default_empty_shell_no_retry_prompt_tokens(),
+            request_max_prompt_tokens: default_request_max_prompt_tokens(),
             circuit_breaker_threshold: 3,
             circuit_breaker_per_model: true,
             retry_on_503: true,
