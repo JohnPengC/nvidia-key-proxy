@@ -67,7 +67,15 @@
     采用"拒绝并明示"：✅ 已实施——见下 §八（413 上游前硬限）。
 - **D** 现有加固是否覆盖这条 case：**未覆盖——pre-clamp 配置阈值=客户常见值，等于不生效**。证据见下 §六。
   - ✅ 已修：guard `>` → `>=`、glm-5.2 pre-clamp target 32000 → 8192（见 §六）。
-- **根因 3** `/v1/props` 404：未处理。可在代理层拒绝未知 GET endpoint 省 key 占用——低优先级，待办。
+- **根因 3** `/v1/props` 404：**评估后不做**。15 条/7 天是 client SDK `GET` 探测一个 NVIDIA 网关不认的端点
+  （`/v1/props`，仓库无此路径），代理透传后上游返 404 且每次消耗一次 key 占用。但：(1) 收益偏小
+  （client 持续重试，省不了 client 侧，只是省代理 key pool 占用 ~几十 ms）；(2) 处理方式都有代价——
+  硬编码拒绝 `/v1/props` 难看且可能误拒 NVIDIA 未来端点；对未知 GET 跳过 key acquisition 会改透传路径
+  的 key 语义。pre-clamp + clamp-retry 跳过 + 413 硬限已覆盖主问题（空壳 73%）。**存档不处理。**
+
+  附：18 条 404 实为三类：(a) 15 条 `GET /v1/props`（SDK 探测，本项）；(b) 3 条 `POST /v1/chat/completions`
+  上游偶发 404（07-30 12:40 三秒内，model 合法、endpoint 合法 → 上游瞬时抖动，现有 4xx 不重试直接透传）；
+  (c) 1 条 `POST /v1/embeddings` model=`snowflake/arctic-embed-l` 上游结构化 404（embeddings 路径透传）。
 
 ## 六、D：现有 pre-clamp / clamp-retry 覆盖性验证（核心发现）
 
