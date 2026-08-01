@@ -84,6 +84,9 @@ pub struct Proxy {
     empty_shell_probe_before_retry: bool,
     /// Per-model max_tokens ceiling for pre-clamping on first attempt.
     empty_shell_pre_clamp_max_tokens: std::collections::HashMap<String, u64>,
+    /// Prompt-token threshold above which an empty-shell retry is skipped
+    /// (surfaces 502 immediately). See Config::empty_shell_no_retry_prompt_tokens.
+    empty_shell_no_retry_prompt_tokens: u64,
     /// Circuit breaker threshold for consecutive empty-shell/504/503 responses.
     circuit_breaker_threshold: u32,
     /// Whether circuit breaker tracks failures per (key, model) pair.
@@ -513,6 +516,28 @@ fn request_body_fingerprint(body: &bytes::Bytes) -> String {
         tools_n,
         scalar("tool_choice"),
     )
+}
+
+/// Rough prompt-token estimate (Σ message content chars / 4) parsed from a
+/// serialized chat-completions request body. Same heuristic as
+/// `request_body_fingerprint`'s `est_prompt_tokens` field, exposed as a
+/// plain number so `handle_empty_shell_failure` can compare it against the
+/// `empty_shell_no_retry_prompt_tokens` threshold. Returns None when the body
+/// isn't valid JSON or has no `messages` array. Coarse by design — it only
+/// needs to reliably separate the 107k+ shells seen in failure.log from
+/// normal requests; the threshold (default 90k) carries the safety margin.
+fn estimate_prompt_tokens(body: &bytes::Bytes) -> Option<u64> {
+    let v: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let arr = v.get("messages").and_then(|m| m.as_array())?;
+    let mut est_chars: usize = 0;
+    for m in arr {
+        match m.get("content") {
+            Some(serde_json::Value::String(s)) => est_chars += s.chars().count(),
+            Some(other) => est_chars += other.to_string().chars().count(),
+            None => {}
+        }
+    }
+    Some(est_chars as u64 / 4)
 }
 
 /// Compact fingerprint of an NVIDIA empty-shell response body — the fields that
@@ -955,6 +980,7 @@ impl Proxy {
         empty_shell_retry_backoff_base_ms: u64,
         empty_shell_retry_backoff_max_ms: u64,
         empty_shell_pre_clamp_max_tokens: std::collections::HashMap<String, u64>,
+        empty_shell_no_retry_prompt_tokens: u64,
         circuit_breaker_threshold: u32,
         circuit_breaker_per_model: bool,
         retry_on_503: bool,
@@ -992,6 +1018,7 @@ impl Proxy {
             empty_shell_retry_backoff_base_ms,
             empty_shell_retry_backoff_max_ms,
             empty_shell_pre_clamp_max_tokens,
+            empty_shell_no_retry_prompt_tokens,
             circuit_breaker_threshold,
             circuit_breaker_per_model,
             retry_on_503,
@@ -2576,6 +2603,34 @@ async fn handle_passthrough_stream(
             && retry_attempt_already_done < self.empty_shell_retry_attempts
             && retry_attempt_already_done + 1 < self.retry_config.max_retries;
 
+        // Long-context bypass: when the request's estimated prompt tokens are
+        // at or above `empty_shell_no_retry_prompt_tokens`, skip the clamped
+        // retry and surface 502 immediately. failure.log showed clamp-retry on
+        // 107k+ prompts recovered 0% (49/49 re-shelled): a shell there means
+        // `prompt + any max_tokens` already exceeds the model's context window,
+        // so shrinking the output budget cannot help — retrying only burns an
+        // upstream round-trip and a key slot. We only short-circuit the *first*
+        // shell (retry_attempt_already_done == 0): later recursive retries that
+        // arrive with >0 attempt have already committed to retrying.
+        let mut prompt_too_large = false;
+        if can_retry
+            && retry_attempt_already_done == 0
+            && self.empty_shell_no_retry_prompt_tokens > 0
+        {
+            if let Some(est) = estimate_prompt_tokens(request_body) {
+                if est >= self.empty_shell_no_retry_prompt_tokens {
+                    prompt_too_large = true;
+                    warn!(
+                        client_req_id = %client_req_id,
+                        est_prompt_tokens = est,
+                        threshold = self.empty_shell_no_retry_prompt_tokens,
+                        "Empty-shell retry skipped: prompt exceeds no-retry threshold"
+                    );
+                }
+            }
+        }
+        let can_retry = can_retry && !prompt_too_large;
+
         // Pre-clamp is applied to the *first* upstream call in
         // `forward_upstream`, not here on the retry. See the retry-budget
         // comment below for why the retry uses `empty_shell_retry_max_tokens`.
@@ -2643,6 +2698,8 @@ async fn handle_passthrough_stream(
             retry_attempt_already_done,
             if can_retry {
                 Some("empty_shell_clamped_retry")
+            } else if prompt_too_large {
+                Some("empty_shell_no_retry_prompt_too_large")
             } else {
                 Some("empty_shell_no_retry")
             },
@@ -2832,6 +2889,9 @@ async fn handle_passthrough_stream(
         }
 
         // No retry budget / retry disabled: surface 502 with the real cause.
+        // `prompt_too_large` is recorded in failure.log (retry_reason =
+        // `empty_shell_no_retry_prompt_too_large`) and the warn! above; the HTTP
+        // body's `retry` field is left as not-attempted since no retry ran.
         warn!(
             client_req_id = %client_req_id,
             "Empty-shell soft failure; surfacing 502 (retry disabled or budget exhausted)",
@@ -3050,6 +3110,7 @@ use crate::config::default_empty_shell_pre_clamp_max_tokens;
             empty_shell_retry_backoff_base_ms: 500,
             empty_shell_retry_backoff_max_ms: 5000,
             empty_shell_pre_clamp_max_tokens: default_empty_shell_pre_clamp_max_tokens(),
+            empty_shell_no_retry_prompt_tokens: 90000,
             max_tokens_max: 100_000,
             concurrency_limit_per_model: std::collections::HashMap::new(),
             concurrency_queue_timeout_ms: 5000,
@@ -3080,6 +3141,7 @@ use crate::config::default_empty_shell_pre_clamp_max_tokens;
             config.empty_shell_retry_backoff_base_ms,
             config.empty_shell_retry_backoff_max_ms,
             config.empty_shell_pre_clamp_max_tokens.clone(),
+            config.empty_shell_no_retry_prompt_tokens,
             config.circuit_breaker_threshold,
             config.circuit_breaker_per_model,
             config.retry_on_503,
@@ -3415,6 +3477,67 @@ use crate::config::default_empty_shell_pre_clamp_max_tokens;
             vec![8192],
             "streaming first call max_tokens should be pre-clamped 64000 -> 8192, got {:?}",
             observed
+        );
+    }
+
+    /// Long-context bypass: when the request's estimated prompt tokens are at
+    /// or above `empty_shell_no_retry_prompt_tokens` and the first upstream
+    /// call shells, the proxy must NOT retry — it surfaces 502 immediately
+    /// with outcome `retry_skipped_prompt_too_large` and makes exactly one
+    /// upstream call. failure.log showed clamp-retry on 107k+ prompts
+    /// recovered 0%; the bypass avoids the wasted round-trip. We set the
+    /// threshold tiny (2) and send a message whose est_prompt_tokens (chars/4)
+    /// exceeds it, so the logic triggers without a megabyte-sized body.
+    #[tokio::test]
+    async fn empty_shell_skips_retry_when_prompt_exceeds_no_retry_threshold() {
+        let shell = serde_json::json!({
+            "choices": [], "id": "", "model": "", "created": 0,
+            "object": "chat.completion", "service_tier": null,
+            "system_fingerprint": null, "usage": null,
+        });
+        let mock_server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/v1/chat/completions"))
+            .respond_with(move |_req: &wiremock::Request| {
+                ResponseTemplate::new(200).set_body_json(shell.clone())
+            })
+            .expect(1) // exactly ONE call — the bypass must suppress the retry
+            .mount(&mock_server)
+            .await;
+
+        let mut cfg = test_config(&mock_server.uri(), 3, 60);
+        // tiny threshold → any non-trivial prompt trips the bypass
+        cfg.empty_shell_no_retry_prompt_tokens = 2;
+        let addr = start_proxy(cfg).await;
+        let client = reqwest::Client::new();
+        // content of 12 chars → est_prompt_tokens = 12/4 = 3 ≥ 2 (threshold)
+        let resp = client
+            .post(format!("http://{}/v1/chat/completions", addr))
+            .header("content-type", "application/json")
+            .body(r#"{"model":"z-ai/glm-5.2","max_tokens":64000,"messages":[{"role":"user","content":"hello world!"}],"stream":false}"#)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            502,
+            "long-context empty shell must surface 502 immediately, got: {:?}",
+            resp.status()
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["error"]["type"].as_str(), Some("upstream_empty_shell"));
+        // No retry ran: the body must report the retry as not attempted, and the
+        // retry-clamp detail (max_tokens=8192) must be absent. (The single-call
+        // assertion above is the real proof the bypass suppressed the retry.)
+        assert_eq!(
+            body["error"]["retry"]["attempted"].as_bool(),
+            Some(false),
+            "retry must be reported as not attempted, got: {body}"
+        );
+        assert!(
+            !body["error"]["detail"].as_str().unwrap_or_default().contains("max_tokens=8192"),
+            "retry-clamp detail must be absent when retry is skipped, got: {body}"
         );
     }
 

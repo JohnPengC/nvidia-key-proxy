@@ -43,6 +43,14 @@ empty_shell_retry_max_tokens = 8192
 # Override via NVIDIA_EMPTY_SHELL_PRE_CLAMP_MAX_TOKENS (JSON map).
 # empty_shell_pre_clamp_max_tokens = { "z-ai/glm-5.2" = 8192 }
 
+# Prompt-token estimate threshold above which an empty-shell soft failure is
+# NOT retried with a clamped max_tokens; the proxy surfaces 502 immediately.
+# failure.log showed clamp-retry on 107k+ prompts recovered 0%, so retrying
+# only wastes a round-trip and a key slot. 0 disables the bypass (always
+# retry). Default 90000.
+# Override via NVIDIA_EMPTY_SHELL_NO_RETRY_PROMPT_TOKENS.
+# empty_shell_no_retry_prompt_tokens = 90000
+
 # Retry 500 Internal Server Error (transient GLM "Failed to generate
 # completions") against another key with backoff. Default true.
 # Env override: NVIDIA_RETRY_ON_500.
