@@ -91,6 +91,13 @@ pub struct Proxy {
     /// rejected with 413 before any upstream call. See
     /// Config::request_max_prompt_tokens.
     request_max_prompt_tokens: u64,
+    /// Coarse per-part token costs used to estimate the prompt size of a
+    /// **multimodal** request (image_url / input_audio content blocks), so the
+    /// 413 hard ceiling and the empty-shell no-retry soft limit aren't fooled
+    /// by inline base64 (which would balloon the estimate and falsely reject
+    /// a legal request) or by URL-only references (which would undercount).
+    /// Derived from `Config::est_*` fields. See `EstPromptCosts`.
+    est_costs: EstPromptCosts,
     /// Circuit breaker threshold for consecutive empty-shell/504/503 responses.
     circuit_breaker_threshold: u32,
     /// Whether circuit breaker tracks failures per (key, model) pair.
@@ -467,20 +474,29 @@ fn request_body_fingerprint(body: &bytes::Bytes) -> String {
     // messages count + rough prompt-token estimate + first/last role previews.
     let messages = v.get("messages").and_then(|m| m.as_array());
     let n = messages.map(|a| a.len()).unwrap_or(0);
-    let mut est_chars: usize = 0;
     // System/tool text also counts toward the prompt; sum every message's
-    // content length regardless of role.
-    if let Some(arr) = messages {
-        for m in arr {
-            match m.get("content") {
-                Some(serde_json::Value::String(s)) => est_chars += s.chars().count(),
-                Some(other) => est_chars += other.to_string().chars().count(),
-                None => {}
-            }
-        }
-    }
-    let est_tokens = est_chars / 4;
+    // content length regardless of role. Use the shared `message_content_tokens`
+    // helper so the fingerprint's `est_prompt_tokens` stays in lockstep with
+    // `estimate_prompt_tokens` (and the 413 / no-retry guards that use it) — and
+    // so a multimodal `content` array doesn't get its base64 image/audio counted
+    // as raw chars, which would either balloon (inline base64) or undercount
+    // (URL-only) vs the guards' decision. Default costs match the static helper.
+    let costs = EstPromptCosts::default_costs();
+    let est_tokens: u64 = messages
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| m.get("content"))
+                .map(|c| message_content_tokens(c, &costs))
+                .sum()
+        })
+        .unwrap_or(0);
 
+    // Preview of the first/last message's content. For a plain string we show
+    // the first 120 chars as before. For a multimodal `content` *array* we do
+    // NOT dump the serialized JSON (a single inline base64 image would be
+    // tens of thousands of chars of base64 noise in the log/failure-fp) —
+    // instead we print a compact part census: counts by block type and the
+    // leading text snippet, capped.
     let prev = |idx: usize| -> Option<String> {
         let arr = messages?;
         let m = arr.get(idx)?;
@@ -489,13 +505,50 @@ fn request_body_fingerprint(body: &bytes::Bytes) -> String {
             .and_then(|r| r.as_str())
             .unwrap_or("?")
             .to_string();
-        let content_str = match m.get("content") {
-            Some(serde_json::Value::String(s)) => s.clone(),
-            Some(other) => other.to_string(),
-            None => String::new(),
+        let preview = match m.get("content") {
+            Some(serde_json::Value::String(s)) => {
+                let c = s.chars().take(120).collect::<String>();
+                format!("content[..120]={c:?}")
+            }
+            Some(serde_json::Value::Array(parts)) => {
+                let mut text = 0u64;
+                let mut image = 0u64;
+                let mut audio = 0u64;
+                let mut other = 0u64;
+                let mut first_text: Option<String> = None;
+                for p in parts {
+                    let ty = p.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                    match ty {
+                        "text" => {
+                            text += 1;
+                            if first_text.is_none() {
+                                first_text = p
+                                    .get("text")
+                                    .and_then(|t| t.as_str())
+                                    .map(|s| s.chars().take(60).collect());
+                            }
+                        }
+                        "image_url" => image += 1,
+                        "input_audio" => audio += 1,
+                        _ => other += 1,
+                    }
+                }
+                let snippet = first_text
+                    .map(|t| format!(" text[..60]={t:?}"))
+                    .unwrap_or_default();
+                format!(
+                    "content[parts={} (text={text}+image={image}+audio={audio}+other={other}){snippet}]",
+                    parts.len()
+                )
+            }
+            Some(other) => {
+                // Non-string, non-array scalar — short, safe to preview.
+                let c = other.to_string().chars().take(120).collect::<String>();
+                format!("content[..120]={c:?}")
+            }
+            None => "content=<absent>".to_string(),
         };
-        let c = content_str.chars().take(120).collect::<String>();
-        Some(format!("role={role} content[..120]={c:?}"))
+        Some(format!("role={role} {preview}"))
     };
     let first = prev(0).unwrap_or_else(|| "<none>".to_string());
     let last = prev(n.saturating_sub(1)).unwrap_or_else(|| "<none>".to_string());
@@ -522,26 +575,152 @@ fn request_body_fingerprint(body: &bytes::Bytes) -> String {
     )
 }
 
-/// Rough prompt-token estimate (Σ message content chars / 4) parsed from a
-/// serialized chat-completions request body. Same heuristic as
-/// `request_body_fingerprint`'s `est_prompt_tokens` field, exposed as a
-/// plain number so `handle_empty_shell_failure` can compare it against the
-/// `empty_shell_no_retry_prompt_tokens` threshold. Returns None when the body
-/// isn't valid JSON or has no `messages` array. Coarse by design — it only
-/// needs to reliably separate the 107k+ shells seen in failure.log from
-/// normal requests; the threshold (default 90k) carries the safety margin.
-fn estimate_prompt_tokens(body: &bytes::Bytes) -> Option<u64> {
-    let v: serde_json::Value = serde_json::from_slice(body).ok()?;
-    let arr = v.get("messages").and_then(|m| m.as_array())?;
-    let mut est_chars: usize = 0;
-    for m in arr {
-        match m.get("content") {
-            Some(serde_json::Value::String(s)) => est_chars += s.chars().count(),
-            Some(other) => est_chars += other.to_string().chars().count(),
-            None => {}
+/// Per-type coarse token costs used when estimating the prompt size of a
+/// **multimodal** chat-completion request. NVIDIA NIM's public API only
+/// documents plain-text `content`; vision/audio models are OpenAI-compatible
+/// and accept OpenAI-style content-block arrays (`{type:"image_url",…}`,
+/// `{type:"input_audio",…}`). The proxy passes these through untouched, but
+/// its prompt-size guards (413 hard ceiling, empty-shell no-retry soft limit,
+/// and the failure-log fingerprint) must not be fooled by them:
+///
+/// - An inline base64 image is tens of thousands of characters. Counting it as
+///   `chars/4` (the text heuristic) balloons the estimate by orders of
+///   magnitude and rejects a perfectly legal multimodal request with 413.
+/// - A URL-only image is a few dozen chars and would *under*-estimate,
+///   letting an over-long prompt slip past the ceiling.
+///
+/// So each non-text part is replaced by a coarse fixed/tokenized cost instead
+/// of its raw byte length. These are heuristic knobs, configurable so an
+/// operator can tune them against a specific model's real token accounting.
+/// All zero disables the dedicated handling and falls back to counting each
+/// part's serialized length (capped) — useful only as an escape hatch.
+#[derive(Clone, Copy, Debug)]
+pub struct EstPromptCosts {
+    /// Flat token cost assigned to each `image_url` block, regardless of whether
+    /// it's a remote `https://` URL or an inline `data:…;base64,` payload.
+    /// Avoids both the base64-blowup and the URL-underestimate. 0 → unknown-part
+    /// fallback.
+    pub image_cost: u64,
+    /// Token cost per *KiB* of base64 audio payload in an `input_audio` block,
+    /// capped at `audio_token_cap`. 0 → unknown-part fallback.
+    pub audio_token_per_kb: u64,
+    /// Hard cap on the per-block audio estimate, so a single huge clip can't
+    /// blow the estimate up.
+    pub audio_token_cap: u64,
+    /// Cap applied to any content part we don't recognize (unknown `type`, an
+    /// object/array of a shape we don't model). Prevents a stray base64 blob in
+    /// an unexpected field from ballooning the estimate while still counting
+    /// *something*. Set to 0 to ignore unknown parts entirely.
+    pub unknown_part_cap: u64,
+}
+
+impl EstPromptCosts {
+    /// Conservative defaults: an image ≈ 1500 tokens (covers low-detail
+    /// OpenAI tiles + a safety margin), audio ≈ 16 tokens/KiB of base64 capped
+    /// at ~10k, unknown parts capped at 2000. Tunable via config/env.
+    pub fn default_costs() -> Self {
+        Self {
+            image_cost: 1500,
+            audio_token_per_kb: 16,
+            audio_token_cap: 10_000,
+            unknown_part_cap: 2000,
         }
     }
-    Some(est_chars as u64 / 4)
+
+    /// Coarse token cost for a single content-block `part` (an element of a
+    /// `content` array). Returns 0 for parts that contribute nothing we can
+    /// size (e.g. an object with no recognizable fields).
+    fn part_cost(&self, part: &serde_json::Value) -> u64 {
+        let ty = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        match ty {
+            // `{type:"text", text:"…"}` — the only part we can size precisely.
+            "text" => part
+                .get("text")
+                .and_then(|t| t.as_str())
+                .map(|s| s.chars().count() as u64 / 4)
+                .unwrap_or(0),
+            // `{type:"image_url", image_url:{url:"…"}}` — flat cost regardless of
+            // URL vs inline base64. Honor an explicit `detail` only insofar as
+            // NVIDIA ignores it; we don't model per-tile scaling here.
+            "image_url" if self.image_cost > 0 => self.image_cost,
+            // `{type:"input_audio", input_audio:{data:"<base64>", format:"…"}}` —
+            // base64 length is a rough proxy for clip size; cap it so one huge
+            // clip can't dominate. 3 bytes of base64 ≈ 3 chars, so /1024 of chars
+            // gives a KiB-ish count.
+            "input_audio" if self.audio_token_per_kb > 0 => {
+                let chars = part
+                    .get("input_audio")
+                    .and_then(|a| a.get("data"))
+                    .and_then(|d| d.as_str())
+                    .map(|s| s.chars().count() as u64)
+                    .unwrap_or(0);
+                // chars/1024 ≈ KiB of base64; × per-KiB cost; clamp to cap.
+                let est = (chars / 1024).saturating_mul(self.audio_token_per_kb);
+                est.min(self.audio_token_cap)
+            }
+            // Anything else (unknown type, or a known type with its dedicated
+            // cost disabled): count the serialized length but cap it, so a
+            // stray base64 blob in an unexpected shape can't blow the estimate
+            // up while still counting *something*. 0 → ignore entirely.
+            _ => {
+                if self.unknown_part_cap == 0 {
+                    return 0;
+                }
+                let raw = part.to_string().chars().count() as u64 / 4;
+                raw.min(self.unknown_part_cap)
+            }
+        }
+    }
+}
+
+/// Coarse token estimate for a single message's `content`, which may be a
+/// plain string (text-only request) or an array of typed parts (OpenAI-style
+/// multimodal). Text is `chars/4`; each non-text part is replaced by its
+/// `EstPromptCosts::part_cost` so inline base64 image/audio doesn't blow the
+/// estimate up and a URL-only image doesn't undercount it.
+fn message_content_tokens(content: &serde_json::Value, costs: &EstPromptCosts) -> u64 {
+    match content {
+        serde_json::Value::String(s) => s.chars().count() as u64 / 4,
+        serde_json::Value::Array(parts) => {
+            parts.iter().map(|p| costs.part_cost(p)).sum::<u64>()
+        }
+        // A non-string, non-array scalar (number/bool/null) — count its
+        // serialized chars/4, capped. Rare; mainly a defensive fallback.
+        other => {
+            if costs.unknown_part_cap == 0 {
+                return 0;
+            }
+            (other.to_string().chars().count() as u64 / 4).min(costs.unknown_part_cap)
+        }
+    }
+}
+
+/// Rough prompt-token estimate (Σ message content chars / 4 for text, plus a
+/// coarse per-part cost for image/audio blocks) parsed from a serialized
+/// chat-completions request body. Exposed as a plain number so the 413 hard
+/// ceiling and the empty-shell no-retry soft limit can compare against it.
+/// Returns None when the body isn't valid JSON or has no `messages` array.
+/// Coarse by design — it only needs to reliably separate the 107k+ shells seen
+/// in failure.log from normal requests; the thresholds (90k soft / 120k hard)
+/// carry the safety margin.
+///
+/// Multimodal `content` arrays are sized with `costs` so an inline base64 image
+/// (tens of thousands of chars) doesn't get divided by 4 and falsely reject a
+/// legal request, and a remote-URL image (a few dozen chars) doesn't undercount
+/// and slip past the ceiling. Plain-text `content` follows the original
+/// `chars/4` heuristic unchanged. Callers that hold the config (the two
+/// prompt-size guards on `Proxy`) pass `self.est_costs`; the failure-log
+/// fingerprint passes `EstPromptCosts::default_costs()` since it's a free
+/// function without access to config.
+fn estimate_prompt_tokens(body: &bytes::Bytes, costs: &EstPromptCosts) -> Option<u64> {
+    let v: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let arr = v.get("messages").and_then(|m| m.as_array())?;
+    let est: u64 = arr
+        .iter()
+        .filter_map(|m| m.get("content"))
+        .map(|c| message_content_tokens(c, costs))
+        .sum();
+    Some(est)
 }
 
 /// Compact fingerprint of an NVIDIA empty-shell response body — the fields that
@@ -986,6 +1165,7 @@ impl Proxy {
         empty_shell_pre_clamp_max_tokens: std::collections::HashMap<String, u64>,
         empty_shell_no_retry_prompt_tokens: u64,
         request_max_prompt_tokens: u64,
+        est_costs: EstPromptCosts,
         circuit_breaker_threshold: u32,
         circuit_breaker_per_model: bool,
         retry_on_503: bool,
@@ -1025,6 +1205,7 @@ impl Proxy {
             empty_shell_pre_clamp_max_tokens,
             empty_shell_no_retry_prompt_tokens,
             request_max_prompt_tokens,
+            est_costs,
             circuit_breaker_threshold,
             circuit_breaker_per_model,
             retry_on_503,
@@ -1619,18 +1800,24 @@ impl Proxy {
             .unwrap_or(false);
 
         // ── Hard prompt-size ceiling: reject before consuming a key/slot ──
-        // failure.log showed every first-attempt shell carried
-        // est_prompt_tokens >= 107,485 — beyond that, `prompt + any max_tokens`
-        // cannot fit glm-5.2's ~128k window and the call is guaranteed to shell
-        // (HTTP 200, choices:[], usage:null — no inference). Rather than burn
-        // a key slot and an upstream round-trip on a request that cannot
+        // failure.log showed doomed requests shell well below the prior
+        // ceilings: round 1's 77 shells fell in [98288, 109231] (under a 120000
+        // ceiling that never fired), round 2's 32 shells fell in [92488, 93445]
+        // (inside a [90k, 95k) "one-shot" grey band that produced 0% success and
+        // a misleading 502 the client retried for ~10 minutes). At ~92k
+        // estimated, `prompt + any max_tokens` already overflows glm-5.2's ~128k
+        // window (the `chars/4` estimate understates real tokens). Rather than
+        // burn a key slot and an upstream round-trip on a request that cannot
         // succeed, refuse up front with 413 and tell the client to compress its
-        // own context. We do NOT rewrite the client's messages — the client
-        // owns its conversation history (Claude Code's /compact is its to run);
-        // the proxy's job is to fail loudly, not silently munge. Disabled when
-        // `request_max_prompt_tokens == 0`.
+        // own context. We do NOT rewrite the client's messages — the client owns
+        // its conversation history (Claude Code's /compact is its to run); the
+        // proxy's job is to fail loudly, not silently munge. The ceiling
+        // (default 90000) is set EQUAL to the soft no-retry limit so there is
+        // no grey band: doomed requests hit a clear 413 immediately, zero
+        // upstream round-trip, instead of a 502 "empty chat completion" the
+        // client retries on. Disabled when `request_max_prompt_tokens == 0`.
         if self.request_max_prompt_tokens > 0 {
-            if let Some(est) = estimate_prompt_tokens(&body_bytes) {
+            if let Some(est) = estimate_prompt_tokens(&body_bytes, &self.est_costs) {
                 if est >= self.request_max_prompt_tokens {
                     warn!(
                         client_req_id = %client_req_id,
@@ -1641,6 +1828,7 @@ impl Proxy {
                          client must compress its context"
                     );
                     self.metrics.inc_error();
+                    self.metrics.inc_prompt_rejected_total(model.as_str(), "413");
                     let err = serde_json::json!({
                         "error": {
                             "message": format!(
@@ -2670,7 +2858,7 @@ async fn handle_passthrough_stream(
             && retry_attempt_already_done == 0
             && self.empty_shell_no_retry_prompt_tokens > 0
         {
-            if let Some(est) = estimate_prompt_tokens(request_body) {
+            if let Some(est) = estimate_prompt_tokens(request_body, &self.est_costs) {
                 if est >= self.empty_shell_no_retry_prompt_tokens {
                     prompt_too_large = true;
                     warn!(
@@ -3101,6 +3289,7 @@ mod proxy_integration_tests {
     use crate::metrics::Metrics;
     use crate::proxy::Proxy;
 use crate::config::default_empty_shell_pre_clamp_max_tokens;
+use crate::config::default_request_max_prompt_tokens;
 
     // Process-global guard: set once so no integration test in this module
     // writes to the on-disk failure.log used for production diagnosis.
@@ -3164,7 +3353,11 @@ use crate::config::default_empty_shell_pre_clamp_max_tokens;
             empty_shell_retry_backoff_max_ms: 5000,
             empty_shell_pre_clamp_max_tokens: default_empty_shell_pre_clamp_max_tokens(),
             empty_shell_no_retry_prompt_tokens: 90000,
-            request_max_prompt_tokens: 120000,
+            request_max_prompt_tokens: default_request_max_prompt_tokens(),
+            est_image_token_cost: 1500,
+            est_audio_token_per_kb: 16,
+            est_audio_token_cap: 10000,
+            est_unknown_part_token_cap: 2000,
             max_tokens_max: 100_000,
             concurrency_limit_per_model: std::collections::HashMap::new(),
             concurrency_queue_timeout_ms: 5000,
@@ -3197,6 +3390,12 @@ use crate::config::default_empty_shell_pre_clamp_max_tokens;
             config.empty_shell_pre_clamp_max_tokens.clone(),
             config.empty_shell_no_retry_prompt_tokens,
             config.request_max_prompt_tokens,
+            crate::proxy::EstPromptCosts {
+                image_cost: config.est_image_token_cost,
+                audio_token_per_kb: config.est_audio_token_per_kb,
+                audio_token_cap: config.est_audio_token_cap,
+                unknown_part_cap: config.est_unknown_part_token_cap,
+            },
             config.circuit_breaker_threshold,
             config.circuit_breaker_per_model,
             config.retry_on_503,
@@ -3653,6 +3852,177 @@ use crate::config::default_empty_shell_pre_clamp_max_tokens;
         assert!(
             body["error"]["est_prompt_tokens"].as_u64().unwrap_or(0) >= 5,
             "body should expose the estimated prompt tokens at/above the ceiling, got: {body}"
+        );
+    }
+
+    /// Multimodal guard regression: a request carrying an inline base64
+    /// `image_url` (50_000 chars of payload) must NOT be 413'd by the prompt
+    /// ceiling. Under the old chars/4 heuristic the base64 alone would estimate
+    /// to ~12_500 tokens; with the multimodal cost it collapses to
+    /// `image_cost` (default 1500). We set the ceiling to 3000 so the OLD
+    /// heuristic would reject (12500 ≥ 3000) while the NEW one passes
+    /// (1500 < 3000) — and exactly one upstream call is made.
+    #[tokio::test]
+    async fn multimodal_inline_image_not_rejected_by_prompt_ceiling() {
+        let mock_server = MockServer::start().await;
+        // Exactly one upstream call: the request passes the 413 check and is forwarded.
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(
+                    r#"{"choices":[{"index":0,"message":{"role":"assistant","content":"a cat"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1500,"completion_tokens":3,"total_tokens":1503}}"#,
+                ),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let mut cfg = test_config(&mock_server.uri(), 3, 60);
+        cfg.request_max_prompt_tokens = 3000; // old heuristic (12500) would 413; new (1500) passes
+        let addr = start_proxy(cfg).await;
+        let client = reqwest::Client::new();
+        let big_b64 = "A".repeat(50_000);
+        let body = serde_json::json!({
+            "model": "nvidia/neva-13b-vision-instruct",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type":"text","text":"what is this?"},
+                    {"type":"image_url","image_url":{"url": format!("data:image/png;base64,{big_b64}")}}
+                ]
+            }],
+            "stream": false
+        });
+        let resp = client
+            .post(format!("http://{}/v1/chat/completions", addr))
+            .header("content-type", "application/json")
+            .body(body.to_string())
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            200,
+            "multimodal request with inline base64 image must NOT be 413'd, got: {:?}",
+            resp.status()
+        );
+    }
+
+    /// Multimodal guard keeps its teeth: even with a base64 image aboard, a
+    /// request whose *text* alone exceeds the ceiling is still 413'd — the image
+    /// cost exemption must not become a hole that lets over-long text through.
+    /// Zero upstream calls expected.
+    #[tokio::test]
+    async fn multimodal_with_long_text_still_rejected_by_prompt_ceiling() {
+        let mock_server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0) // 413 fires before any upstream call
+            .mount(&mock_server)
+            .await;
+
+        let mut cfg = test_config(&mock_server.uri(), 3, 60);
+        cfg.request_max_prompt_tokens = 3000;
+        let addr = start_proxy(cfg).await;
+        let client = reqwest::Client::new();
+        let big_b64 = "A".repeat(50_000);
+        // 20_000 chars of text → 5000 tokens from text alone, ≥ 3000 ceiling.
+        let long_text = "x".repeat(20_000);
+        let body = serde_json::json!({
+            "model": "nvidia/neva-13b-vision-instruct",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type":"text","text": long_text},
+                    {"type":"image_url","image_url":{"url": format!("data:image/png;base64,{big_b64}")}}
+                ]
+            }],
+            "stream": false
+        });
+        let resp = client
+            .post(format!("http://{}/v1/chat/completions", addr))
+            .header("content-type", "application/json")
+            .body(body.to_string())
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            413,
+            "multimodal request whose text exceeds the ceiling must still be 413'd, got: {:?}",
+            resp.status()
+        );
+        let err: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            err["error"]["type"].as_str(),
+            Some("request_too_large"),
+            "should still classify as request_too_large, got: {err}"
+        );
+    }
+
+    /// Body normalization must preserve a multimodal `content` array verbatim:
+    /// the model alias / max_tokens / reasoning_effort rewrites touch only
+    /// top-level scalar fields, never `messages[].content`. We forward the body
+    /// back out of the mock so we can assert the content array is unchanged.
+    #[tokio::test]
+    async fn multimodal_content_array_preserved_through_normalization() {
+        let mock_server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(
+                    r#"{"choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#,
+                ),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        // Alias the client-facing name to an NVIDIA id so the normalization
+        // path (which rewrites top-level fields) actually runs.
+        let mut cfg = test_config(&mock_server.uri(), 3, 60);
+        cfg.model_aliases.insert(
+            "gpt-4o".to_string(),
+            "meta/llama-3.2-90b-vision-instruct".to_string(),
+        );
+        let addr = start_proxy(cfg).await;
+        let client = reqwest::Client::new();
+
+        let content_arr = serde_json::json!([
+            {"type":"text","text":"what is this?"},
+            {"type":"image_url","image_url":{"url":"https://example.com/cat.png","detail":"high"}},
+            {"type":"input_audio","input_audio":{"data":"QkFTRTY0","format":"wav"}}
+        ]);
+        let body = serde_json::json!({
+            "model": "gpt-4o",
+            "max_tokens": 256,
+            "messages": [{"role":"user","content": content_arr.clone()}]
+        });
+        let _resp = client
+            .post(format!("http://{}/v1/chat/completions", addr))
+            .header("content-type", "application/json")
+            .body(body.to_string())
+            .send()
+            .await
+            .unwrap();
+
+        // Read what the proxy actually forwarded upstream from the mock's log.
+        let received = &mock_server.received_requests().await.expect("recorded")[0];
+        let fwd: serde_json::Value = serde_json::from_slice(&received.body).unwrap();
+        // model alias was rewritten (proves normalization ran)…
+        assert_eq!(
+            fwd["model"].as_str(),
+            Some("meta/llama-3.2-90b-vision-instruct"),
+            "alias should have been rewritten before forwarding, got: {fwd}"
+        );
+        // …but the content array is byte-for-byte identical to what the client sent.
+        assert_eq!(
+            fwd["messages"][0]["content"],
+            content_arr,
+            "multimodal content array must be preserved verbatim through normalization, got: {fwd}"
         );
     }
 
@@ -4378,6 +4748,207 @@ use crate::config::default_empty_shell_pre_clamp_max_tokens;
 #[cfg(test)]
 mod usage_accounting_tests {
     use super::*;
+
+    // ==================== Multimodal prompt-token estimation ====================
+    //
+    // `estimate_prompt_tokens` / `message_content_tokens` / `EstPromptCosts`
+    // must size a multimodal `content` array by coarse per-part costs (image,
+    // audio) instead of the raw serialized length, so an inline base64 image
+    // (tens of thousands of chars) doesn't balloon the estimate and falsely
+    // trip the 413 hard ceiling / empty-shell no-retry soft limit, and a
+    // URL-only image (a few dozen chars) doesn't undercount and slip past it.
+
+    /// A plain-text request keeps the original `chars/4` heuristic unchanged,
+    /// so existing 413 / no-retry behavior does not regress for text traffic.
+    #[test]
+    fn estimate_prompt_tokens_text_unchanged_chars_div_4() {
+        let costs = EstPromptCosts::default_costs();
+        let body = bytes::Bytes::from(
+            r#"{"messages":[{"role":"user","content":"twenty four chars here!!"}]}"#,
+        );
+        // 24 chars / 4 = 6
+        assert_eq!(
+            estimate_prompt_tokens(&body, &costs),
+            Some(6),
+            "text content must stay chars/4"
+        );
+    }
+
+    /// An inline base64 `image_url` (50_000 chars of payload) must NOT be
+    /// counted as 50_000/4 = 12_500 tokens — it collapses to the flat image
+    /// cost (default 1500), so a legal multimodal request isn't 413'd.
+    #[test]
+    fn estimate_prompt_tokens_inline_base64_image_collapses_to_image_cost() {
+        let costs = EstPromptCosts::default_costs();
+        let big_b64 = "A".repeat(50_000);
+        let body = serde_json::json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type":"text","text":"what is this?"},
+                    {"type":"image_url","image_url":{"url": format!("data:image/png;base64,{big_b64}")}}
+                ]
+            }]
+        });
+        let bytes = bytes::Bytes::from(body.to_string());
+        let est = estimate_prompt_tokens(&bytes, &costs).expect("valid body");
+        // text "what is this?" = 14 chars / 4 = 3; + image_cost 1500 = 1503.
+        // The base64 payload (50k chars) must NOT inflate this to ~12500.
+        assert_eq!(
+            est, 1503,
+            "base64 image must collapse to image_cost, not chars/4; got {est}"
+        );
+    }
+
+    /// A URL-only `image_url` (a few dozen chars) must NOT undercount — it
+    /// still costs the same flat `image_cost`, so a request packing many
+    /// remote images can't slip past the ceiling for free.
+    #[test]
+    fn estimate_prompt_tokens_url_image_costs_image_cost_not_chars() {
+        let costs = EstPromptCosts::default_costs();
+        let body = serde_json::json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type":"text","text":"hi"},
+                    {"type":"image_url","image_url":{"url":"https://x.example/img.png"}},
+                    {"type":"image_url","image_url":{"url":"https://x.example/img2.png"}}
+                ]
+            }]
+        });
+        let bytes = bytes::Bytes::from(body.to_string());
+        let est = estimate_prompt_tokens(&bytes, &costs).expect("valid body");
+        // "hi"/4 = 0 (2 chars); two images × 1500 = 3000 exactly.
+        assert_eq!(
+            est, 3000,
+            "two URL images should cost exactly 3000 (2× image_cost), not undercount by URL length; got {est}"
+        );
+    }
+
+    /// An `input_audio` block is sized by base64 length (KiB-ish) × per-KiB cost,
+    /// capped — so a modest clip costs a bounded amount and a giant one can't
+    /// dominate unboundedly.
+    #[test]
+    fn estimate_prompt_tokens_input_audio_sized_and_capped() {
+        let costs = EstPromptCosts::default_costs(); // 16 per KiB, cap 10000
+        // 8192 chars ≈ 8 "KiB" (chars/1024=8) × 16 = 128 tokens — well under cap.
+        let mid_b64 = "B".repeat(8192);
+        let body = serde_json::json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type":"input_audio","input_audio":{"data": mid_b64, "format":"wav"}}
+                ]
+            }]
+        });
+        let bytes = bytes::Bytes::from(body.to_string());
+        let est = estimate_prompt_tokens(&bytes, &costs).expect("valid body");
+        assert_eq!(est, 128, "8KiB base64 audio @ 16/KiB = 128 tokens, got {est}");
+
+        // 1_000_000 chars ≈ 976 "KiB" × 16 = 15616 → capped at 10000.
+        let huge_b64 = "C".repeat(1_000_000);
+        let body = serde_json::json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type":"input_audio","input_audio":{"data": huge_b64, "format":"wav"}}
+                ]
+            }]
+        });
+        let bytes = bytes::Bytes::from(body.to_string());
+        let est = estimate_prompt_tokens(&bytes, &costs).expect("valid body");
+        assert_eq!(est, costs.audio_token_cap, "huge audio clip must hit the cap, got {est}");
+    }
+
+    /// An unrecognized content-block type is sized by its serialized length
+    /// capped at `unknown_part_cap`, so a stray base64 blob in an unexpected
+    /// shape can't balloon the estimate while still counting *something*.
+    #[test]
+    fn estimate_prompt_tokens_unknown_part_capped() {
+        let costs = EstPromptCosts::default_costs(); // unknown cap = 2000
+        let big = "Z".repeat(50_000);
+        let body = serde_json::json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type":"video/embed","url": format!("data:video/mp4;base64,{big}")}
+                ]
+            }]
+        });
+        let bytes = bytes::Bytes::from(body.to_string());
+        let est = estimate_prompt_tokens(&bytes, &costs).expect("valid body");
+        assert_eq!(
+            est, costs.unknown_part_cap,
+            "unknown part must be capped, not chars/4 (~12500); got {est}"
+        );
+    }
+
+    /// `EstPromptCosts::part_cost` returns 0 for an empty/text-less text block
+    /// and never panics on parts missing expected sub-fields.
+    #[test]
+    fn part_cost_handles_missing_fields_without_panic() {
+        let costs = EstPromptCosts::default_costs();
+        // text block with no `text` field → 0
+        assert_eq!(costs.part_cost(&serde_json::json!({"type":"text"})), 0);
+        // image_url still flat-costs even with no inner object
+        assert_eq!(
+            costs.part_cost(&serde_json::json!({"type":"image_url"})),
+            costs.image_cost
+        );
+        // input_audio with no `data` → 0 chars → 0 tokens
+        assert_eq!(
+            costs.part_cost(&serde_json::json!({"type":"input_audio","input_audio":{"format":"wav"}})),
+            0
+        );
+        // no `type` at all → unknown path, capped (and never panics)
+        let unknown_cost = costs.part_cost(&serde_json::json!({"foo":"bar"}));
+        assert!(
+            unknown_cost <= costs.unknown_part_cap,
+            "unknown part must not exceed unknown_part_cap, got {unknown_cost}"
+        );
+    }
+
+    /// The request fingerprint of a multimodal request must surface a part
+    /// census (text/image/audio counts) and must NOT dump the base64 payload
+    /// — a 40k-char image would otherwise flood failure.log.
+    #[test]
+    fn request_body_fingerprint_multimodal_no_base64_dump() {
+        let big_b64 = "Q".repeat(40_000);
+        let body = serde_json::json!({
+            "model": "nvidia/neva-13b-vision-instruct",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type":"text","text":"describe this"},
+                    {"type":"image_url","image_url":{"url": format!("data:image/png;base64,{big_b64}")}},
+                    {"type":"input_audio","input_audio":{"data": big_b64.clone(), "format":"wav"}}
+                ]
+            }]
+        });
+        let bytes = bytes::Bytes::from(body.to_string());
+        let fp = request_body_fingerprint(&bytes);
+        // Census present
+        assert!(fp.contains("text=1"), "missing text census in: {fp}");
+        assert!(fp.contains("image=1"), "missing image census in: {fp}");
+        assert!(fp.contains("audio=1"), "missing audio census in: {fp}");
+        // No base64 payload leaked
+        assert!(!fp.contains("QQQQQ"), "base64 payload must not leak into fp: {fp}");
+        // Still carries the role + a bounded text snippet
+        assert!(fp.contains("role=user"), "missing role in: {fp}");
+        // est_prompt_tokens must be the multimodal coarse est: image 1500 +
+        // audio ((40000/1024)*16 = 608, < cap 10000) = 2108 + tiny text/4.
+        // NOT chars/4 over the ~80k-char body (~20000).
+        let est = fp
+            .split("est_prompt_tokens=~")
+            .nth(1)
+            .and_then(|s| s.split_whitespace().next())
+            .and_then(|n| n.parse::<u64>().ok())
+            .unwrap_or(u64::MAX);
+        assert!(
+            est < 5000,
+            "fingerprint est must use multimodal costs, not chars/4 (would be ~20000); got {est}"
+        );
+    }
 
     #[test]
     fn parse_usage_pulls_components() {

@@ -170,25 +170,75 @@ pub struct Config {
     /// Hard ceiling on a request's estimated prompt tokens: a non-streaming or
     /// streaming chat-completions request whose estimated prompt size is at or
     /// above this limit is rejected up front with HTTP 413 (no upstream call),
-    /// asking the client to compress its context itself. failure.log showed
-    /// every first-attempt shell carried est_prompt_tokens >= 107,485 — once
-    /// the prompt is that large, `prompt + any max_tokens` cannot fit the
-    /// model's context window, so the call is guaranteed to shell. The proxy
-    /// refuses rather than burn an upstream round-trip and a key slot on a
-    /// request that cannot succeed. The Auto-compact is the client's job
-    /// (Claude Code owns its conversation history); we surface a clear 413
-    /// instead of silently rewriting the client's messages.
-    /// This is a *hard* limit, intentionally above
-    /// `empty_shell_no_retry_prompt_tokens` (the soft limit that still lets one
-    /// attempt run, just suppressing the retry): requests between the soft and
-    /// hard limits get one shot and, if they shell, surface 502 without retry;
-    /// requests at/above the hard limit are refused outright.
-    /// 0 disables the hard limit (always let the first call go out).
-    /// Default 120000 (just above the 107k shell floor, so only truly doomed
-    /// requests are refused).
+    /// asking the client to compress its context itself. The proxy refuses
+    /// rather than burn an upstream round-trip and a key slot on a request that
+    /// cannot succeed. Auto-compact is the client's job (Claude Code owns its
+    /// conversation history); we surface a clear 413 instead of silently
+    /// rewriting the client's messages.
+    ///
+    /// **Set EQUAL to `empty_shell_no_retry_prompt_tokens` (both default 90000)
+    /// — there is deliberately no grey band between the soft and hard limits.**
+    /// Requests at/above the hard limit are refused outright (413); requests
+    /// below the soft limit run the normal retry path. The two rounds of
+    /// measurement that collapsed the band are in the `default_*` rationale
+    /// below. 0 disables the hard limit (always let the first call go out).
+    ///
+    /// Default 90000. Tuned in two rounds from the actual shell distribution in
+    /// failure.log:
+    /// (1) With the ceiling at 120000, every one of 77 observed shells carried
+    ///     est_prompt_tokens in [98288, 109231] — none ever reached 120k, so the
+    ///     413 guard never fired and every doomed /compact surfaced as a 502
+    ///     "empty chat completion" the client retried for ~10 minutes instead of
+    ///     an honest 413. (The `chars/4` estimate understates real tokens, so a
+    ///     ~109k estimate already overflows a ~128k model window once max_tokens
+    ///     is added in.) Dropped to 95000.
+    /// (2) With the ceiling at 95000 (a [90k, 95k) "one-shot" grey band still
+    ///     allowed one attempt), all 32 of the next-day's shells carried est in
+    ///     [92488, 93445] — every one fell inside that band and all 32 shelled
+    ///     (0% success). The band gave Claude Code a 502 it retried for ~10
+    ///     minutes (the same failure mode as round 1) instead of a clear 413 it
+    ///     would have honored at once. The measured shell floor had also dropped
+    ///     from 98288 to 92488 as the session grew.
+    /// So 90000 collapses the band: sits below both measured floors, and any
+    /// est >= 90000 → 413 immediately, zero upstream round-trip, zero client
+    /// retry storm. If `chars/4` is later replaced by a more accurate estimator,
+    /// revisit whether a small grey band can be re-introduced.
     /// Override via `NVIDIA_REQUEST_MAX_PROMPT_TOKENS`.
     #[serde(default = "default_request_max_prompt_tokens")]
     pub request_max_prompt_tokens: u64,
+
+    // ==================== Multimodal prompt-token estimation ====================
+    /// Coarse per-part token cost assigned to each `{type:"image_url",…}` block
+    /// when estimating a multimodal request's prompt size, regardless of whether
+    /// the URL is a remote `https://` reference or an inline `data:…;base64,`
+    /// payload. The proxy forwards multimodal bodies untouched, but its prompt
+    /// guards (413 hard ceiling, empty-shell no-retry soft limit) must not be
+    /// fooled: counting a base64 image as `chars/4` balloons the estimate by
+    /// orders of magnitude and rejects a legal request with 413, while a
+    /// URL-only image undercounts and lets an over-long prompt slip past.
+    /// Default 1500. 0 falls back to the unknown-part cost. Override via
+    /// `NVIDIA_EST_IMAGE_TOKEN_COST`.
+    #[serde(default = "default_est_image_token_cost")]
+    pub est_image_token_cost: u64,
+    /// Token cost per *KiB* of base64 audio payload in an
+    /// `{type:"input_audio",…}` block, capped at `est_audio_token_cap`.
+    /// Default 16. 0 falls back to the unknown-part cost. Override via
+    /// `NVIDIA_EST_AUDIO_TOKEN_PER_KB`.
+    #[serde(default = "default_est_audio_token_per_kb")]
+    pub est_audio_token_per_kb: u64,
+    /// Hard cap on the per-block audio estimate, so one huge clip can't blow
+    /// the estimate up. Default 10000. Override via
+    /// `NVIDIA_EST_AUDIO_TOKEN_CAP`.
+    #[serde(default = "default_est_audio_token_cap")]
+    pub est_audio_token_cap: u64,
+    /// Cap applied to any content part of an unrecognized shape (unknown
+    /// `type`, or a known type whose dedicated cost is 0): its serialized
+    /// `chars/4` is counted but clamped here, so a stray base64 blob in an
+    /// unexpected field can't balloon the estimate while still counting
+    /// *something*. Default 2000. 0 ignores unknown parts entirely. Override
+    /// via `NVIDIA_EST_UNKNOWN_PART_TOKEN_CAP`.
+    #[serde(default = "default_est_unknown_part_token_cap")]
+    pub est_unknown_part_token_cap: u64,
 
     /// Optional ceiling for max_tokens validation. Any request with max_tokens
     /// > this value will have the field dropped (model default used). Default
@@ -291,8 +341,28 @@ fn default_empty_shell_no_retry_prompt_tokens() -> u64 {
     90000
 }
 
-fn default_request_max_prompt_tokens() -> u64 {
-    120000
+/// Public wrapper for the hard prompt-token ceiling default. Used by test
+/// scaffolds in `proxy.rs` / `key_pool.rs` / `integration_test.rs` so their
+/// hand-built `Config` follows the production default without restating the
+/// literal (mirrors `default_empty_shell_pre_clamp_max_tokens`).
+pub fn default_request_max_prompt_tokens() -> u64 {
+    90000
+}
+
+fn default_est_image_token_cost() -> u64 {
+    1500
+}
+
+fn default_est_audio_token_per_kb() -> u64 {
+    16
+}
+
+fn default_est_audio_token_cap() -> u64 {
+    10000
+}
+
+fn default_est_unknown_part_token_cap() -> u64 {
+    2000
 }
 
 fn default_circuit_breaker_threshold() -> u32 {
@@ -416,6 +486,19 @@ impl fmt::Debug for Config {
             .field(
                 "request_max_prompt_tokens",
                 &self.request_max_prompt_tokens,
+            )
+            .field(
+                "est_image_token_cost",
+                &self.est_image_token_cost,
+            )
+            .field(
+                "est_audio_token_per_kb",
+                &self.est_audio_token_per_kb,
+            )
+            .field("est_audio_token_cap", &self.est_audio_token_cap)
+            .field(
+                "est_unknown_part_token_cap",
+                &self.est_unknown_part_token_cap,
             )
             .field(
                 "circuit_breaker_threshold",
@@ -598,6 +681,10 @@ impl Config {
             empty_shell_pre_clamp_max_tokens: default_empty_shell_pre_clamp_max_tokens(),
             empty_shell_no_retry_prompt_tokens: default_empty_shell_no_retry_prompt_tokens(),
             request_max_prompt_tokens: default_request_max_prompt_tokens(),
+            est_image_token_cost: default_est_image_token_cost(),
+            est_audio_token_per_kb: default_est_audio_token_per_kb(),
+            est_audio_token_cap: default_est_audio_token_cap(),
+            est_unknown_part_token_cap: default_est_unknown_part_token_cap(),
             circuit_breaker_threshold: default_circuit_breaker_threshold(),
             circuit_breaker_per_model: default_circuit_breaker_per_model(),
             retry_on_503: default_retry_on_503(),
@@ -922,6 +1009,26 @@ impl Config {
                         config.request_max_prompt_tokens = v;
                     }
                 }
+                "est_image_token_cost" => {
+                    if let Ok(v) = value.parse::<u64>() {
+                        config.est_image_token_cost = v;
+                    }
+                }
+                "est_audio_token_per_kb" => {
+                    if let Ok(v) = value.parse::<u64>() {
+                        config.est_audio_token_per_kb = v;
+                    }
+                }
+                "est_audio_token_cap" => {
+                    if let Ok(v) = value.parse::<u64>() {
+                        config.est_audio_token_cap = v;
+                    }
+                }
+                "est_unknown_part_token_cap" => {
+                    if let Ok(v) = value.parse::<u64>() {
+                        config.est_unknown_part_token_cap = v;
+                    }
+                }
                 "max_tokens_max" => {
                     if let Ok(v) = value.parse::<u64>() {
                         config.max_tokens_max = v;
@@ -1024,6 +1131,10 @@ mod config_validation_tests {
             empty_shell_pre_clamp_max_tokens: default_empty_shell_pre_clamp_max_tokens(),
             empty_shell_no_retry_prompt_tokens: default_empty_shell_no_retry_prompt_tokens(),
             request_max_prompt_tokens: default_request_max_prompt_tokens(),
+            est_image_token_cost: default_est_image_token_cost(),
+            est_audio_token_per_kb: default_est_audio_token_per_kb(),
+            est_audio_token_cap: default_est_audio_token_cap(),
+            est_unknown_part_token_cap: default_est_unknown_part_token_cap(),
             circuit_breaker_threshold: 3,
             circuit_breaker_per_model: true,
             retry_on_503: true,
