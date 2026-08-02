@@ -840,6 +840,7 @@ mod retry_state_machine_tests {
     use crate::config::{
         AuthConfig, CooldownConfig, HealthCheckConfig, ObservabilityConfig, RateLimiterConfig,
         default_empty_shell_pre_clamp_max_tokens,
+        default_request_max_prompt_tokens,
     };
 
     fn build_pool(keys: &[&str]) -> KeyPool {
@@ -882,7 +883,11 @@ mod retry_state_machine_tests {
             empty_shell_retry_backoff_max_ms: 5000,
             empty_shell_pre_clamp_max_tokens: default_empty_shell_pre_clamp_max_tokens(),
             empty_shell_no_retry_prompt_tokens: 90000,
-            request_max_prompt_tokens: 120000,
+            request_max_prompt_tokens: default_request_max_prompt_tokens(),
+            est_image_token_cost: 1500,
+            est_audio_token_per_kb: 16,
+            est_audio_token_cap: 10000,
+            est_unknown_part_token_cap: 2000,
             circuit_breaker_threshold: 3,
             circuit_breaker_per_model: true,
             retry_on_503: true,
@@ -1010,6 +1015,7 @@ mod score_selection_tests {
     use crate::config::{
         AuthConfig, CooldownConfig, HealthCheckConfig, ObservabilityConfig, RateLimiterConfig,
         default_empty_shell_pre_clamp_max_tokens,
+        default_request_max_prompt_tokens,
     };
 
     fn build_pool_with_keys(keys: &[&str], qps: f64, burst: u64) -> KeyPool {
@@ -1052,7 +1058,11 @@ mod score_selection_tests {
             empty_shell_retry_backoff_max_ms: 5000,
             empty_shell_pre_clamp_max_tokens: default_empty_shell_pre_clamp_max_tokens(),
             empty_shell_no_retry_prompt_tokens: 90000,
-            request_max_prompt_tokens: 120000,
+            request_max_prompt_tokens: default_request_max_prompt_tokens(),
+            est_image_token_cost: 1500,
+            est_audio_token_per_kb: 16,
+            est_audio_token_cap: 10000,
+            est_unknown_part_token_cap: 2000,
             circuit_breaker_threshold: 3,
             circuit_breaker_per_model: true,
             retry_on_503: true,
@@ -1179,6 +1189,7 @@ mod runtime_key_tests {
     use crate::config::{
         AuthConfig, CooldownConfig, HealthCheckConfig, ObservabilityConfig, RateLimiterConfig,
         default_empty_shell_pre_clamp_max_tokens,
+        default_request_max_prompt_tokens,
     };
 
     fn pool(keys: &[&str]) -> KeyPool {
@@ -1221,7 +1232,11 @@ mod runtime_key_tests {
             empty_shell_retry_backoff_max_ms: 5000,
             empty_shell_pre_clamp_max_tokens: default_empty_shell_pre_clamp_max_tokens(),
             empty_shell_no_retry_prompt_tokens: 90000,
-            request_max_prompt_tokens: 120000,
+            request_max_prompt_tokens: default_request_max_prompt_tokens(),
+            est_image_token_cost: 1500,
+            est_audio_token_per_kb: 16,
+            est_audio_token_cap: 10000,
+            est_unknown_part_token_cap: 2000,
             circuit_breaker_threshold: 3,
             circuit_breaker_per_model: true,
             retry_on_503: true,

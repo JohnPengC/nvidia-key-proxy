@@ -53,12 +53,39 @@ empty_shell_retry_max_tokens = 8192
 
 # Hard ceiling on estimated prompt tokens: a request at/above this is rejected
 # with HTTP 413 before any upstream call, asking the client to compress its own
-# context. failure.log showed 107k+ prompts always shell; we refuse instead of
-# burning a key slot. Does NOT rewrite the client's messages. HARD limit above
-# the soft 90k knob (90k–120k gets one shot + 502-on-shell; 120k+ refused).
-# 0 disables. Default 120000.
+# context. Set EQUAL to the soft `empty_shell_no_retry_prompt_tokens` (both
+# 90000) — no grey band between them. Two rounds of measurement showed any
+# "one shot" band just produced guaranteed shells + a misleading 502 the client
+# retried for minutes: at ~92k estimated (chars/4, which understates real
+# tokens), `prompt + max_tokens` already overflows glm-5.2's ~128k window. So
+# est >= 90000 → 413 immediately, zero upstream round-trip. Does NOT rewrite the
+# client's messages. 0 disables. Default 90000.
 # Override via NVIDIA_REQUEST_MAX_PROMPT_TOKENS.
-# request_max_prompt_tokens = 120000
+# request_max_prompt_tokens = 90000
+
+# ── Multimodal prompt-token estimation ───────────────────────────────────────
+# The proxy forwards OpenAI-style multimodal content arrays (image_url /
+# input_audio blocks) to NVIDIA NIM untouched. The prompt-token estimate used
+# by the 413 hard ceiling and the 90k empty-shell soft limit must NOT be fooled
+# by them: an inline base64 `data:…;base64,…` image is tens of thousands of
+# chars (chars/4 would balloon the estimate and 413 a legal request), and a
+# URL-only image is a few dozen chars (would undercount and slip past).
+# So each non-text content block is replaced by a coarse fixed/tokenized cost:
+#   {type:"text"}        → chars/4 as before
+#   {type:"image_url"}   → est_image_token_cost (flat, URL or base64 alike)
+#   {type:"input_audio"} → est_audio_token_per_kb × (base64 chars/1024),
+#                          capped at est_audio_token_cap
+#   anything else        → chars/4 capped at est_unknown_part_token_cap,
+#                          so a stray base64 blob can't blow the estimate up.
+# Defaults tuned conservatively; override per-environment as needed.
+# Env overrides: NVIDIA_EST_IMAGE_TOKEN_COST,
+#                 NVIDIA_EST_AUDIO_TOKEN_PER_KB,
+#                 NVIDIA_EST_AUDIO_TOKEN_CAP,
+#                 NVIDIA_EST_UNKNOWN_PART_TOKEN_CAP.
+# est_image_token_cost      = 1500
+# est_audio_token_per_kb    = 16
+# est_audio_token_cap       = 10000
+# est_unknown_part_token_cap = 2000
 
 # Retry 500 Internal Server Error (transient GLM "Failed to generate
 # completions") against another key with backoff. Default true.

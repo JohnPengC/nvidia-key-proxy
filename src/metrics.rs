@@ -168,6 +168,27 @@ pub fn empty_shell_total() -> &'static CounterVec {
     })
 }
 
+/// Total requests rejected up front by the hard prompt-token ceiling (HTTP 413,
+/// `prompt_tokens_exceeds_ceiling`), by model and outcome. Symmetric to
+/// `proxy_empty_shell_total` (which counts the upstream-side soft failure):
+/// this counts the **proxy-side** pre-rejection. outcome is currently always
+/// `"413"`; kept as a label so a future finer breakdown (e.g. distinguishing
+/// the hard ceiling from other in-front-door rejections) can slot in without a
+/// metric rename. Without it, 413 rejections are indistinguishable from other
+/// non-2xx in `proxy_requests_errors_total`, so an operator has no way to tell
+/// whether the ceiling is firing on real traffic or sitting idle.
+pub fn prompt_rejected_total() -> &'static CounterVec {
+    static PRT: OnceLock<CounterVec> = OnceLock::new();
+    PRT.get_or_init(|| {
+        register_counter_vec!(
+            "proxy_prompt_rejected_total",
+            "Total requests rejected by the hard prompt-token ceiling (413), by model and outcome",
+            &["model", "outcome"]
+        )
+        .unwrap()
+    })
+}
+
 /// Total empty-shell retry attempts, by model.
 pub fn empty_shell_retry_attempts_total() -> &'static CounterVec {
     static ESR: OnceLock<CounterVec> = OnceLock::new();
@@ -270,6 +291,11 @@ impl Metrics {
 
     pub fn inc_empty_shell_total(&self, model: &str, outcome: &str) {
         empty_shell_total().with_label_values(&[model, outcome]).inc();
+    }
+
+    /// Increment the hard-ceiling 413 rejection counter. See `prompt_rejected_total`.
+    pub fn inc_prompt_rejected_total(&self, model: &str, outcome: &str) {
+        prompt_rejected_total().with_label_values(&[model, outcome]).inc();
     }
 
     pub fn inc_empty_shell_retry_attempts_total(&self, model: &str) {

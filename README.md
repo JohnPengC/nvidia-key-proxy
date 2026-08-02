@@ -13,6 +13,7 @@ A lightweight, high‑performance proxy written in Rust that fronts multiple NVI
 - **Concurrency limiting** – per-model semaphore prevents overwhelming upstream workers (e.g., nemotron-3-ultra's 32-worker limit); queue timeout returns 503 with `Retry-After`.
 - **Network resilience** – configurable connection pool (idle timeout 90s, connect timeout 5s), retry jitter (default 100ms), network error metrics.
 - **Request normalization** – coalesces invalid `max_tokens`/`reasoning_effort`/`tools` fields instead of hard 400; remaps model aliases; injects `stream_options.include_usage`.
+- **Multimodal pass-through** – forwards OpenAI-style content-block arrays (`image_url`, `input_audio`) to NVIDIA NIM vision/audio models unchanged, and estimates their prompt size by coarse per-part costs (not raw byte length) so an inline base64 image doesn't trip the 413 ceiling and a URL image doesn't undercount. Video is not supported (NIM has no standardized video input).
 - **Configuration validation** – fails fast on placeholder `base_url`/keys, warns on overly short timeouts.
 - **Streaming timeout** – separate `request_timeout_streaming_seconds` for long generations.
 - **max_tokens validation** – drops invalid `max_tokens` (≤0, >100k, non‑numeric, negative strings) before they hit NVIDIA.
@@ -151,6 +152,10 @@ A lightweight, high‑performance proxy written in Rust that fronts multiple NVI
 | `empty_shell_pre_clamp_max_tokens` | Per-model `max_tokens` ceiling clamped on the *first* upstream call (streaming included) | `{"z-ai/glm-5.2": 32000, "nvidia/nemotron-3-ultra-550b-a55b": 8192}` |
 | `circuit_breaker_threshold` | Consecutive shell/504 before cooldown (0 = disabled) | `3` |
 | `max_tokens_max` | Ceiling for `max_tokens` validation; drop field if exceeded | `100_000` |
+| `est_image_token_cost` | Flat token cost per `image_url` block in the prompt-size estimate (URL or inline base64 alike) | `1500` |
+| `est_audio_token_per_kb` | Token cost per KiB of base64 in an `input_audio` block | `16` |
+| `est_audio_token_cap` | Hard cap on the per-block audio estimate | `10000` |
+| `est_unknown_part_token_cap` | Cap on any unrecognized content-block type's serialized length | `2000` |
 | `retry_on_503` | Retry 503 (Worker resource exhausted) against another key | `true` |
 | `retry_on_500` | Retry 500 `Failed to generate completions` against another key | `true` |
 | `allow_local_base_url` | Permit a loopback/localhost `base_url` (testing only) | `false` |
@@ -345,6 +350,36 @@ from "pure forwarding" and is listed here so the behavior is predictable:
 - **`error.code` is coerced to a string** in both buffered and SSE error
   responses, because NVIDIA returns a numeric `code` while OpenAI-compatible
   clients expect a string.
+- **Multimodal content is passed through verbatim**: a message `content` array
+  of OpenAI-style blocks (`{type:"text",…}`, `{type:"image_url",…}`,
+  `{type:"input_audio",…}`) reaches NVIDIA unchanged — the body-normalization
+  rewrites touch only top-level scalar fields (`max_tokens`,
+  `reasoning_effort`, `model`, `stream_options`), never `messages[].content`.
+  NVIDIA NIM's public API only documents plain-text `content`; vision/audio
+  models are OpenAI-compatible and accept these block arrays, but the exact
+  schema and which models accept it is unverified upstream — the proxy does no
+  format translation and makes no validation claims. **Video is not supported**
+  (NIM has no standardized video input).
+- **Multimodal prompt-token estimates use coarse per-part costs**: the 413 hard
+  ceiling (`request_max_prompt_tokens`) and the empty-shell no-retry soft limit
+  (`empty_shell_no_retry_prompt_tokens`) compare against `estimate_prompt_tokens`,
+  which sizes a `content` array as `text=chars/4`, `image_url=<flat cost>`,
+  `input_audio=<per-KiB cost, capped>`, unknown=`<chars/4, capped>`. This keeps
+  an inline base64 image (tens of thousands of chars) from ballooning the
+  estimate and falsely 413'ing a legal multimodal request, while a URL-only image
+  (a few dozen chars) still costs the flat image cost and can't slip past the
+  ceiling for free. The failure-log fingerprint reports this same coarse est
+  and a part census (text/image/audio counts) instead of dumping the base64
+  payload. Tunable via `est_image_token_cost`,
+  `est_audio_token_per_kb`/`est_audio_token_cap`, `est_unknown_part_token_cap`.
+  **Note (2026-08-01, live-verified):** the *upstream* side is gated by key
+  permissions — against a test pool of 22 keys, NVIDIA returned HTTP **403
+  `Authorization failed`** for any request whose `content` is an OpenAI-style
+  array (text-only array, URL-only image, inline base64 image, on a vision
+  *or* text model), while plain-string `content` on the same keys returned 200.
+  The proxy passes the array through unchanged (and forwards the 403 to the
+  client, since 4xx is not retried), but actual multimodal inference requires a
+  key whose NVIDIA plan has vision permission; see `FAILURE_ANALYSIS.md` §九.
 
 If you need strict transparency, the body/alias/response-path rewrites are the
 parts to be aware of; they are confined to chat-completion paths.
