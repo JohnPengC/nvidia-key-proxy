@@ -243,6 +243,40 @@ async fn admin_keys_list_and_add_and_remove() {
     assert_eq!(resp.status(), 401);
 }
 
+/// Regression: admin POST /admin/keys must reject an oversized body with 413.
+/// `warp::body::json()` has no default size limit, so without the explicit
+/// `content_length_limit(1 MiB)` on the route an authenticated caller pasting a
+/// huge key file could OOM the process or drive pathological lock churn in
+/// `add_keys_batch`. With the cap, a 4 MiB body never reaches json() at all.
+#[tokio::test]
+async fn admin_keys_add_rejects_oversized_body() {
+    let mut cfg = test_config();
+    cfg.auth.admin_token = "admin-secret".to_string();
+    let state = AppState::new(cfg);
+    let filter = build_routes(&state);
+
+    // A 4 MiB body: one JSON string of ~4 MiB valid JSON chars (each key
+    // short enough to pass add_keys_batch's length check — but we never get
+    // there; content_length_limit rejects first).
+    let huge = "x".repeat(4 * 1024 * 1024);
+    let body = format!(r#"["{}"]"#, huge);
+    let resp = request()
+        .method("POST")
+        .path("/admin/keys")
+        .header("authorization", "Bearer admin-secret")
+        .header("content-type", "application/json")
+        .body(body)
+        .reply(&filter)
+        .await;
+    assert_eq!(
+        resp.status(),
+        413,
+        "oversized admin add-keys body should be rejected with 413, got {} body={:?}",
+        resp.status(),
+        std::str::from_utf8(resp.body()).unwrap_or("")
+    );
+}
+
 
 #[tokio::test]
 async fn front_door_auth_enforced() {

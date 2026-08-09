@@ -11,6 +11,17 @@
 //!   ts, req_id, client_req_id, endpoint, method, model, key, status,
 //!   category, detail, body_excerpt, body_summary, upstream_url,
 //!   retry_attempt, retry_reason, error_kind
+//!
+//! Rotation: the file grows unbounded unless `FAILURE_LOG_MAX_BYTES` is set
+//! (a byte ceiling on the *current* file). When a written line would push
+//! the current file past the limit, the existing file is rolled to
+//! `<path>.<unix-secs>` and a fresh file is opened before the line is
+//! written. 0/disabled (the default) keeps the append-only behavior the
+//! tuning history in README assumes. For a no-restart rotation policy,
+//! pair `FAILURE_LOG_MAX_BYTES` with an external `logrotate` using
+//! `copytruncate` (the in-process handle flushes per line and survives
+//! truncation), or rely on the built-in roll above. Archived files are
+//! not compressed or pruned by this process — manage retention externally.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -21,20 +32,59 @@ use serde_json::{json, Value};
 
 use crate::key_pool::mask_key;
 
-/// One global file handle guarded by a Mutex. Writes are short (single JSON
-/// line) so contention is negligible; we never hold the lock across await.
-static FAILURE_FILE: Mutex<Option<File>> = Mutex::new(None);
+/// One global file handle guarded by a Mutex, plus a byte counter for the
+/// current file so we can rotate at `FAILURE_LOG_MAX_BYTES`. Writes are short
+/// (single JSON line) so contention is negligible; we never hold the lock
+/// across await.
+struct RotationState {
+    file: File,
+    /// Bytes written to the *current* open file. Reset on rotation.
+    written: u64,
+    /// Parsed `FAILURE_LOG_MAX_BYTES`. Captured at ensure_open time so a
+    /// mid-process env change doesn't take effect (config snapshot).
+    max_bytes: u64,
+}
+static FAILURE_FILE: Mutex<Option<RotationState>> = Mutex::new(None);
 
 fn log_path() -> String {
     std::env::var("FAILURE_LOG_PATH").unwrap_or_else(|_| "failure.log".to_string())
 }
 
+/// `FAILURE_LOG_MAX_BYTES` ceiling on the current file. 0 = disabled
+/// (append unbounded — legacy behavior). Read once at open time.
+fn max_bytes_setting() -> u64 {
+    std::env::var("FAILURE_LOG_MAX_BYTES")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
 fn ensure_open() {
-    let mut guard = FAILURE_FILE.lock().unwrap();
+    // `unwrap_or_else(|p| p.into_inner())` survives a poisoned mutex — if a
+    // prior write panicked (it never should on this path, but a panic during
+    // `writeln!`/`flush` from a broken fd would do it), we still want the
+    // failure-log channel to keep writing rather than cascade-panic every
+    // subsequent failure record.
+    let mut guard = FAILURE_FILE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     if guard.is_none() {
         let path = log_path();
         match OpenOptions::new().create(true).append(true).open(&path) {
-            Ok(f) => *guard = Some(f),
+            Ok(f) => {
+                // Start the counter at the current file size (only when
+                // rotation is enabled) so an already-large file rotates on the
+                // very next write rather than ignoring existing bytes.
+                let written = match f.metadata().map(|m| m.len()) {
+                    Ok(len) => len,
+                    Err(_) => 0,
+                };
+                *guard = Some(RotationState {
+                    file: f,
+                    written,
+                    max_bytes: max_bytes_setting(),
+                });
+            }
             Err(e) => {
                 eprintln!("failure_log: cannot open {}: {}", path, e);
                 // Leave None — write_failure becomes a no-op.
@@ -81,9 +131,11 @@ pub fn write_failure(
         return;
     }
     ensure_open();
-    let mut guard = FAILURE_FILE.lock().unwrap();
-    let file = match guard.as_mut() {
-        Some(f) => f,
+    let mut guard = FAILURE_FILE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let rot = match guard.as_mut() {
+        Some(r) => r,
         None => return,
     };
 
@@ -124,8 +176,38 @@ pub fn write_failure(
     // failure path.
     match serde_json::to_string(&entry) {
         Ok(line) => {
-            let _ = writeln!(file, "{}", line);
-            let _ = file.flush();
+            // Rotate before writing this line if it would push the current
+            // file past the ceiling. `max_bytes == 0` disables rotation.
+            if rot.max_bytes > 0 && rot.written + (line.len() as u64) + 1 > rot.max_bytes {
+                let path = log_path();
+                // Flush + close the current file, roll it to a timestamped
+                // name, and open a fresh one. All best-effort: a failed roll
+                // falls back to continuing on the same handle so we never
+                // drop the failure record.
+                let _ = rot.file.flush();
+                let stamp = now.timestamp();
+                if let Err(e) = std::fs::rename(&path, format!("{}.{}", path, stamp)) {
+                    eprintln!("failure_log: rename for rotation failed ({}): {}", path, e);
+                    // Could not roll; keep appending to the same handle and
+                    // update `written` so we don't re-attempt every line.
+                } else {
+                    match OpenOptions::new().create(true).append(true).open(&path) {
+                        Ok(new) => {
+                            rot.file = new;
+                            rot.written = 0;
+                        }
+                        Err(e) => {
+                            eprintln!("failure_log: reopen after rotation failed ({}): {}", path, e);
+                            // `rot.file` still holds the old handle; rename
+                            // of an open file on Unix leaves the fd writing to
+                            // the moved inode, so data is preserved.
+                        }
+                    }
+                }
+            }
+            let _ = writeln!(rot.file, "{}", line);
+            let _ = rot.file.flush();
+            rot.written += (line.len() as u64) + 1;
         }
         Err(e) => {
             eprintln!("failure_log: serialize failed: {}", e);

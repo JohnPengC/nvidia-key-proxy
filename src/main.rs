@@ -6,6 +6,13 @@ use nvidia_key_proxy::{build_routes, AppState, Config};
 
 #[tokio::main]
 async fn main() {
+    // Disable proxy environment variables to force direct connections
+    std::env::remove_var("ALL_PROXY");
+    std::env::remove_var("all_proxy");
+    std::env::remove_var("HTTP_PROXY");
+    std::env::remove_var("http_proxy");
+    std::env::remove_var("HTTPS_PROXY");
+    std::env::remove_var("https_proxy");
     // Load configuration (may exit on error).
     let config = Config::load().unwrap_or_else(|e| {
         eprintln!("Failed to load configuration: {}", e);

@@ -212,7 +212,7 @@ pub fn build_routes(
                     if auth.enabled {
                         let expected = format!("Bearer {}", auth.bearer_token);
                         match headers.get("authorization").and_then(|v| v.to_str().ok()) {
-                            Some(v) if v == expected => {}
+                            Some(v) if constant_time_eq(v.as_bytes(), expected.as_bytes()) => {}
                             _ => {
                                 return Err::<_, Rejection>(warp::reject::custom(Unauthorized));
                             }
@@ -285,6 +285,11 @@ pub async fn handle_rejection(err: Rejection) -> Result<impl Reply, Rejection> {
             "Invalid query".to_string(),
             StatusCode::BAD_REQUEST,
         ))
+    } else if err.find::<warp::reject::PayloadTooLarge>().is_some() {
+        Ok(warp::reply::with_status(
+            "Payload too large".to_string(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+        ))
     } else if err.find::<warp::reject::MethodNotAllowed>().is_some() {
         Ok(warp::reply::with_status(
             "Method not allowed".to_string(),
@@ -321,6 +326,25 @@ impl warp::reject::Reject for Unauthorized {}
 struct AdminDisabled;
 impl warp::reject::Reject for AdminDisabled {}
 
+/// Constant-time byte comparison, used for bearer-token checks so a remote
+/// caller can't recover the token (or its length) by measuring how long an
+/// `==` comparison takes. Length difference alone returns false (this matches
+/// `subtle::ConstantTimeCompare`/Go's `crypto/subtle.ConstantTimeCompare`;
+/// the obvious length side-channel is accepted because a well-formed
+/// `Authorization: Bearer <token>` header almost always shares the fixed
+/// `Bearer ` prefix). The per-byte loop always scans the whole common length
+/// and aggregates differences into one accumulator rather than short-circuiting.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 /// Check the admin bearer token from the request headers. When `admin_token`
 /// is empty the whole admin surface is hidden (404), so it can't be probed;
 /// otherwise the caller must present `Authorization: Bearer <admin_token>`.
@@ -333,7 +357,7 @@ fn check_admin_token(
     }
     let expected = format!("Bearer {}", admin_token);
     match headers.get("authorization").and_then(|v| v.to_str().ok()) {
-        Some(v) if v == expected => Ok(()),
+        Some(v) if constant_time_eq(v.as_bytes(), expected.as_bytes()) => Ok(()),
         _ => Err(warp::reject::custom(Unauthorized)),
     }
 }
@@ -394,8 +418,16 @@ fn admin_api(state: AppState) -> impl Filter<Extract = impl Reply, Error = Rejec
             }
         });
 
+    // Cap the admin add-keys body. `warp::body::json()` has no default size
+    // limit and would buffer the entire body into memory before
+    // `extract_keys` ever runs — an authenticated caller pasting a giant key
+    // file (or a malicious one with the admin token) could OOM the process or
+    // drive pathological lock churn in `add_keys_batch`. 1 MiB is ample for
+    // any realistic add-keys payload (a thousand 80-byte keys + JSON framing
+    // is ~100 KiB) and rejects the OOM class outright with a 413.
     let add = warp::path!("admin" / "keys")
         .and(warp::post())
+        .and(warp::body::content_length_limit(1024 * 1024))
         .and(warp::body::json())
         .and(warp::header::headers_cloned())
         .and_then({
@@ -405,20 +437,8 @@ fn admin_api(state: AppState) -> impl Filter<Extract = impl Reply, Error = Rejec
                 async move {
                     check_admin_token(&s.config.auth.admin_token, &headers)?;
                     let keys = extract_keys(&body);
-                    let mut added = Vec::new();
-                    let mut already_present = Vec::new();
-                    let mut invalid = Vec::new();
-                    for k in keys {
-                        if k.len() < 8 {
-                            invalid.push(k);
-                            continue;
-                        }
-                        if s.key_pool.add_key(k.clone()).await {
-                            added.push(k);
-                        } else {
-                            already_present.push(k);
-                        }
-                    }
+                    let (added, already_present, invalid) =
+                        s.key_pool.add_keys_batch(keys).await;
                     Ok::<_, Rejection>(json_reply(
                         200,
                         &serde_json::json!({

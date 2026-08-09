@@ -7,6 +7,46 @@ use tracing::{info, warn};
 
 use crate::key_pool::mask_key;
 
+/// Extract the host portion of a `scheme://[userinfo@]host[:port]/...` URL
+/// without requiring a URL crate. Returns `None` if the string doesn't have a
+/// recognizable scheme://authority. Handles bracketed IPv6 literals (e.g.
+/// `[::1]`). Used by `Config::validate` so the development-host check compares
+/// the actual host rather than a substring of the whole URL.
+fn host_of_url(url: &str) -> Option<String> {
+    let idx = url.find("://")?;
+    let after = &url[idx + 3..];
+    // Authority runs up to the first '/', '?', or '#'.
+    let end = after
+        .find(|c| c == '/' || c == '?' || c == '#')
+        .unwrap_or(after.len());
+    let authority = &after[..end];
+    // Strip `userinfo@` if present.
+    let authority = match authority.rfind('@') {
+        Some(at) => &authority[at + 1..],
+        None => authority,
+    };
+    // Bracketed IPv6 literal: `[::1]` or `[::1]:port`.
+    if let Some(rest) = authority.strip_prefix('[') {
+        let close = rest.find(']')?;
+        return Some(format!("[{}]", &rest[..close]));
+    }
+    // Plain host — strip a trailing `:port`.
+    let host = match authority.rfind(':') {
+        Some(colon) => {
+            // Make sure `colon` isn't actually inside something IPv6-ish; for a
+            // plain host the part after the last ':' must be all digits.
+            let port_part = &authority[colon + 1..];
+            if port_part.chars().all(|c| c.is_ascii_digit()) && !port_part.is_empty() {
+                &authority[..colon]
+            } else {
+                authority
+            }
+        }
+        None => authority,
+    };
+    Some(host.to_string())
+}
+
 #[derive(Deserialize, Clone)]
 pub struct Config {
     pub listen_addr: String,
@@ -751,24 +791,34 @@ impl Config {
             return Err("base_url must not be empty".into());
         }
         let base_lower = self.base_url.to_ascii_lowercase();
-        if !self.allow_local_base_url
-            && (base_lower.contains("example.com")
-                || base_lower.contains("localhost")
-                || base_lower.contains("127.0.0.1"))
-        {
-            return Err(format!(
-                "base_url '{}' looks like a placeholder/development endpoint; \
-                 set a real NVIDIA API base URL",
-                self.base_url
-            )
-            .into());
-        }
         if !base_lower.starts_with("http://") && !base_lower.starts_with("https://") {
             return Err(format!(
                 "base_url '{}' must start with http:// or https://",
                 self.base_url
             )
             .into());
+        }
+        if !self.allow_local_base_url {
+            // Reject development/placeholder hosts by their *authority host*, not
+            // by substring — substring matching false-rejects legitimate domains
+            // that merely contain "example.com" or "localhost" (e.g.
+            // `https://api.example-cloud.nvidia.com`). We parse out the host
+            // portion ourselves to avoid pulling in a URL crate.
+            if let Some(host) = host_of_url(&self.base_url) {
+                let host_lower = host.to_ascii_lowercase();
+                if host_lower == "localhost"
+                    || host_lower == "example.com"
+                    || host_lower == "127.0.0.1"
+                    || host_lower == "::1"
+                {
+                    return Err(format!(
+                        "base_url '{}' points at a placeholder/development host ({}); \
+                         set a real NVIDIA API base URL",
+                        self.base_url, host_lower
+                    )
+                    .into());
+                }
+            }
         }
 
         // Reject obviously fake/test keys before startup. The log showed
@@ -824,6 +874,42 @@ impl Config {
         Ok(())
     }
 
+    /// Parse an NVIDIA_* env override into the target field, warning on failure
+    /// instead of silently dropping it. Keeping the bad value in the log lets an
+    /// operator spot a typo (e.g. `NVIDIA_REQUEST_MAX_PROMPT_TOKENS=90kk`) that
+    /// would otherwise be hard to notice — the override is ignored and the
+    /// configured/default value silently sticks, which previously looked like a
+    /// no-op with no diagnostic.
+    fn env_parse_into<T: std::str::FromStr>(key: &str, value: &str, target: &mut T)
+    where
+        <T as std::str::FromStr>::Err: std::fmt::Debug,
+    {
+        match value.parse::<T>() {
+            Ok(v) => *target = v,
+            Err(e) => warn!(
+                env = key,
+                raw = value,
+                error = ?e,
+                "ignoring malformed NVIDIA_* override; using configured/default value",
+            ),
+        }
+    }
+
+    /// Same as `env_parse_into` but for serde-deserializable overrides (the two
+    /// `*_per_model` JSON-map fields). The parse-error warning uses `Display`
+    /// since serde_json errors don't impl Debug-friendliness consistently.
+    fn env_json_into<T: serde::de::DeserializeOwned>(key: &str, value: &str, target: &mut T) {
+        match serde_json::from_str::<T>(value) {
+            Ok(v) => *target = v,
+            Err(e) => warn!(
+                env = key,
+                raw = value,
+                error = %e,
+                "ignoring malformed NVIDIA_* JSON override; using configured/default value",
+            ),
+        }
+    }
+
     fn apply_env_overrides(config: &mut Config) {
         for (key, value) in std::env::vars() {
             if !key.starts_with("NVIDIA_") {
@@ -833,8 +919,17 @@ impl Config {
             let key_lower = key.to_ascii_lowercase();
             match key_lower.as_str() {
                 "listen_addr" => {
-                    if let Ok(addr) = value.parse::<SocketAddr>() {
-                        config.listen_addr = addr.to_string();
+                    // SocketAddr doesn't live directly in the struct (it's a
+                    // String), so parse then stringify; warn on malformed so a
+                    // typo in NVIDIA_LISTEN_ADDR is loud rather than a no-op.
+                    match value.parse::<SocketAddr>() {
+                        Ok(addr) => config.listen_addr = addr.to_string(),
+                        Err(e) => warn!(
+                            env = key,
+                            raw = value,
+                            error = ?e,
+                            "ignoring malformed NVIDIA_* override; using configured/default value",
+                        ),
                     }
                 }
                 "base_url" => config.base_url = value,
@@ -846,240 +941,62 @@ impl Config {
                         .filter(|s| !s.is_empty())
                         .collect();
                 }
-                "rate_limiter_qps_per_key" => {
-                    if let Ok(v) = value.parse::<f64>() {
-                        config.rate_limiter.qps_per_key = v;
-                    }
-                }
-                "rate_limiter_burst" => {
-                    if let Ok(v) = value.parse::<u64>() {
-                        config.rate_limiter.burst = v;
-                    }
-                }
-                "rate_limiter_token_wait_ms" => {
-                    if let Ok(v) = value.parse::<u64>() {
-                        config.rate_limiter.token_wait_ms = v;
-                    }
-                }
-                "cooldown_base_seconds" => {
-                    if let Ok(v) = value.parse::<u64>() {
-                        config.cooldown.base_seconds = v;
-                    }
-                }
-                "cooldown_max_seconds" => {
-                    if let Ok(v) = value.parse::<u64>() {
-                        config.cooldown.max_seconds = v;
-                    }
-                }
-                "health_check_interval_seconds" => {
-                    if let Ok(v) = value.parse::<u64>() {
-                        config.health_check.interval_seconds = v;
-                    }
-                }
-                "health_check_timeout_seconds" => {
-                    if let Ok(v) = value.parse::<u64>() {
-                        config.health_check.timeout_seconds = v;
-                    }
-                }
-                "health_check_max_consecutive_failures" => {
-                    if let Ok(v) = value.parse::<usize>() {
-                        config.health_check.max_consecutive_failures = v;
-                    }
-                }
-                "observability_enable_metrics" => {
-                    if let Ok(v) = value.parse::<bool>() {
-                        config.observability.enable_metrics = v;
-                    }
-                }
+                "rate_limiter_qps_per_key" => Self::env_parse_into(&key, &value, &mut config.rate_limiter.qps_per_key),
+                "rate_limiter_burst" => Self::env_parse_into(&key, &value, &mut config.rate_limiter.burst),
+                "rate_limiter_token_wait_ms" => Self::env_parse_into(&key, &value, &mut config.rate_limiter.token_wait_ms),
+                "cooldown_base_seconds" => Self::env_parse_into(&key, &value, &mut config.cooldown.base_seconds),
+                "cooldown_max_seconds" => Self::env_parse_into(&key, &value, &mut config.cooldown.max_seconds),
+                "health_check_interval_seconds" => Self::env_parse_into(&key, &value, &mut config.health_check.interval_seconds),
+                "health_check_timeout_seconds" => Self::env_parse_into(&key, &value, &mut config.health_check.timeout_seconds),
+                "health_check_max_consecutive_failures" => Self::env_parse_into(&key, &value, &mut config.health_check.max_consecutive_failures),
+                "observability_enable_metrics" => Self::env_parse_into(&key, &value, &mut config.observability.enable_metrics),
                 "observability_metrics_path" => {
                     config.observability.metrics_path = value;
                 }
                 "observability_log_level" => {
                     config.observability.log_level = value;
                 }
-                "request_timeout_seconds" => {
-                    if let Ok(v) = value.parse::<u64>() {
-                        config.request_timeout_seconds = v;
-                    }
-                }
-                "retry_max_retries" => {
-                    if let Ok(v) = value.parse::<u32>() {
-                        config.retry.max_retries = v;
-                    }
-                }
-                "retry_backoff_base_ms" => {
-                    if let Ok(v) = value.parse::<u64>() {
-                        config.retry.backoff_base_ms = v;
-                    }
-                }
-                "retry_backoff_max_ms" => {
-                    if let Ok(v) = value.parse::<u64>() {
-                        config.retry.backoff_max_ms = v;
-                    }
-                }
-                "retry_auth_fail_threshold" => {
-                    if let Ok(v) = value.parse::<u32>() {
-                        config.retry.auth_fail_threshold = v;
-                    }
-                }
-                "retry_max_key_switches" => {
-                    if let Ok(v) = value.parse::<u32>() {
-                        config.retry.max_key_switches = v;
-                    }
-                }
-                "allow_local_base_url" => {
-                    if let Ok(v) = value.parse::<bool>() {
-                        config.allow_local_base_url = v;
-                    }
-                }
-                "auth_enabled" => {
-                    if let Ok(v) = value.parse::<bool>() {
-                        config.auth.enabled = v;
-                    }
-                }
+                "request_timeout_seconds" => Self::env_parse_into(&key, &value, &mut config.request_timeout_seconds),
+                "retry_max_retries" => Self::env_parse_into(&key, &value, &mut config.retry.max_retries),
+                "retry_backoff_base_ms" => Self::env_parse_into(&key, &value, &mut config.retry.backoff_base_ms),
+                "retry_backoff_max_ms" => Self::env_parse_into(&key, &value, &mut config.retry.backoff_max_ms),
+                "retry_auth_fail_threshold" => Self::env_parse_into(&key, &value, &mut config.retry.auth_fail_threshold),
+                "retry_max_key_switches" => Self::env_parse_into(&key, &value, &mut config.retry.max_key_switches),
+                "allow_local_base_url" => Self::env_parse_into(&key, &value, &mut config.allow_local_base_url),
+                "auth_enabled" => Self::env_parse_into(&key, &value, &mut config.auth.enabled),
                 "auth_bearer_token" => {
                     config.auth.bearer_token = value;
                 }
                 "auth_admin_token" => {
                     config.auth.admin_token = value;
                 }
-                "inject_stream_usage" => {
-                    if let Ok(v) = value.parse::<bool>() {
-                        config.inject_stream_usage = v;
-                    }
-                }
-                "synthesize_empty_choices" => {
-                    if let Ok(v) = value.parse::<bool>() {
-                        config.synthesize_empty_choices = v;
-                    }
-                }
-                "retry_on_empty_shell" => {
-                    if let Ok(v) = value.parse::<bool>() {
-                        config.retry_on_empty_shell = v;
-                    }
-                }
-                "empty_shell_retry_max_tokens" => {
-                    if let Ok(v) = value.parse::<u64>() {
-                        config.empty_shell_retry_max_tokens = v;
-                    }
-                }
-                "empty_shell_retry_attempts" => {
-                    if let Ok(v) = value.parse::<u32>() {
-                        config.empty_shell_retry_attempts = v;
-                    }
-                }
-                "empty_shell_probe_before_retry" => {
-                    if let Ok(v) = value.parse::<bool>() {
-                        config.empty_shell_probe_before_retry = v;
-                    }
-                }
-                "circuit_breaker_threshold" => {
-                    if let Ok(v) = value.parse::<u32>() {
-                        config.circuit_breaker_threshold = v;
-                    }
-                }
-                "circuit_breaker_per_model" => {
-                    if let Ok(v) = value.parse::<bool>() {
-                        config.circuit_breaker_per_model = v;
-                    }
-                }
-                "empty_shell_retry_backoff_base_ms" => {
-                    if let Ok(v) = value.parse::<u64>() {
-                        config.empty_shell_retry_backoff_base_ms = v;
-                    }
-                }
-                "empty_shell_retry_backoff_max_ms" => {
-                    if let Ok(v) = value.parse::<u64>() {
-                        config.empty_shell_retry_backoff_max_ms = v;
-                    }
-                }
-                "empty_shell_pre_clamp_max_tokens" => {
-                    // Parse as JSON object: {"model": max_tokens}
-                    if let Ok(map) = serde_json::from_str::<std::collections::HashMap<String, u64>>(&value) {
-                        config.empty_shell_pre_clamp_max_tokens = map;
-                    }
-                }
-                "empty_shell_no_retry_prompt_tokens" => {
-                    if let Ok(v) = value.parse::<u64>() {
-                        config.empty_shell_no_retry_prompt_tokens = v;
-                    }
-                }
-                "request_max_prompt_tokens" => {
-                    if let Ok(v) = value.parse::<u64>() {
-                        config.request_max_prompt_tokens = v;
-                    }
-                }
-                "est_image_token_cost" => {
-                    if let Ok(v) = value.parse::<u64>() {
-                        config.est_image_token_cost = v;
-                    }
-                }
-                "est_audio_token_per_kb" => {
-                    if let Ok(v) = value.parse::<u64>() {
-                        config.est_audio_token_per_kb = v;
-                    }
-                }
-                "est_audio_token_cap" => {
-                    if let Ok(v) = value.parse::<u64>() {
-                        config.est_audio_token_cap = v;
-                    }
-                }
-                "est_unknown_part_token_cap" => {
-                    if let Ok(v) = value.parse::<u64>() {
-                        config.est_unknown_part_token_cap = v;
-                    }
-                }
-                "max_tokens_max" => {
-                    if let Ok(v) = value.parse::<u64>() {
-                        config.max_tokens_max = v;
-                    }
-                }
-                "retry_on_503" => {
-                    if let Ok(v) = value.parse::<bool>() {
-                        config.retry_on_503 = v;
-                    }
-                }
-                "probe_before_503_retry" => {
-                    if let Ok(v) = value.parse::<bool>() {
-                        config.probe_before_503_retry = v;
-                    }
-                }
-                "retry_on_500" => {
-                    if let Ok(v) = value.parse::<bool>() {
-                        config.retry_on_500 = v;
-                    }
-                }
-                "request_timeout_streaming_seconds" => {
-                    if let Ok(v) = value.parse::<u64>() {
-                        config.request_timeout_streaming_seconds = v;
-                    }
-                }
-                "concurrency_limit_per_model" => {
-                    // Parse as JSON object: {"model": limit}
-                    if let Ok(map) = serde_json::from_str::<std::collections::HashMap<String, u32>>(&value) {
-                        config.concurrency_limit_per_model = map;
-                    }
-                }
-                "concurrency_queue_timeout_ms" => {
-                    if let Ok(v) = value.parse::<u64>() {
-                        config.concurrency_queue_timeout_ms = v;
-                    }
-                }
-                "upstream_connect_timeout_secs" => {
-                    if let Ok(v) = value.parse::<u64>() {
-                        config.upstream_connect_timeout_secs = v;
-                    }
-                }
-                "upstream_pool_idle_timeout_secs" => {
-                    if let Ok(v) = value.parse::<u64>() {
-                        config.upstream_pool_idle_timeout_secs = v;
-                    }
-                }
-                "retry_jitter_ms" => {
-                    if let Ok(v) = value.parse::<u64>() {
-                        config.retry_jitter_ms = v;
-                    }
-                }
+                "inject_stream_usage" => Self::env_parse_into(&key, &value, &mut config.inject_stream_usage),
+                "synthesize_empty_choices" => Self::env_parse_into(&key, &value, &mut config.synthesize_empty_choices),
+                "retry_on_empty_shell" => Self::env_parse_into(&key, &value, &mut config.retry_on_empty_shell),
+                "empty_shell_retry_max_tokens" => Self::env_parse_into(&key, &value, &mut config.empty_shell_retry_max_tokens),
+                "empty_shell_retry_attempts" => Self::env_parse_into(&key, &value, &mut config.empty_shell_retry_attempts),
+                "empty_shell_probe_before_retry" => Self::env_parse_into(&key, &value, &mut config.empty_shell_probe_before_retry),
+                "circuit_breaker_threshold" => Self::env_parse_into(&key, &value, &mut config.circuit_breaker_threshold),
+                "circuit_breaker_per_model" => Self::env_parse_into(&key, &value, &mut config.circuit_breaker_per_model),
+                "empty_shell_retry_backoff_base_ms" => Self::env_parse_into(&key, &value, &mut config.empty_shell_retry_backoff_base_ms),
+                "empty_shell_retry_backoff_max_ms" => Self::env_parse_into(&key, &value, &mut config.empty_shell_retry_backoff_max_ms),
+                "empty_shell_pre_clamp_max_tokens" => Self::env_json_into(&key, &value, &mut config.empty_shell_pre_clamp_max_tokens),
+                "empty_shell_no_retry_prompt_tokens" => Self::env_parse_into(&key, &value, &mut config.empty_shell_no_retry_prompt_tokens),
+                "request_max_prompt_tokens" => Self::env_parse_into(&key, &value, &mut config.request_max_prompt_tokens),
+                "est_image_token_cost" => Self::env_parse_into(&key, &value, &mut config.est_image_token_cost),
+                "est_audio_token_per_kb" => Self::env_parse_into(&key, &value, &mut config.est_audio_token_per_kb),
+                "est_audio_token_cap" => Self::env_parse_into(&key, &value, &mut config.est_audio_token_cap),
+                "est_unknown_part_token_cap" => Self::env_parse_into(&key, &value, &mut config.est_unknown_part_token_cap),
+                "max_tokens_max" => Self::env_parse_into(&key, &value, &mut config.max_tokens_max),
+                "retry_on_503" => Self::env_parse_into(&key, &value, &mut config.retry_on_503),
+                "probe_before_503_retry" => Self::env_parse_into(&key, &value, &mut config.probe_before_503_retry),
+                "retry_on_500" => Self::env_parse_into(&key, &value, &mut config.retry_on_500),
+                "request_timeout_streaming_seconds" => Self::env_parse_into(&key, &value, &mut config.request_timeout_streaming_seconds),
+                "concurrency_limit_per_model" => Self::env_json_into(&key, &value, &mut config.concurrency_limit_per_model),
+                "concurrency_queue_timeout_ms" => Self::env_parse_into(&key, &value, &mut config.concurrency_queue_timeout_ms),
+                "upstream_connect_timeout_secs" => Self::env_parse_into(&key, &value, &mut config.upstream_connect_timeout_secs),
+                "upstream_pool_idle_timeout_secs" => Self::env_parse_into(&key, &value, &mut config.upstream_pool_idle_timeout_secs),
+                "retry_jitter_ms" => Self::env_parse_into(&key, &value, &mut config.retry_jitter_ms),
                 _ => {}
             }
         }

@@ -310,7 +310,11 @@ The proxy is organised into focused modules under `src/lib.rs`:
 - **`proxy`** – warp handler: acquire key → rate-limit → forward → update key state → stream response back.
 - **`health`** – startup probe + periodic bad-key recovery.
 - **`metrics`** – Prometheus counters and histograms.
-- **`failure_log`** – structured JSONL failure log (`failure.log`).
+- **`failure_log`** – structured JSONL failure log (`failure.log`). Path override and rotation via `FAILURE_LOG_PATH` / `FAILURE_LOG_MAX_BYTES` (see below); `FAILURE_LOG_DISABLE` silently no-ops writes (CI).
+
+#### `failure.log` rotation
+
+The log appends unbounded unless `FAILURE_LOG_MAX_BYTES` is set (a byte ceiling on the *current* file — set it to e.g. `10485760` for 10 MiB). When a new line would push the current file past the ceiling, the existing file is rolled to `failure.log.<unix-secs>` and a fresh file is opened before the line is written, all under one mutex — no entries are dropped. `0` / unset keeps the legacy append-only behavior the tuning history above was built on. Archived files are not pruned or compressed by the proxy: pair with an external `logrotate` (e.g. `copytruncate` + `rotate N` + compress) when you need retention limits.
 
 `AppState` bundles the shared runtime objects (metrics, key pool, proxy, health checker, stop signal, config) and `build_routes` constructs the warp filters, so integration tests can exercise the full stack without reaching into `main`.
 

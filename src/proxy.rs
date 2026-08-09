@@ -3,13 +3,13 @@ use once_cell::sync::OnceCell;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
 use tracing::{error, info, warn};
 use warp::{self, Rejection, Reply};
 
 use crate::failure_log;
-use crate::key_pool::{mask_key, KeyPool};
+use crate::key_pool::{mask_key, KeyPool, KeyStateHandle};
 use crate::metrics::Metrics;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -27,6 +27,142 @@ static REQ_COUNTER: AtomicU64 = AtomicU64::new(0);
 fn next_req_id() -> u64 {
     REQ_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
+
+/// RAII holder of a per-model concurrency slot. `Drop` releases the
+/// `OwnedSemaphorePermit` *and* refreshes `proxy_concurrency_current` so the
+/// gauge falls when a request finishes — not just when the next one starts.
+///
+/// The slot is acquired once per client request (before the upstream-attempt
+/// loop) and held across every retry attempt; only the final disposition frees
+/// it. For streaming success the guard is **moved into the response body
+/// stream** (see `GuardedStream`) so the slot is freed when the client finishes
+/// draining the body, not when `handle_request` returns; otherwise NVIDIA's
+/// upstream worker is still streaming tokens after the proxy released its
+/// permit, and a request that just acquired the next slot can punch through
+/// the per-model worker cap (`503 ResourceExhausted`) the limiter exists to
+/// prevent.
+struct ConcurrencyGuard {
+    /// Held only for its `Drop` (returns the slot to the semaphore). Never
+    /// read directly — the guard's job is to own the permit's lifetime.
+    #[allow(dead_code)]
+    permit: OwnedSemaphorePermit,
+    semaphore: Arc<Semaphore>,
+    metrics: Arc<Metrics>,
+    model: String,
+}
+
+impl Drop for ConcurrencyGuard {
+    fn drop(&mut self) {
+        // `OwnedSemaphorePermit`'s own Drop releases the slot; read
+        // `available_permits` *after* we're committed to release. We can't
+        // observe own-drop order, so compute the post-release value directly:
+        // current available + 1 (the slot we're giving back). `min(limit)` caps
+        // the edge case where a racing release already returned us to full.
+        let post = (self.semaphore.available_permits() as i64).saturating_add(1);
+        self.metrics.set_concurrency_current(&self.model, post);
+        // `self.permit` drops here → semaphore actually gains the permit. The
+        // gauge was set to a value that assumes this release; a concurrent
+        // acquire will subtract it again on its own, so the gauge can briefly
+        // over-report by 1 under contention. Accepted: a 1-slot transient is
+        // harmless for a gauge whose job is to show rough concurrency pressure.
+    }
+}
+
+/// Wraps a pinned stream with a `ConcurrencyGuard` so the guard (and its
+/// semaphore permit) lives as long as the body is still being read by the
+/// client. Dropping `GuardedStream` drops both the inner stream and the guard.
+struct GuardedStream {
+    inner: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>,
+    _guard: ConcurrencyGuard,
+}
+
+impl Stream for GuardedStream {
+    type Item = Result<Bytes, std::io::Error>;
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.inner.as_mut().poll_next(cx)
+    }
+}
+
+/// RAII guard for a key's `in_flight` counter. The `acquire_*` path bumps
+/// `in_flight` exactly once per acquired `KeyStateHandle`; every explicit
+/// return path in `handle_request`'s retry loop used to call
+/// `key_handle.dec_in_flight()` by hand — but when warp drops the handler
+/// future mid-`await` (client disconnect), those `match result` arms never
+/// run and `in_flight` leaked by +1, permanently depressing the key's acquire
+/// score (`in_flight * IN_FLIGHT_PENALTY`) until process restart.
+///
+/// `InFlightGuard` fixes this by owning the handle and decrementing exactly
+/// once in `Drop` *unless* `release()`/`swap()` already did. The explicit
+/// `dec` sites call `release()` early so the key's score sees the refund
+/// immediately (rather than waiting for frame teardown); `swap()` backs the
+/// retry-switch (`key_handle = next.clone()`) sites. Idempotent — calling
+/// `release()` twice or `release()` then `Drop` is safe.
+///
+/// The token-starvation probe loop (above the guard's lifecycle, still
+/// using bare `KeyStateHandle`) is untouched: those candidates aren't wrapped
+/// yet and already balance their own inc/dec one-for-one.
+struct InFlightGuard {
+    handle: KeyStateHandle,
+    released: bool,
+}
+
+impl InFlightGuard {
+    /// Wrap a freshly acquired handle. The handle has already been
+    /// `inc_in_flight`'d by `acquire_excluding` — the guard assumes the
+    /// responsibility for the matching `dec` exactly once.
+    fn new(handle: KeyStateHandle) -> Self {
+        Self {
+            handle,
+            released: false,
+        }
+    }
+
+    /// Idempotently decrement `in_flight`. Safe to call multiple times and
+    /// safe for `Drop` to follow — only the first call actually decrements.
+    fn release(&mut self) {
+        if !self.released {
+            self.handle.dec_in_flight();
+            self.released = true;
+        }
+    }
+
+    /// Borrow the wrapped handle for `key().await` log key extraction, ptr-
+    /// hash identity, etc. (`process_upstream_attempt` takes a `&KeyStateHandle`,
+    /// so this guard is transparent to it).
+    fn handle(&self) -> &KeyStateHandle {
+        &self.handle
+    }
+
+    /// Switch the wrapped handle to `new`: release the old (eager refund so
+    /// the old key's score recovers before the next acquire round), then take
+    /// ownership of `new` (which `acquire_retry_key` already `inc_in_flight`'d)
+    /// and reset the `released` flag so a later `release()` / `Drop` will
+    /// decrement the *new* handle exactly once.
+    fn swap(&mut self, new: KeyStateHandle) {
+        self.release();
+        self.handle = new;
+        self.released = false;
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+
+/// Maximum length of a model name we'll carry verbatim into a Prometheus
+/// label. Anything longer (however it got here) is collapsed to `"_unknown"` —
+/// even an operator-configured alias that accidentally exceeds it — so a
+/// single pathological `model` can't inflate /metrics output.
+const METRICS_MODEL_MAX_LEN: usize = 64;
+
+/// Sentinel label value for a `model` that isn't in the operator's allowlist
+/// (see `Proxy::known_models`) or is empty / too long. Collapsing all such
+/// values to one bucket keeps the metrics label dimension bounded regardless
+/// of what clients send.
+const METRICS_UNKNOWN_MODEL: &str = "_unknown";
 
 /// Proxy handles forwarding requests to NVIDIA API using a key from the pool.
 #[derive(Clone)]
@@ -51,6 +187,15 @@ pub struct Proxy {
     /// the mapped value before forwarding upstream. Unmatched names are
     /// forwarded unchanged.
     model_aliases: std::collections::HashMap<String, String>,
+    /// Frozen allowlist of model names that may appear as a Prometheus label
+    /// without being collapsed to `"_unknown"`. Built at construction from the
+    /// union of `model_aliases` keys + values, `empty_shell_pre_clamp_max_tokens`
+    /// keys, and `concurrency_limit_per_model` keys — i.e. every model the
+    /// operator has explicitly named in config. A client-supplied `model` that
+    /// isn't in this set (or exceeds `LABEL_MODEL_MAX_LEN`) is reported to
+    /// metrics as `"_unknown"` so an attacker can't mint unbounded label
+    /// cardinality by sending a fresh `model` per request (cardinality DoS).
+    known_models: std::collections::HashSet<String>,
     /// Cache of the upstream `/v1/models` catalog. NVIDIA answers this
     /// endpoint without auth, so we forward it through and memoize the
     /// result to avoid re-probing upstream on every client startup.
@@ -194,7 +339,15 @@ fn is_empty_shell_failure(body: &serde_json::Value) -> bool {
     if !id_empty {
         return false;
     }
-    // Created == 0 as third corroborating signal.
+    // `created == 0` is a **hard gate**, not merely a third signal: NVIDIA's
+    // empty-shell soft failure emits `created: 0` (no inference ran → no
+    // server timestamp) and we deliberately require it so we don't
+    // false-positive a real `stream:false` completion whose `choices` happen
+    // to be empty and `usage` null (legal for some no-op / tool-only paths).
+    // Relaxing this gate without measured evidence that NVIDIA ships a real
+    // timestamp on shells would risk classifying genuine completions as
+    // shells and surfacing 502s for healthy responses. See
+    // memory/tune-from-data-not-assumption.
     let created_zero = match body.get("created") {
         Some(serde_json::Value::Number(n)) => n.as_u64() == Some(0),
         _ => false,
@@ -970,6 +1123,20 @@ struct UsageTap<S> {
     inner: S,
     metrics: Arc<Metrics>,
     carry: String,
+    /// Raw byte accumulator for cross-chunk UTF-8 reassembly. The upstream
+    /// `bytes_stream()` can split a multi-byte UTF-8 codepoint across two
+    /// chunks (rare — NVIDIA SSE is mostly ASCII, but user-facing content /
+    /// tool names inside a `data:` payload can carry multibyte chars).
+    /// `from_utf8(chunk)` would fail on the partial chunk and `feed` would
+    /// `return`, dropping the whole chunk from `carry` — so the line spanning
+    /// the boundary would never make it to `classify_json_line` and this
+    /// stream's usage / `saw_choices` flags would be under-counted.
+    /// We instead append the raw bytes here and peel off the longest *valid*
+    /// UTF-8 prefix (`Utf8Error::valid_up_to`), leaving any partial trailing
+    /// codepoint in the buffer for the next feed. This is metric/diagnostic
+    /// recovery only — `poll_next` still forwards the original chunk verbatim
+    /// to the client, so client bytes are never affected.
+    feed_buf: Vec<u8>,
     usage: Option<Usage>,
     /// Did any parsed JSON object on this stream carry a non-empty `choices`
     /// array? If yes by stream end, the response had real content and we
@@ -991,11 +1158,35 @@ where
     S: Stream<Item = Result<Bytes, std::io::Error>> + Unpin + Send,
 {
     fn feed(&mut self, chunk: &Bytes) {
-        let s = match std::str::from_utf8(chunk) {
-            Ok(s) => s,
-            Err(_) => return,
+        self.feed_buf.extend_from_slice(chunk);
+        // Peel the longest valid UTF-8 prefix off the raw accumulator; any
+        // trailing partial codepoint stays in `feed_buf` for the next chunk
+        // to complete. (`from_utf8` errors carry `valid_up_to` so we get the
+        // cut point for free; the byte-slice case only fires on invalid
+        // sequences, not on partial tails at EOF — those are handled by
+        // `flush_trailing`.)
+        let (text, consumed) = match std::str::from_utf8(&self.feed_buf) {
+            Ok(s) => (s, self.feed_buf.len()),
+            Err(e) => {
+                let up = e.valid_up_to();
+                if up == 0 {
+                    // Entire buffer so far is a non-UTF-8 sequence (e.g. an
+                    // upstream gzipped body). Don't keep accumulating; if we
+                    // never see valid UTF-8 on the whole stream this would
+                    // otherwise hold the whole body in memory. Drain.
+                    self.feed_buf.clear();
+                    return;
+                }
+                let text = std::str::from_utf8(&self.feed_buf[..up])
+                    .expect("valid_up_to bytes are valid UTF-8");
+                (text, up)
+            }
         };
-        self.carry.push_str(s);
+        self.carry.push_str(text);
+        // Keep the remaining partial tail in the byte buffer; the rest of the
+        // function only inspects `carry`'s complete lines, so partial trailing
+        // bytes naturally wait here.
+        self.feed_buf.drain(..consumed);
         // Process every complete line (one ending in '\n'); keep the trailing
         // partial line (if any) in `carry` for the next chunk.
         while let Some(nl) = self.carry.find('\n') {
@@ -1049,6 +1240,18 @@ where
     /// never flushed it, `saw_choices` would stay false and the diagnostic
     /// would false-positive on every non-streaming request.
     fn flush_trailing(&mut self) {
+        // Any residual bytes in the UTF-8 reassembly buffer (a final partial
+        // codepoint, or simply an EOF with no final newline) need to become a
+        // candidate line too — best-effort replace invalid bytes with U+FFFD
+        // rather than dropping them. partial codepoints at true EOF are
+        // harmless for `classify_json_line` (the JSON would fail to parse
+        // either way), but a buffered non-streaming body whose final chunk
+        // ended mid-codepoint would otherwise be lost.
+        if !self.feed_buf.is_empty() {
+            let rest = String::from_utf8_lossy(&self.feed_buf).into_owned();
+            self.carry.push_str(&rest);
+            self.feed_buf.clear();
+        }
         if !self.carry.is_empty() {
             let rest: String = std::mem::take(&mut self.carry);
             self.classify_json_line(&rest);
@@ -1183,6 +1386,23 @@ impl Proxy {
             .connect_timeout(Duration::from_secs(upstream_connect_timeout_secs))
             .build()
             .expect("Failed to build reqwest client");
+        // Build the model allowlist for metrics-label cardinality containment:
+        // every model the operator has explicitly named in config. A client-supplied
+        // `model` outside this set is reported as "_unknown" (see metrics_model).
+        let mut known_models: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        for k in model_aliases.keys() {
+            known_models.insert(k.clone());
+        }
+        for v in model_aliases.values() {
+            known_models.insert(v.clone());
+        }
+        for k in empty_shell_pre_clamp_max_tokens.keys() {
+            known_models.insert(k.clone());
+        }
+        for k in concurrency_limit_per_model.keys() {
+            known_models.insert(k.clone());
+        }
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             key_pool,
@@ -1193,6 +1413,7 @@ impl Proxy {
             retry_config,
             token_wait_ms,
             model_aliases,
+            known_models,
             models_cache: Arc::new(Mutex::new(None)),
             inject_stream_usage,
             synthesize_empty_choices,
@@ -1217,6 +1438,23 @@ impl Proxy {
             upstream_connect_timeout_secs,
             upstream_pool_idle_timeout_secs,
             retry_jitter_ms,
+        }
+    }
+
+    /// Collapse a (possibly client-supplied) model string to a label that's
+    /// safe to emit as a Prometheus dimension. A value is passed through only
+    /// when it is non-empty, at most `METRICS_MODEL_MAX_LEN` bytes, and present
+    /// in the operator's `known_models` allowlist; everything else becomes
+    /// `"_unknown"`. This contains label cardinality: an unprivileged client
+    /// can't inflate the registry by sending a fresh `model` per request.
+    fn metrics_model<'a>(&'a self, model: &'a str) -> &'a str {
+        if !model.is_empty()
+            && model.len() <= METRICS_MODEL_MAX_LEN
+            && self.known_models.contains(model)
+        {
+            model
+        } else {
+            METRICS_UNKNOWN_MODEL
         }
     }
 
@@ -1318,11 +1556,22 @@ impl Proxy {
         body: &bytes::Bytes,
         key_str: &str,
         is_streaming: bool,
+        body_is_json: bool,
     ) -> reqwest::RequestBuilder {
         let mut req_builder = self.client.request(method.clone(), url);
         req_builder = req_builder
             .header(req_header::AUTHORIZATION, format!("Bearer {}", key_str))
             .header(req_header::USER_AGENT, "nvidia-key-proxy/0.1");
+        // When the body was rewritten to canonical JSON, force Content-Type to
+        // application/json to match what we're actually sending upstream. A
+        // client may legitimately POST a JSON payload under a non-JSON
+        // Content-Type (cc-switch sometimes uses text/plain); we'd otherwise
+        // forward the rewritten JSON bytes labeled as form-urlencoded/text and
+        // NVIDIA's gateway would reject/misparse — protocol mismatch even
+        // though the body content is valid. When the body is forwarded as-is
+        // (parse failed), we keep the client's original Content-Type so
+        // non-JSON passthrough stays byte/label-faithful.
+        let strip_content_type = body_is_json;
         for (hkey, hvalue) in headers.iter() {
             let key_name = hkey.as_str();
             match key_name {
@@ -1340,6 +1589,14 @@ impl Proxy {
                 // the proxy controls which response shape NVIDIA picks.
                 | "accept"
                 | "authorization" => continue,
+                // `content-type` is dropped only when we re-serialized the
+                // body to canonical JSON (so the forced `application/json`
+                // below is the only Content-Type NVIDIA sees); kept otherwise
+                // (passthrough non-JSON stays byte/label-faithful). Split into
+                // its own arm — a `|` arm + guard would gate *every* pattern
+                // in that arm on the guard, which would let hop-by-hop headers
+                // through whenever `strip_content_type` was false.
+                "content-type" if strip_content_type => continue,
                 _ => {}
             }
             if let Ok(req_val) = ReqHeaderValue::from_bytes(hvalue.as_bytes()) {
@@ -1355,6 +1612,10 @@ impl Proxy {
             "application/json"
         };
         req_builder = req_builder.header(req_header::ACCEPT, accept_val);
+        // Force Content-Type when the body was re-serialized as JSON.
+        if body_is_json {
+            req_builder = req_builder.header("content-type", "application/json");
+        }
         if !body.is_empty() {
             req_builder = req_builder.body(body.clone());
         }
@@ -1421,10 +1682,17 @@ impl Proxy {
         let mut tried_key_hashes: Vec<u64> = Vec::new();
         let mut key_handle: Option<crate::key_pool::KeyStateHandle> = None;
         let mut switch_count: u32 = 0;
+        // Per-model concurrency slot, acquired later in this function once
+        // `model` is known. Stays here so it survives across every retry
+        // attempt (one slot per client request), and is either dropped in this
+        // frame on the non-streaming exit paths or moved into the streaming
+        // response body so it lives as long as the client keeps draining.
+        let mut concurrency_guard: Option<ConcurrencyGuard> = None;
 
         for _attempt in 0..=max_switches {
-            // Acquire (score-based top-1)
-            let candidate = match self.key_pool.acquire().await {
+            // Acquire (score-based top-1), skipping keys already tried this
+            // request so a just-failed (token-starved) key isn't re-picked.
+            let candidate = match self.key_pool.acquire_excluding(&tried_key_hashes).await {
                 Some(k) => k,
                 None => {
                     // Release any previously held key's in_flight before
@@ -1439,16 +1707,8 @@ impl Proxy {
                 }
             };
 
-            // Avoid re-trying the same key (identified by pointer hash).
-            let key_hash = {
-                let addr = &candidate as *const crate::key_pool::KeyStateHandle as usize;
-                addr as u64
-            };
-            if tried_key_hashes.contains(&key_hash) {
-                // This key was already tried; release it and loop for next.
-                candidate.dec_in_flight();
-                continue;
-            }
+            // Record this key so subsequent retries skip it.
+            let key_hash = candidate.identity();
             tried_key_hashes.push(key_hash);
 
             // Drop any previous handle before taking the new one.
@@ -1476,7 +1736,7 @@ impl Proxy {
             break;
         }
 
-        let mut key_handle = match key_handle {
+        let key_handle = match key_handle {
             Some(k) => k,
             None => {
                 self.metrics.inc_error();
@@ -1485,6 +1745,12 @@ impl Proxy {
                 }));
             }
         };
+        // Wrap the acquired handle in an `InFlightGuard` so the `inc_in_flight`
+        // done by `acquire_excluding` is decremented exactly once even if warp
+        // drops this future mid-`await` (client disconnect) — see the guard
+        // docs above. All explicit `dec_in_flight()` / retry-switch sites use
+        // `key_guard.release()` / `swap()` from here on.
+        let mut key_guard = InFlightGuard::new(key_handle);
 
         // Generate a single correlation id for this client request. All
         // upstream attempts (including retries) will share this id so we can
@@ -1530,6 +1796,13 @@ impl Proxy {
         // caller clearly intended to be JSON.
         let mut body_value: Option<serde_json::Value> = parsed_body.clone();
         let mut model_rewrite_log: Option<String> = None;
+        // Original client-facing model name (before any alias remap). We keep
+        // this so the per-model concurrency cap and circuit breaker can be keyed
+        // by either the client-facing alias *source* (X) or the alias *target*
+        // (Y) — operators naturally key these maps by either. If we only kept
+        // `model_rewrite_log` (== target when remapped), a cap keyed by the
+        // source X would silently never apply (lookup by target → None).
+        let mut model_lookup_source: Option<String> = None;
         if let Some(obj) = body_value.as_mut().and_then(|v| v.as_object_mut()) {
             // max_tokens normalization with underflow/overflow guard.
             // NVIDIA returns 400 "max_tokens must be at least 1, got -14758" when
@@ -1609,6 +1882,10 @@ impl Proxy {
 
             // model alias remap: client name → NVIDIA-ready name
             if let Some(m) = obj.get("model").and_then(|x| x.as_str()).map(|s| s.to_string()) {
+                // Record the client-facing source before any rewrite so
+                // cap/circuit-breaker lookups prefer it (operator may key
+                // the maps by either X or Y).
+                model_lookup_source = Some(m.clone());
                 if let Some(target) = self.model_aliases.get(&m).cloned() {
                     if target != m {
                         info!(
@@ -1828,7 +2105,8 @@ impl Proxy {
                          client must compress its context"
                     );
                     self.metrics.inc_error();
-                    self.metrics.inc_prompt_rejected_total(model.as_str(), "413");
+                    self.metrics
+                        .inc_prompt_rejected_total(self.metrics_model(model.as_str()), "413");
                     let err = serde_json::json!({
                         "error": {
                             "message": format!(
@@ -1862,12 +2140,19 @@ impl Proxy {
         // ---- Concurrency semaphore (Priority 2) ----
         // Acquire a slot for this model's concurrency limit before we even try to get a key.
         // This prevents overwhelming upstream workers (e.g., nemotron-3-ultra's 32-worker limit).
-        if let Some(&limit) = self.concurrency_limit_per_model.get(&model) {
+        //
+        // Look up by the client-facing source name first (operators naturally
+        // key `concurrency_limit_per_model` by the alias source X), and fall
+        // back to the post-remap target Y — so a cap keyed by either form
+        // applies. See `model_lookup_source` above.
+        let cap_key: Option<String> =
+            model_lookup_source.clone().or_else(|| Some(model.clone()));
+        let cap_lookup = cap_key
+            .as_ref()
+            .and_then(|k| self.concurrency_limit_per_model.get(k))
+            .or_else(|| self.concurrency_limit_per_model.get(&model));
+        if let Some(&limit) = cap_lookup {
             if limit > 0 {
-                use std::sync::Arc;
-                use tokio::sync::Semaphore;
-                use std::time::Duration;
-
                 // Lazy-init semaphores per model (thread-safe with StdMutex for interior mutability)
                 static SEMAPHORES: OnceCell<StdMutex<HashMap<String, Arc<Semaphore>>>> = OnceCell::new();
                 let semaphores = SEMAPHORES.get_or_init(|| StdMutex::new(HashMap::new()));
@@ -1881,7 +2166,7 @@ impl Proxy {
                 };
 
                 let queue_timeout = Duration::from_millis(self.concurrency_queue_timeout_ms);
-                let permit = match tokio::time::timeout(queue_timeout, semaphore.acquire()).await {
+                let permit = match tokio::time::timeout(queue_timeout, semaphore.clone().acquire_owned()).await {
                     Ok(Ok(permit)) => {
                         self.metrics.inc_concurrency_acquire_total(&model, "ok");
                         permit
@@ -1903,11 +2188,24 @@ impl Proxy {
                     }
                 };
 
-                // Track current concurrency
+                // Track current concurrency at acquire time (post-take permits).
                 self.metrics.set_concurrency_current(&model, semaphore.available_permits() as i64);
 
-                // Ensure permit is released on all exit paths
-                let _permit_guard = permit;
+                // The guard holds the permit and refreshes the gauge on drop.
+                // For streaming-success bodies it is moved into the response
+                // stream (`GuardedStream`), so the slot is returned to the
+                // semaphore only when the client finishes draining the body —
+                // matching when NVIDIA's upstream worker actually frees up —
+                // rather than when `handle_request` returns (which can be well
+                // before the stream ends). For every other exit path it drops
+                // here in `handle_request`'s frame and the permit is reclaimed.
+                let guard = ConcurrencyGuard {
+                    permit,
+                    semaphore: semaphore.clone(),
+                    metrics: self.metrics.clone(),
+                    model: model.clone(),
+                };
+                concurrency_guard = Some(guard);
             }
         }
 
@@ -1926,7 +2224,7 @@ impl Proxy {
         loop {
             let is_last_attempt = attempt >= self.retry_config.max_retries;
             let attempt_fut = self.process_upstream_attempt(
-                &key_handle,
+                key_guard.handle(),
                 &method,
                 &url,
                 &headers,
@@ -1937,17 +2235,23 @@ impl Proxy {
                 &client_req_id,
                 is_last_attempt,
                 attempt,
+                body_value.is_some(),
+                &mut concurrency_guard,
             );
 
-            // For streaming requests we never wrap in a hard timeout
-            // (long-running token generation can exceed 60s) UNLESS a separate
-            // streaming timeout is configured. For non-streaming requests we
-            // honor request_timeout_secs (0 disables the timeout).
+            // For streaming requests we honor an explicit streaming timeout
+            // (>0); when unset (0) we inherit `request_timeout_secs` — this
+            // matches the config docstring ("0 = use request_timeout_seconds")
+            // so a stalled upstream worker can never pin a key + concurrency
+            // slot forever while holding a healthy pool's traffic hostage.
+            // The timeout bounds connect + send + receive headers + the
+            // bounded peek prefix (TTFB-ish), NOT the total stream drain:
+            // long token generation isn't aborted.
             let timeout_secs = if is_streaming {
                 if self.request_timeout_streaming_secs > 0 {
                     self.request_timeout_streaming_secs
                 } else {
-                    0 // no timeout for streaming by default
+                    self.request_timeout_secs
                 }
             } else {
                 self.request_timeout_secs
@@ -1963,7 +2267,7 @@ impl Proxy {
                 {
                     Ok(r) => r,
                     Err(_) => {
-                        let k = key_handle.key().await;
+                        let k = key_guard.handle().key().await;
                         warn!(key = %mask_key(&k), timeout_secs, "Upstream request timeout");
                         self.key_pool.mark_bad(&k, None).await;
                         Err(AttemptError::Timeout)
@@ -1973,7 +2277,7 @@ impl Proxy {
 
             match result {
                 Ok(AttemptResponse::Done(resp)) => {
-                    key_handle.dec_in_flight();
+                    key_guard.release();
                     self.metrics.observe_latency(start.elapsed().as_secs_f64());
                     info!(
                         client_req_id = %client_req_id,
@@ -1987,13 +2291,12 @@ impl Proxy {
                     // Retryable upstream status (401 without Retry-After, 503,
                     // or 500) — caller still has retry budget.
                     if attempt < self.retry_config.max_retries {
-                        if let Some(next) = self.key_pool.acquire().await {
+                        if let Some(next) = self.acquire_retry_key(&mut tried_key_hashes).await {
                             let will_retry_again = attempt + 1 < self.retry_config.max_retries;
                             self.metrics.inc_retry_attempt_failure();
                             // Release the current handle before switching.
-                            key_handle.dec_in_flight();
+                            key_guard.release();
                             let got_backup = next.try_consume_token(self.token_wait_ms).await;
-                            key_handle = next.clone();
                             let got_token = got_backup;
                             if !got_token {
                                 next.dec_in_flight();
@@ -2004,6 +2307,10 @@ impl Proxy {
                                     msg: "Upstream retry failed".into(),
                                 }));
                             }
+                            // `acquire_retry_key` already inc'd `next`; move
+                            // it into the guard (the old key was released above
+                            // so `swap`'s internal `release()` is a no-op).
+                            key_guard.swap(next);
                             attempt += 1;
                             if will_retry_again {
                                 self.backoff_sleep(attempt).await;
@@ -2018,7 +2325,7 @@ impl Proxy {
                         warn!(client_req_id = %client_req_id, attempt = attempt, "No other keys available; surfacing retryable error");
                     }
                     // Defensive fallback (helper should have returned Done on last attempt).
-                    key_handle.dec_in_flight();
+                    key_guard.release();
                     self.metrics.inc_error();
                     return Err(warp::reject::custom(BadGateway {
                         msg: "Upstream retryable error".into(),
@@ -2028,7 +2335,7 @@ impl Proxy {
                     // Network-level error: cool the key and, if we still have
                     // retries left, try another key without counting this as
                     // an auth failure.
-                    let k = key_handle.key().await;
+                    let k = key_guard.handle().key().await;
                     warn!(key = %mask_key(&k), "Request send error: {}", e);
                     failure_log::write_failure(
                         method.as_str(),
@@ -2056,13 +2363,12 @@ impl Proxy {
                     // network-error retries at 1 additional attempt.
                     let network_retry_cap: u32 = 1;
                     if attempt < network_retry_cap && attempt < self.retry_config.max_retries {
-                        if let Some(next) = self.key_pool.acquire().await {
+                        if let Some(next) = self.acquire_retry_key(&mut tried_key_hashes).await {
                             let will_retry_again = false; // network cap = 1 → no further retry
                             self.metrics.inc_retry_attempt_failure();
-                            self.metrics.inc_network_errors_total(&model, "connection");
-                            key_handle.dec_in_flight();
+                            self.metrics.inc_network_errors_total(self.metrics_model(&model), "connection");
+                            key_guard.release();
                             let got_backup = next.try_consume_token(self.token_wait_ms).await;
-                            key_handle = next.clone();
                             let got_token = got_backup;
                             if !got_token {
                                 next.dec_in_flight();
@@ -2073,6 +2379,7 @@ impl Proxy {
                                     msg: "Upstream request failed".into(),
                                 }));
                             }
+                            key_guard.swap(next);
                             attempt += 1;
                             if will_retry_again {
                                 self.backoff_sleep(attempt).await;
@@ -2085,14 +2392,14 @@ impl Proxy {
                             continue;
                         }
                     }
-                    key_handle.dec_in_flight();
+                    key_guard.release();
                     self.metrics.inc_error();
                     return Err(warp::reject::custom(BadGateway {
                         msg: "Upstream request failed".into(),
                     }));
                 }
                 Err(AttemptError::Timeout) => {
-                    let k = key_handle.key().await;
+                    let k = key_guard.handle().key().await;
                     warn!(key = %mask_key(&k), "Upstream request timeout");
                     failure_log::write_failure(
                         method.as_str(),
@@ -2115,12 +2422,11 @@ impl Proxy {
                         Some("timeout"),
                     );
                     if attempt < self.retry_config.max_retries {
-                        if let Some(next) = self.key_pool.acquire().await {
+                        if let Some(next) = self.acquire_retry_key(&mut tried_key_hashes).await {
                             let will_retry_again = attempt + 1 < self.retry_config.max_retries;
                             self.metrics.inc_retry_attempt_failure();
-                            key_handle.dec_in_flight();
+                            key_guard.release();
                             let got_backup = next.try_consume_token(self.token_wait_ms).await;
-                            key_handle = next.clone();
                             let got_token = got_backup;
                             if !got_token {
                                 next.dec_in_flight();
@@ -2131,6 +2437,7 @@ impl Proxy {
                                     msg: "Upstream request timed out".into(),
                                 }));
                             }
+                            key_guard.swap(next);
                             attempt += 1;
                             if will_retry_again {
                                 self.backoff_sleep(attempt).await;
@@ -2143,14 +2450,14 @@ impl Proxy {
                             continue;
                         }
                     }
-                    key_handle.dec_in_flight();
+                    key_guard.release();
                     self.metrics.inc_error();
                     return Err(warp::reject::custom(BadGateway {
                         msg: "Upstream request timed out".into(),
                     }));
                 }
                 Err(AttemptError::BodyRead(e)) => {
-                    let k = key_handle.key().await;
+                    let k = key_guard.handle().key().await;
                     error!(key = %mask_key(&k), "Failed to read response body: {}", e);
                     failure_log::write_failure(
                         method.as_str(),
@@ -2169,13 +2476,13 @@ impl Proxy {
                         &client_req_id,
                         Some("body_read"),
                     );
-                    key_handle.dec_in_flight();
+                    key_guard.release();
                     return Err(warp::reject::custom(BadGateway {
                         msg: "Failed to read response body".into(),
                     }));
                 }
                 Err(AttemptError::Fatal(r)) => {
-                    key_handle.dec_in_flight();
+                    key_guard.release();
                     return Err(r);
                 }
             }
@@ -2183,6 +2490,34 @@ impl Proxy {
     }
 
     /// Exponential backoff sleep with jitter: `base * 2^(attempt-1) + jitter` capped at `max`.
+    /// Acquire a key for a retry attempt, preferring one that hasn't been
+    /// used yet on this request. Records the chosen key's identity in
+    /// `tried_key_hashes`.
+    ///
+    /// Falls back to `acquire()` (allowing a re-tried key) when every active
+    /// key has already been tried this request — e.g. a single-key
+    /// deployment. There, retrying the same key on a 401/503 is preferable to
+    /// surfacing a 5xx, since NVIDIA-side transient failures often clear on a
+    /// second attempt and the original retry budget exists precisely for that.
+    async fn acquire_retry_key(
+        &self,
+        tried_key_hashes: &mut Vec<u64>,
+    ) -> Option<crate::key_pool::KeyStateHandle> {
+        if let Some(k) = self.key_pool.acquire_excluding(tried_key_hashes).await {
+            tried_key_hashes.push(k.identity());
+            return Some(k);
+        }
+        if let Some(k) = self.key_pool.acquire().await {
+            let h = k.identity();
+            if !tried_key_hashes.contains(&h) {
+                tried_key_hashes.push(h);
+            }
+            Some(k)
+        } else {
+            None
+        }
+    }
+
     async fn backoff_sleep(&self, attempt: u32) {
         let base = self.retry_config.backoff_base_ms;
         let max = self.retry_config.backoff_max_ms;
@@ -2219,6 +2554,8 @@ impl Proxy {
         client_req_id: &str,
         is_last_attempt: bool,
         attempt: u32,
+        request_body_is_json: bool,
+        concurrency_guard: &mut Option<ConcurrencyGuard>,
     ) -> Result<AttemptResponse, AttemptError> {
         let key_str = key_handle.key().await;
         let key_hash = {
@@ -2233,7 +2570,7 @@ impl Proxy {
             body_summary = %body_summary,
             "upstream attempt start"
         );
-        let req_builder = self.build_upstream_request(url, method, headers, request_body, &key_str, is_streaming);
+        let req_builder = self.build_upstream_request(url, method, headers, request_body, &key_str, is_streaming, request_body_is_json);
         let resp = req_builder.send().await.map_err(AttemptError::Network)?;
 
         let status = resp.status();
@@ -2266,7 +2603,7 @@ impl Proxy {
         // verbatim without buffering.
         if is_streaming && is_sse && status.is_success() {
             let resp = self
-                .handle_passthrough_stream(resp, resp_headers, status, client_req_id)
+                .handle_passthrough_stream(resp, resp_headers, status, client_req_id, concurrency_guard.take())
                 .await
                 .map_err(AttemptError::Fatal)?;
             return Ok(AttemptResponse::Done(resp));
@@ -2288,25 +2625,49 @@ impl Proxy {
         // non-empty `choices` — falls back to the same zero-ownership passthrough
         // as before, with the already-buffered prefix prepended to the stream.
         if status.is_success() {
-            self.key_pool.mark_good(&key_str).await;
-            self.metrics.inc_success();
+            // Defer `mark_good` / `inc_success` until we know whether this
+            // 200 is a *real* completion or an NVIDIA empty-shell soft failure
+            // (200 with `usage:null`, no inference). A shell is not a success:
+            // treating it as one both inflates the success metric and — via
+            // `mark_good` → `reset_all_circuit_breakers` — wipes the per-model
+            // cb counter the shell path (below in `handle_empty_shell_failure`)
+            // is accumulating, making the empty-shell circuit breaker nearly
+            // unreachable at the default threshold. For the legacy path
+            // (synthesis disabled) we can't inspect the body, so we mark good
+            // eagerly as before.
             let outcome = if self.synthesize_empty_choices {
-                self.handle_success_maybe_synthesize(resp, resp_headers, status, client_req_id)
+                self.handle_success_maybe_synthesize(resp, resp_headers, status, client_req_id, concurrency_guard)
                     .await
             } else {
                 // Synthesis disabled — the empty-shell retry path can't
-                // inspect the body, so passthrough verbatim (legacy behavior).
-                self.handle_passthrough_stream(resp, resp_headers, status, client_req_id)
+                // inspect the body, so passthrough verbatim (legacy behavior);
+                // this is a genuine success.
+                self.key_pool.mark_good(&key_str).await;
+                self.metrics.inc_success();
+                self.handle_passthrough_stream(resp, resp_headers, status, client_req_id, concurrency_guard.take())
                     .await
                     .map(SuccessOutcome::Response)
             }
             .map_err(AttemptError::Fatal)?;
             return Ok(match outcome {
-                SuccessOutcome::Response(resp) => AttemptResponse::Done(resp),
+                SuccessOutcome::Response(resp) => {
+                    // Real completion (synthesis path confirmed choices, or
+                    // legacy passthrough already marked good above). For the
+                    // synthesis path we mark good only here, after the body
+                    // cleared the shell check.
+                    if self.synthesize_empty_choices {
+                        self.key_pool.mark_good(&key_str).await;
+                        self.metrics.inc_success();
+                    }
+                    AttemptResponse::Done(resp)
+                }
                 SuccessOutcome::ShellFailure { body } => {
                     // NVIDIA empty-shell soft failure — no inference ran.
                     // Surface the real cause instead of a misleading empty
                     // body. Optionally retry once with a clamped `max_tokens`.
+                    // Deliberately do NOT mark good / inc_success here: the
+                    // shell is a soft failure, and the cb counter must persist
+                    // so repeated shells can trip the breaker.
                     self.handle_empty_shell_failure(
                         body,
                         method,
@@ -2633,6 +2994,7 @@ async fn handle_passthrough_stream(
     resp_headers: Vec<(String, Vec<u8>)>,
     status: warp::http::StatusCode,
     client_req_id: &str,
+    concurrency_guard: Option<ConcurrencyGuard>,
 ) -> Result<warp::http::Response<warp::hyper::Body>, Rejection> {
     let upstream = resp.bytes_stream();
     let forwarded: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> =
@@ -2647,6 +3009,7 @@ async fn handle_passthrough_stream(
             inner: forwarded,
             metrics: self.metrics.clone(),
             carry: String::new(),
+            feed_buf: Vec::new(),
             usage: None,
             saw_choices: false,
             saw_empty_choices: false,
@@ -2658,7 +3021,19 @@ async fn handle_passthrough_stream(
         let mut response_builder = warp::http::Response::builder().status(status);
         apply_forwarded_response_headers(&mut response_builder, resp_headers);
 
-        let body = warp::hyper::Body::wrap_stream(tapped);
+        // When a per-model concurrency slot was acquired, move the guard into
+        // the body stream so the slot is released when the client finishes
+        // draining the body (NVIDIA's worker frees up at stream end), not when
+        // `handle_request` returns — which can be when the response headers
+        // arrived, long before token generation is done.
+        let body = if let Some(guard) = concurrency_guard {
+            warp::hyper::Body::wrap_stream(Box::pin(GuardedStream {
+                inner: tapped,
+                _guard: guard,
+            }))
+        } else {
+            warp::hyper::Body::wrap_stream(tapped)
+        };
         Ok(response_builder.body(body).unwrap_or_else(|_| {
             warp::http::Response::builder()
                 .status(status)
@@ -2695,6 +3070,7 @@ async fn handle_passthrough_stream(
         resp_headers: Vec<(String, Vec<u8>)>,
         status: warp::http::StatusCode,
         client_req_id: &str,
+        concurrency_guard: &mut Option<ConcurrencyGuard>,
     ) -> Result<SuccessOutcome, Rejection> {
         let mut upstream = resp.bytes_stream();
         let mut buf: Vec<u8> = Vec::new();
@@ -2768,8 +3144,16 @@ async fn handle_passthrough_stream(
 
         // Fallthrough: passthrough with the buffered prefix prepended to the
         // remaining upstream stream. This preserves byte-for-byte fidelity with
-        // `handle_passthrough_stream` (no synthesis happened).
+        // `handle_passthrough_stream` (no synthesis happened), *including*
+        // running the buffered prefix through `coerce_sse_chunk` — otherwise a
+        // `data: {"error":{"code":400}}` event that landed inside the peek
+        // prefix would be forwarded uncoerced here while the pure-passthrough
+        // path coerces every chunk. The first chunks of the stream are
+        // exactly where NVIDIA tends to surface error events, so skipping
+        // coercion on the prefix would re-introduce the numeric-`code` 422
+        // the coercion exists to prevent.
         let prefix = Bytes::from(buf);
+        let coerced_prefix = coerce_sse_chunk(&prefix);
         let req_id_owned = client_req_id.to_string();
         let rest = upstream.map(move |r| {
             r.map(|chunk| coerce_sse_chunk(&chunk)).map_err(|e| {
@@ -2778,10 +3162,10 @@ async fn handle_passthrough_stream(
             })
         });
         let pref: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> =
-            if prefix.is_empty() {
+            if coerced_prefix.is_empty() {
                 Box::pin(rest)
             } else {
-                let head = futures_util::stream::iter(vec![Ok(prefix)]);
+                let head = futures_util::stream::iter(vec![Ok(coerced_prefix)]);
                 Box::pin(head.chain(rest))
             };
 
@@ -2790,6 +3174,7 @@ async fn handle_passthrough_stream(
                 inner: pref,
                 metrics: self.metrics.clone(),
                 carry: String::new(),
+                feed_buf: Vec::new(),
                 usage: None,
                 saw_choices: false,
                 saw_empty_choices: false,
@@ -2803,7 +3188,21 @@ async fn handle_passthrough_stream(
         // The response is now a known-length buffered-prefix stream; we leave
         // Content-Length off (chunked) to stay byte-faithful without having to
         // recompute it for the prefix + dynamic remainder.
-        let body = warp::hyper::Body::wrap_stream(tapped);
+        //
+        // Move the concurrency guard into the body stream for the streaming
+        // fallthrough (above) — the upstream worker is still generating. The
+        // synthesized-buffered path (which returns earlier) doesn't take the
+        // guard; the caller's frame holds it and drops on return, which is
+        // fine because that body is already fully buffered (no more upstream
+        // work).
+        let body = if let Some(guard) = concurrency_guard.take() {
+            warp::hyper::Body::wrap_stream(Box::pin(GuardedStream {
+                inner: tapped,
+                _guard: guard,
+            }))
+        } else {
+            warp::hyper::Body::wrap_stream(tapped)
+        };
         let resp = response_builder.body(body).unwrap_or_else(|_| {
             warp::http::Response::builder()
                 .status(status)
@@ -2965,7 +3364,7 @@ async fn handle_passthrough_stream(
 
         // Metrics for empty shell
         let outcome = if can_retry { "first_shell" } else { "502" };
-        self.metrics.inc_empty_shell_total(model, outcome);
+        self.metrics.inc_empty_shell_total(self.metrics_model(model), outcome);
 
         if can_retry {
             // Exponential backoff between retries
@@ -2977,7 +3376,7 @@ async fn handle_passthrough_stream(
             }
 
             // Metrics for retry attempt
-            self.metrics.inc_empty_shell_retry_attempts_total(model);
+            self.metrics.inc_empty_shell_retry_attempts_total(self.metrics_model(model));
 
             // Determine max_tokens for this retry. The first upstream call
             // already had pre-clamp applied (see `forward_upstream`), so when
@@ -3005,6 +3404,7 @@ async fn handle_passthrough_stream(
                 &retry_body,
                 key_str,
                 false, // shell responses are non-streaming compaction requests
+                true,  // retry_body is the JSON we re-serialized above + clamped
             );
             match rebuild.send().await {
                 Ok(resp) => {
@@ -3029,12 +3429,26 @@ async fn handle_passthrough_stream(
                         "Empty-shell retry upstream response"
                     );
                     if resp_status.is_success() && self.synthesize_empty_choices {
+                        // The concurrency guard is owned by `handle_request`'s
+                        // frame; we don't thread it into the empty-shell retry
+                        // recursion (which can self-borrow across a pinned
+                        // future). The shell-failure retry targets the same
+                        // model with a bounded `max_tokens`, so the worker
+                        // finishes quickly; if that body streams, the slot is
+                        // released on `handle_request` return rather than at
+                        // stream end — a known minor relaxation that only
+                        // affects streaming empty-shell retries on a model
+                        // that has a configured per-model limit (rare: shells
+                        // are a GLM behaviour and the limit is set for
+                        // nemotron-3-ultra).
+                        let mut no_guard: Option<ConcurrencyGuard> = None;
                         let outcome = self
                             .handle_success_maybe_synthesize(
                                 resp,
                                 resp_headers,
                                 resp_status,
                                 client_req_id,
+                                &mut no_guard,
                             )
                             .await
                             .map_err(AttemptError::Fatal)?;
@@ -3042,7 +3456,7 @@ async fn handle_passthrough_stream(
                             SuccessOutcome::Response(resp) => {
                                 self.key_pool.mark_good(key_str).await;
                                 // Record success metric for empty-shell retry
-                                self.metrics.inc_empty_shell_total(model, "retry_ok");
+                                self.metrics.inc_empty_shell_total(self.metrics_model(model), "retry_ok");
                                 AttemptResponse::Done(resp)
                             }
                             // Retry also shelled — maybe retry again or surface 502.
@@ -3075,7 +3489,7 @@ async fn handle_passthrough_stream(
                                     None,
                                 );
                                 // Record final shell metric
-                                self.metrics.inc_empty_shell_total(model, "retry_shell");
+                                self.metrics.inc_empty_shell_total(self.metrics_model(model), "retry_shell");
                                 return Ok(AttemptResponse::Done(empty_shell_bad_gateway(
                                     request_body,  // original request body for fingerprint
                                     &body,         // retry shell body
@@ -3288,12 +3702,122 @@ mod proxy_integration_tests {
     use crate::key_pool::KeyPool;
     use crate::metrics::Metrics;
     use crate::proxy::Proxy;
+    use crate::proxy::InFlightGuard;
 use crate::config::default_empty_shell_pre_clamp_max_tokens;
 use crate::config::default_request_max_prompt_tokens;
 
     // Process-global guard: set once so no integration test in this module
     // writes to the on-disk failure.log used for production diagnosis.
     static DISABLE_FAILURE_LOG: std::sync::Once = std::sync::Once::new();
+
+    /// Regression: `InFlightGuard` must `dec_in_flight` exactly once when
+    /// dropped without an explicit `release()` — this is the cancel-drop path
+    /// (warp drops the handler future mid-`await` when the client disconnects,
+    /// so no `match result` arm ever runs the explicit `release()`). Before the
+    /// guard, that leaked +1 per cancelled request and permanently depressed
+    /// the key's acquire score (`in_flight * IN_FLIGHT_PENALTY`). Here we
+    /// acquire (inc), wrap in a guard, *drop the guard without releasing*, and
+    /// assert the counter returns to 0.
+    #[tokio::test]
+    async fn in_flight_guard_drops_dec_on_unreleased_drop() {
+        let cfg = test_config("https://example.test", 3, 60);
+        let metrics = Arc::new(Metrics::new());
+        let pool = Arc::new(KeyPool::new(&cfg, metrics));
+        // Acquire bumps `in_flight` to 1 (acquire_excluding line `inc_in_flight`).
+        let handle = pool.acquire().await.expect("active key must be available");
+        let h_probe = handle.clone();
+        assert_eq!(
+            h_probe.in_flight(),
+            1,
+            "acquire must bump in_flight to 1"
+        );
+        // Wrap the acquired handle. Drop it WITHOUT calling release() —
+        // simulating a client cancel that drops the future mid-await.
+        drop(InFlightGuard::new(handle));
+        assert_eq!(
+            h_probe.in_flight(),
+            0,
+            "InFlightGuard Drop must dec in_flight to 0 (cancel-drop path); \
+             found {} — would mean +1 leaked per cancelled request",
+            h_probe.in_flight()
+        );
+    }
+
+    /// `InFlightGuard` idempotency: `release()` then `Drop` must decrement
+    /// exactly once (not twice — would under-count `in_flight`, eventually
+    /// wrapping toward u32::MAX). And `release()` twice is a no-op the second
+    /// time.
+    #[tokio::test]
+    async fn in_flight_guard_release_then_drop_decrements_once() {
+        let cfg = test_config("https://example.test", 3, 60);
+        let metrics = Arc::new(Metrics::new());
+        let pool = Arc::new(KeyPool::new(&cfg, metrics));
+        for _ in 0..5 {
+            let handle = pool.acquire().await.expect("active key available");
+            let h_probe = handle.clone();
+            assert_eq!(h_probe.in_flight(), 1);
+            let mut guard = InFlightGuard::new(handle);
+            guard.release(); // explicit release on the happy/retry path
+            guard.release(); // idempotent — second should NOT re-decrement
+            assert_eq!(
+                h_probe.in_flight(),
+                0,
+                "after release() in_flight should be 0; double-release must not undercount"
+            );
+            drop(guard); // Drop follows release — must be a no-op
+            assert_eq!(
+                h_probe.in_flight(),
+                0,
+                "Drop following release() must not further decrement; found {}",
+                h_probe.in_flight()
+            );
+        }
+        // Sanity: after N acquire/release/drop cycles the counter is exactly 0,
+        // not negative/wrapped (would manifest as enormous in_flight).
+        let final_handle = pool.acquire().await.expect("still available");
+        let final_probe = final_handle.clone();
+        assert_eq!(
+            final_probe.in_flight(),
+            1,
+            "after acquire again in_flight=1, no accumulation from idempotency test"
+        );
+        drop(InFlightGuard::new(final_handle));
+        assert_eq!(final_probe.in_flight(), 0);
+    }
+
+    /// `InFlightGuard::swap`: switching to a fresh handle must release the old
+    /// and adopt the new (whose acquire already bumped its own counter). This
+    /// backstops the retry-switch sites (`key_guard.swap(next)`).
+    #[tokio::test]
+    async fn in_flight_guard_swap_releases_old_and_adopts_new() {
+        let cfg = test_config("https://example.test", 3, 60);
+        let metrics = Arc::new(Metrics::new());
+        let pool = Arc::new(KeyPool::new(&cfg, metrics));
+        // Two handles share the same key's in_flight Arc (both clones of the
+        // one KeyStateHandle for "fake-key"); acquire bumps by 1 per call.
+        let h1 = pool.acquire().await.unwrap();
+        let h1_probe = h1.clone();
+        let h2 = pool.acquire().await.unwrap();
+        let h2_probe = h2.clone();
+        assert_eq!(h1_probe.in_flight(), 2, "two acquires → in_flight=2");
+        let mut guard = InFlightGuard::new(h1); // guard owns the first inc
+        // swap: release old (in_flight 2→1), adopt new (whose inc already counted)
+        guard.swap(h2);
+        assert_eq!(
+            h1_probe.in_flight(),
+            1,
+            "swap must release the old handle (2→1)"
+        );
+        // Drop without explicit release: Drop adopts the new handle's dec
+        drop(guard);
+        assert_eq!(
+            h1_probe.in_flight(),
+            0,
+            "Drop of the swapped-in guard must decrement the new handle → 0"
+        );
+        // both probes read the same Arc counter
+        assert_eq!(h2_probe.in_flight(), 0);
+    }
 
     fn test_config(base_url: &str, max_retries: u32, request_timeout: u64) -> Config {
         DISABLE_FAILURE_LOG.call_once(|| {
@@ -4205,7 +4729,6 @@ use crate::config::default_request_max_prompt_tokens;
     #[tokio::test]
     async fn numeric_error_code_in_sse_stream_is_coerced() {
         let sse_error = "data: {\"error\":{\"message\":\"x\",\"code\":400}}\n\n";
-
         let mock_server = MockServer::start().await;
         Mock::given(matchers::method("POST"))
             .and(matchers::path("/v1/chat/completions"))
@@ -4238,6 +4761,174 @@ use crate::config::default_request_max_prompt_tokens;
             !body.contains("\"code\":400"),
             "no raw numeric code should remain in SSE output, got: {}",
             body
+        );
+    }
+
+    /// Regression: `handle_success_maybe_synthesize`'s fallthrough path buffers
+    /// the peek prefix into `buf` and prepends it to the streaming remainder.
+    /// Before the fix, that buffered prefix was emitted verbatim *without*
+    /// going through `coerce_sse_chunk`, so a `data:` error event with a
+    /// numeric `code` that landed inside the prefix reached the client
+    /// uncoerced — re-triggering the cc-switch 422 the coercion exists to
+    /// prevent. The pure-passthrough path (`handle_passthrough_stream`)
+    /// coerces every chunk, so the two paths were inconsistent. This test
+    /// exercises the synthesis fallthrough by sending an SSE body that starts
+    /// with an error event (no `choices`) followed by a non-empty choices
+    /// event; the first event lands entirely inside the buffered prefix.
+    #[tokio::test]
+    async fn numeric_error_code_in_fallthrough_prefix_is_coerced() {
+        let sse_body = concat!(
+            "data: {\"error\":{\"message\":\"x\",\"code\":400}}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+        );
+
+        let mock_server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(sse_body, "text/event-stream"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let addr = start_proxy(test_config(&mock_server.uri(), 0, 60)).await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://{}/v1/chat/completions", addr))
+            .header("content-type", "application/json")
+            .body(r#"{"model":"m","stream":true,"messages":[]}"#)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 200);
+        let body = resp.text().await.unwrap();
+        assert!(
+            body.contains("\"code\":\"400\""),
+            "error event in buffered prefix should have numeric code coerced to string, got: {}",
+            body
+        );
+        assert!(
+            !body.contains("\"code\":400"),
+            "no raw numeric code should remain in fallthrough SSE output, got: {}",
+            body
+        );
+        // The fallthrough must still forward the *non-error* SSE event that
+        // followed the error in the same buffered prefix — synthesizing the
+        // choices event away would be a regression in body fidelity.
+        assert!(
+            body.contains("\"choices\":[{\"delta\":{\"content\":\"hi\"}}]"),
+            "non-error choices event after the error event must still be forwarded, got: {}",
+            body
+        );
+    }
+
+    /// Regression: the per-model concurrency cap lookup must honor the
+    /// *client-facing* alias source (X), not only the post-remap target (Y).
+    /// Before the fix, `concurrency_limit_per_model.get(&model)` was keyed on
+    /// `model == target` after the alias rewrite → a cap keyed by source (`{
+    /// "client-a": 1 }`) silently never applied and the limiter was a no-op,
+    /// letting upstream workers be exceeded. Here we mount a slow (300ms) mock
+    /// and fire two concurrent POSTs against a cap of 1 with a 50 ms queue
+    /// timeout. If the lookup keys by source (correct), the second request
+    /// queues 50 ms and surfaces 503 `concurrency limit reached`; if it keys
+    /// by target only (the bug), the second request acquires immediately and
+    /// both return 200.
+    ///
+    /// Note: this test is timing-sensitive (two concurrent requests, a 300 ms
+    /// mock delay, a 50 ms queue timeout) but the margin (6x mock-delay over
+    /// queue-timeout) is wide enough to be reliably non-flaky on CI.
+    #[tokio::test]
+    async fn concurrency_cap_keyed_by_alias_source_is_enforced() {
+        let mock_server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/v1/chat/completions"))
+            .and(matchers::header("content-type", "application/json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(300))
+                    .set_body_json(serde_json::json!({
+                        "id": "x", "object": "chat.completion", "model": "glm-5.2",
+                        "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}]
+                    })),
+            )
+            // Both requests match; we don't pin expectation counts since one
+            // of the two will be answered by the proxy itself (503) and never
+            // reach upstream.
+            .mount(&mock_server)
+            .await;
+
+        let mut cfg = test_config(&mock_server.uri(), 0, 60);
+        cfg.concurrency_limit_per_model
+            .insert("client-a".to_string(), 1);
+        cfg.concurrency_queue_timeout_ms = 50;
+        cfg.model_aliases
+            .insert("client-a".to_string(), "glm-5.2".to_string());
+
+        let addr = start_proxy(cfg).await;
+        let client = reqwest::Client::new();
+        let body = r#"{"model":"client-a","messages":[{"role":"user","content":"hi"}]}"#;
+        // Fire two requests concurrently.
+        let (r1, r2) = tokio::join!(
+            client
+                .post(format!("http://{}/v1/chat/completions", addr))
+                .header("content-type", "application/json")
+                .body(body)
+                .send(),
+            client
+                .post(format!("http://{}/v1/chat/completions", addr))
+                .header("content-type", "application/json")
+                .body(body)
+                .send(),
+        );
+        let r1 = r1.unwrap();
+        let r2 = r2.unwrap();
+        // Exactly one must succeed (200) and the other must hit the queue
+        // timeout (503 with the concurrency-limit message). The ordering is
+        // racy, so we just assert the *set* of statuses is {200, 503}.
+        let s1 = r1.status();
+        let s2 = r2.status();
+        let body2 = r2.text().await.unwrap_or_default();
+        assert!(
+            (s1 == 200 && s2 == 503) || (s1 == 503 && s2 == 200),
+            "expected one 200 and one 503 (cap enforced via alias source key), got {} and {}; r2 body={:?}",
+            s1, s2, body2
+        );
+    }
+
+    #[tokio::test]
+    async fn rewritten_json_body_forces_application_json_content_type_upstream() {
+        let mock_server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/v1/chat/completions"))
+            .and(matchers::header("content-type", "application/json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "x", "object": "chat.completion", "model": "m",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}]
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let addr = start_proxy(test_config(&mock_server.uri(), 0, 60)).await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://{}/v1/chat/completions", addr))
+            // deliberately non-JSON Content-Type, with a valid JSON body.
+            .header("content-type", "text/plain")
+            .body(r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            200,
+            "rewritten JSON body should reach upstream as content-type=application/json (got {}, body={:?})",
+            resp.status(),
+            resp.text().await.unwrap_or_default()
         );
     }
 
@@ -4672,6 +5363,61 @@ use crate::config::default_request_max_prompt_tokens;
         );
     }
 
+    /// Regression: the per-(key, model) empty-shell circuit breaker must
+    /// actually *trigger* after repeated shells. Before the fix, `mark_good`
+    /// ran on every 200 *before* the empty-shell classification in
+    /// `handle_success_maybe_synthesize`; `mark_good` calls
+    /// `reset_all_circuit_breakers`, so each shell response wiped the cb
+    /// counter the shell path had just incremented — the breaker could never
+    /// accumulate to threshold and `inc_circuit_breaker_triggered` never fired.
+    /// With mark_good deferred to after classification, two consecutive
+    /// shells (threshold=2, retry disabled so one upstream call each) must trip
+    /// the breaker and increment the triggered counter.
+    #[tokio::test]
+    async fn empty_shell_circuit_breaker_triggers_on_repeated_shells() {
+        let shell = serde_json::json!({
+            "choices": [], "id": "", "model": "", "created": 0,
+            "object": "chat.completion", "service_tier": null,
+            "system_fingerprint": null, "usage": null,
+        });
+        let mock_server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(shell))
+            .mount(&mock_server)
+            .await;
+
+        let mut cfg = test_config(&mock_server.uri(), 3, 60);
+        cfg.retry_on_empty_shell = false;
+        cfg.circuit_breaker_threshold = 2;
+        let addr = start_proxy(cfg).await;
+        let client = reqwest::Client::new();
+        let url = format!("http://{}/v1/chat/completions", addr);
+        let body = r#"{"model":"z-ai/glm-5.2","max_tokens":64000,"messages":[],"stream":false}"#;
+
+        let cb_before = crate::metrics::circuit_breaker_triggered().get();
+        // Two consecutive shells; the second one must trip the breaker
+        // (increment-after-check at threshold=2). Globally-countered metrics
+        // are read as a delta to stay robust under other parallel tests.
+        for _ in 0..2 {
+            let resp = client
+                .post(&url)
+                .header("content-type", "application/json")
+                .body(body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 502, "shell must surface as 502");
+        }
+        let cb_after = crate::metrics::circuit_breaker_triggered().get();
+        assert!(
+            cb_after > cb_before,
+            "circuit_breaker_triggered counter must increment after two shells with threshold=2 \
+             (before={cb_before}, after={cb_after}); if mark_good resets the cb counter on the \
+             shell path the breaker never reaches threshold"
+        );
+    }
+
     /// A normal non-empty-choices `stream:false` response must pass through the
     /// bounded-peek path unchanged — the synthesis is strictly additive and
     /// only touches the empty-choices case.
@@ -4984,6 +5730,7 @@ mod usage_accounting_tests {
             inner: futures_util::stream::empty(),
             metrics: Arc::new(Metrics::new()),
             carry: String::new(),
+            feed_buf: Vec::new(),
             usage: None,
             saw_choices: false,
             saw_empty_choices: false,
@@ -5006,6 +5753,56 @@ mod usage_accounting_tests {
         assert_eq!(u.total, Some(10));
     }
 
+    /// Regression: `bytes_stream()` can split a multi-byte UTF-8 codepoint
+    /// across two chunks. Before the cross-chunk UTF-8 reassembly fix,
+    /// `feed` did `from_utf8(chunk)` and on `Err` returned, dropping the
+    /// entire first chunk from `carry` — so the data line spanning the
+    /// boundary never reached `classify_json_line` and `usage` / `saw_choices`
+    /// were silently under-counted. This is metric-only loss (client bytes are
+    /// always forwarded verbatim), but the tap is our only usage record for
+    /// the request, so it matters for observability. We split `"café"`'s
+    /// multibyte `é` (U+00E9, two UTF-8 bytes 0xC3 0xA9) between two feeds
+    /// that together carry a complete `data:` line with a usage event — the
+    /// tap must still parse and record it.
+    #[test]
+    fn usage_tap_handles_multibyte_utf8_split_across_chunks() {
+        let mut tap = UsageTap {
+            inner: futures_util::stream::empty(),
+            metrics: Arc::new(Metrics::new()),
+            carry: String::new(),
+            feed_buf: Vec::new(),
+            usage: None,
+            saw_choices: false,
+            saw_empty_choices: false,
+            saw_any_json: false,
+            status: None,
+            client_req_id: String::new(),
+        };
+        // First chunk ends mid-codepoint: café = 'c','a','f',0xC3,0xA9.
+        // We cut after 0xC3 so the next feed's first byte (0xA9) completes é.
+        // The chunk also carries a complete first data: line + an open JSON
+        // object whose string value ends at the split mid-é.
+        let mut full1: Vec<u8> =
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"caf".to_vec();
+        full1.push(0xC3);
+        let mut chunk2: Vec<u8> = vec![0xA9];
+        chunk2.extend_from_slice(b"\"}}]}\n\n");
+        chunk2.extend_from_slice(
+            b"data: {\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":1,\"total_tokens\":5}}\n\n",
+        );
+        tap.feed(&Bytes::from(full1.clone()));
+        assert!(tap.usage.is_none(), "first chunk is a partial line + partial UTF-8");
+        tap.feed(&Bytes::from(chunk2.clone()));
+        let u = tap.usage.expect("usage captured across multibyte UTF-8 split");
+        assert_eq!(u.prompt, Some(4));
+        assert_eq!(u.completion, Some(1));
+        assert_eq!(u.total, Some(5));
+        // And the non-empty choices line that spanned the boundary must be
+        // classified too — otherwise the empty-choices diagnostic would
+        // false-positive.
+        assert!(tap.saw_choices, "choices event spanning UTF-8 split must be parsed");
+    }
+
     // ── empty-choices diagnostic: classify without false-positiving ──
 
     /// Helper: feed a body through a `UsageTap` (with an inner `empty()` stream
@@ -5017,6 +5814,7 @@ mod usage_accounting_tests {
             inner: futures_util::stream::empty(),
             metrics: Arc::new(Metrics::new()),
             carry: String::new(),
+            feed_buf: Vec::new(),
             usage: None,
             saw_choices: false,
             saw_empty_choices: false,

@@ -169,6 +169,15 @@ impl KeyStateHandle {
         self.in_flight.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Stable identity for this handle: the address of the shared `inner`
+    /// state. Equal iff the two handles refer to the same key slot (handles
+    /// are cheap clones sharing one `Arc`). Used by the proxy's tried-key set
+    /// so a just-failed key can be reliably excluded on retry — a handle's
+    /// own stack address is NOT stable across calls, but this Arc pointer is.
+    pub fn identity(&self) -> u64 {
+        std::sync::Arc::as_ptr(&self.inner) as u64
+    }
+
     /// Try to consume one token from the key's bucket with a deadline.
     /// Returns `true` when the token was consumed before the deadline,
     /// `false` when the deadline elapsed without success. The caller should
@@ -249,11 +258,12 @@ impl TokenBucket {
         if tokens <= 0.0 {
             return Ok(());
         }
-        if self.refill_per_sec <= 0.0 {
-            // No refill — permanent bucket; consume from the initial capacity.
-        }
         let mut toks = self.tokens.lock().await;
         let mut last = self.last_refill.lock().await;
+        // refill_locked is a no-op when refill_per_sec == 0 (it guards on
+        // that), so a permanent (non-refilling) bucket just drains from its
+        // initial capacity here — same as the explicit early-return consume()
+        // does, just without the special-casing.
         self.refill_locked(&mut toks, &mut last);
         if *toks >= tokens {
             *toks -= tokens;
@@ -427,6 +437,20 @@ impl KeyPool {
     ///
     /// Returns `None` when no active key exists.
     pub async fn acquire(&self) -> Option<KeyStateHandle> {
+        self.acquire_excluding(&[]).await
+    }
+
+    /// Like `acquire`, but never returns a key whose pointer-hash is in
+    /// `exclude_hashes`. Used by the retry/token-starvation loops to avoid
+    /// re-selecting a key that already failed on this request: without it a
+    /// just-failed key can be re-acquired on the next loop iteration (its
+    /// weight is only halved by `mark_failure`, not zeroed), wasting a slot
+    /// and a token-consume attempt. Returns `None` when no active,
+    /// not-excluded key exists.
+    pub async fn acquire_excluding(
+        &self,
+        exclude_hashes: &[u64],
+    ) -> Option<KeyStateHandle> {
         let handles: Vec<KeyStateHandle> = {
             let read_guard = self.inner.read().await;
             read_guard.values().cloned().collect()
@@ -440,6 +464,14 @@ impl KeyPool {
         const IN_FLIGHT_PENALTY: f64 = 0.15;
         let mut candidates: Vec<Candidate> = Vec::new();
         for handle in handles {
+            // Skip keys explicitly excluded by the caller (already tried
+            // this request). Identity is the shared `inner` Arc pointer,
+            // stable across clones of the handle.
+            if !exclude_hashes.is_empty() {
+                if exclude_hashes.contains(&handle.identity()) {
+                    continue;
+                }
+            }
             let guard = handle.inner.read().await;
             let is_active = matches!(guard.state, KeyState::Active);
             if !is_active {
@@ -525,6 +557,20 @@ impl KeyPool {
     /// `key_str` and, if the consecutive failure count crosses the configured
     /// threshold, transition the key to `KeyState::Disabled` until a health
     /// probe recovers it. Returns `true` if the key was just disabled.
+    /// Atomically record a non-throttling upstream auth/forbidden failure for
+    /// `key_str` and, if the consecutive failure count crosses the configured
+    /// threshold, transition the key to `KeyState::Disabled` until a health
+    /// probe recovers it. Returns `true` if the key was just disabled.
+    ///
+    /// This runs on every upstream-response path (401/500/429 without
+    /// Retry-After). We deliberately do NOT call `refresh_metrics()` here: that
+    /// would do an O(N) all-key state tally on the hot path (one async read
+    /// lock per key per failure). The Prometheus key-state gauges are kept
+    /// fresh by `cool_down_task`'s periodic `refresh_metrics()` (every
+    /// `health_check.interval_seconds`), so a stale gauge lags at most one
+    /// interval — a deliberate trade for not serializing N lock acquisitions
+    /// on every error response. `main.rs` also calls `refresh_metrics()` once
+    /// at startup.
     pub async fn mark_failure(&self, key_str: &str, threshold: u32) -> bool {
         let read_guard = self.inner.read().await;
         if let Some(handle) = read_guard.get(key_str) {
@@ -535,7 +581,6 @@ impl KeyPool {
             let already_disabled = matches!(handle.state().await, KeyState::Disabled { .. });
             if already_disabled {
                 // Already disabled; nothing more to do (weight is already 1).
-                self.refresh_metrics().await;
                 return true;
             }
             // Halve the weight even below threshold so the next weighted-random
@@ -558,7 +603,6 @@ impl KeyPool {
                     fail_count
                 );
                 let _ = self.pub_notifier.send(handle);
-                self.refresh_metrics().await;
                 return true;
             }
             warn!(
@@ -568,7 +612,6 @@ impl KeyPool {
                 "Recorded non-throttling auth failure (no disable yet)",
             );
         }
-        self.refresh_metrics().await;
         false
     }
 
@@ -588,7 +631,7 @@ impl KeyPool {
             );
             let _ = self.pub_notifier.send(handle);
         }
-        self.refresh_metrics().await;
+        // Gauge refresh deferred to cool_down_task (see mark_failure rationale).
     }
 
     /// Reactivate a previously Disabled key after a successful health probe.
@@ -635,7 +678,7 @@ impl KeyPool {
             info!(key = %mask_key(key_str), "Marked key as good (active)");
             let _ = self.pub_notifier.send(handle);
         }
-        self.refresh_metrics().await;
+        // Gauge refresh deferred to cool_down_task (see mark_failure rationale).
     }
 
     /// Mark a key as bad (got 429/403) and put it into cooldown.
@@ -643,6 +686,14 @@ impl KeyPool {
     /// If the upstream asks for a Retry-After longer than `cooldown.max_seconds`,
     /// we cap it to `max_seconds` to prevent a single key from draining the
     /// pool for an unbounded time. This is an intentional policy choice.
+    ///
+    /// If the key is already Cooling, the new `ready_at` is applied only if
+    /// it would *extend* the existing cooldown — never shorten it. Concurrent
+    /// 429s with a long Retry-After can land seconds apart with shorter (or
+    /// no) Retry-After; without this preserve-max rule the later call would
+    /// overwrite an existing long cooldown with the shorter value, defeating
+    /// the upstream's backoff request. A non-Cooling previous state (Active /
+    /// Disabled) is always overwritten as before.
     pub async fn mark_bad(&self, key_str: &str, retry_after: Option<u64>) {
         let read_guard = self.inner.read().await;
         if let Some(handle) = read_guard.get(key_str) {
@@ -651,7 +702,32 @@ impl KeyPool {
             let base = self.config.cooldown.base_seconds;
             let max = self.config.cooldown.max_seconds;
             let delay = retry_after.unwrap_or(base).min(max);
-            let ready_at = Instant::now() + Duration::from_secs(delay);
+            let new_ready_at = Instant::now() + Duration::from_secs(delay);
+            // Preserve an existing longer cooldown: only overwrite the
+            // Cooling ready_at if our new one is later. A first time-marking
+            // (prev state != Cooling) overwrites unconditionally.
+            let prev_ready_at = {
+                let guard = handle.inner.read().await;
+                if let KeyState::Cooling { ready_at } = guard.state {
+                    Some(ready_at)
+                } else {
+                    None
+                }
+            };
+            let ready_at = match prev_ready_at {
+                Some(prev) if prev > new_ready_at => prev,
+                _ => new_ready_at,
+            };
+            let applied_delay = ready_at
+                .checked_duration_since(Instant::now())
+                .map(|d| d.as_secs())
+                .filter(|&s| s > 0)
+                .unwrap_or(delay);
+            // `filter(s > 0)` guards the sub-second boundary: when we kept a
+            // longer `prev` ready_at but only a few hundred ms remain, raw
+            // `as_secs()` truncates to 0 and the log would falsely read
+            // "cooling for 0 seconds". Fall back to the new `delay` so the log
+            // reflects a positive cooling budget.
             handle.set_state(KeyState::Cooling { ready_at }).await;
             let w = handle.weight().await as i32;
             let delta = -(w.max(1) / 2);
@@ -659,13 +735,13 @@ impl KeyPool {
             handle.increment_fail().await;
             warn!(
                 key = %mask_key(key_str),
-                delay = delay,
+                delay = applied_delay,
                 "Marked key as bad, cooling for {} seconds",
-                delay
+                applied_delay
             );
             let _ = self.pub_notifier.send(handle);
         }
-        self.refresh_metrics().await;
+        // Gauge refresh deferred to cool_down_task (see mark_failure rationale).
     }
 
     /// Increment circuit breaker failure count for a key and model (for empty-shell/504 responses).
@@ -712,6 +788,53 @@ impl KeyPool {
         drop(write_guard);
         self.refresh_metrics().await;
         true
+    }
+
+    /// Add a batch of keys in a single write-lock acquisition, then refresh
+    /// metrics once. This is the admin POST `/admin/keys` path — callers may
+    /// paste hundreds or thousands of keys at once, and calling the per-key
+    /// `add_key` (which acquires the write lock and runs an O(N) state scan on
+    /// every call) turns that into O(N²) lock churn that stalls the proxy's
+    /// hot path. Here we hold the write lock once for all inserts.
+    ///
+    /// Returns `(added, already_present, invalid)` so the admin caller can
+    /// report per-key disposition without re-walking the pool. `invalid` holds
+    /// keys that are too short / blank (the same gate `add_key` applies).
+    pub async fn add_keys_batch(
+        &self,
+        keys: Vec<String>,
+    ) -> (Vec<String>, Vec<String>, Vec<String>) {
+        let mut added = Vec::new();
+        let mut already_present = Vec::new();
+        let mut invalid = Vec::new();
+        // First pass: partition without the lock — length/blankness checks
+        // are pure and don't touch shared state. This keeps the write lock
+        // held only for the HashMap inserts.
+        let mut to_insert: Vec<String> = Vec::new();
+        for k in keys {
+            if k.len() < 8 || k.trim().is_empty() {
+                invalid.push(k);
+                continue;
+            }
+            to_insert.push(k);
+        }
+        if !to_insert.is_empty() {
+            let mut write_guard = self.inner.write().await;
+            for k in to_insert {
+                if write_guard.contains_key(&k) {
+                    already_present.push(k);
+                } else {
+                    let handle = make_handle(&self.config, &k);
+                    write_guard.insert(k.clone(), handle);
+                    info!(key = %mask_key(&k), "Key added to pool at runtime");
+                    added.push(k);
+                }
+            }
+            drop(write_guard);
+            // One refresh for the whole batch — cheap regardless of size.
+            self.refresh_metrics().await;
+        }
+        (added, already_present, invalid)
     }
 
     /// Remove a key from the pool at runtime. Returns `true` if the key was
@@ -818,11 +941,8 @@ impl KeyPool {
                 }
             }
             for (key_str, handle) in to_update {
-                let mut guard = handle.inner.write().await;
-                let was_disabled = matches!(guard.state, KeyState::Disabled { .. });
-                guard.state = KeyState::Active;
-                guard.weight = 1;
-                guard.fail_count = 0;
+                let was_disabled =
+                    self.reactivate_after_cooldown(&handle).await;
                 if was_disabled {
                     info!(key = %mask_key(&key_str), "Disabled key reactivated by cooldown expiry (probes likely failing)");
                 } else {
@@ -831,6 +951,27 @@ impl KeyPool {
             }
             self.refresh_metrics().await;
         }
+    }
+
+    /// Cooldown-expiry reactivation: move a Cooling/Disabled key back to
+    /// `Active`, reset score/weight/fail counters, and **clear stale
+    /// circuit-breaker counters**. Called by `cool_down_task` for keys whose
+    /// `ready_at` has elapsed (no probe). Returns whether the key was
+    /// previously Disabled (for logging only).
+    ///
+    /// Split out as a `pub(crate)` helper so the invariants (state → Active,
+    /// cb counters cleared) can be unit-tested without the wall-clock of the
+    /// sweeping task. A fresh key should get a clean cb slate after a cool-down
+    /// — otherwise the first post-recovery empty-shell/504 would re-trip the
+    /// breaker immediately and the key would oscillate cool→shell→cool forever.
+    pub(crate) async fn reactivate_after_cooldown(&self, handle: &KeyStateHandle) -> bool {
+        let mut guard = handle.inner.write().await;
+        let was_disabled = matches!(guard.state, KeyState::Disabled { .. });
+        guard.state = KeyState::Active;
+        guard.weight = 1;
+        guard.fail_count = 0;
+        guard.circuit_breaker_failures.clear();
+        was_disabled
     }
 }
 
@@ -1180,6 +1321,83 @@ mod score_selection_tests {
         // With only one key now in Cooling, acquire must return None.
         let acquire = pool.acquire().await;
         assert!(acquire.is_none(), "Cooling key must not be acquireable");
+    }
+
+    /// Regression: a later `mark_bad` with a shorter cooldown must NOT shorten
+    /// an existing Cooling key's `ready_at`. Without the preserve-max rule,
+    /// a second concurrent 429 (with a short Retry-After or `None` → base)
+    /// landing after a first long Retry-After would overwrite the long cooldown
+    /// and allow the upstream to hammer the still-throttled key early.
+    #[tokio::test]
+    async fn mark_bad_preserves_longer_existing_cooldown() {
+        let pool = build_pool_with_keys(&["k1"], 100.0, 10);
+        // First mark: long Retry-After, capped at max_seconds (2s).
+        pool.mark_bad("k1", Some(60)).await;
+        let ready_at_1 = {
+            let h = pool.inner.read().await.get("k1").cloned().unwrap();
+            let g = h.inner.read().await;
+            match g.state {
+                KeyState::Cooling { ready_at } => ready_at,
+                _ => panic!("must be Cooling after first mark_bad"),
+            }
+        };
+        // Second mark: short cooldown (None → base=1s), strictly earlier
+        // than what the first mark set. Must NOT move ready_at earlier.
+        pool.mark_bad("k1", None).await;
+        let ready_at_2 = {
+            let h = pool.inner.read().await.get("k1").cloned().unwrap();
+            let g = h.inner.read().await;
+            match g.state {
+                KeyState::Cooling { ready_at } => ready_at,
+                _ => panic!("must remain Cooling after second mark_bad"),
+            }
+        };
+        assert_eq!(
+            ready_at_2, ready_at_1,
+            "second mark_bad with a shorter cooldown must not shorten the existing one"
+        );
+    }
+
+    /// Regression: cooldown-expiry reactivation (the auto path in
+    /// `cool_down_task`, not `mark_good`) must clear the stale per-model
+    /// circuit-breaker counters. Before the fix, `cool_down_task` set
+    /// `state = Active` directly without clearing `circuit_breaker_failures`,
+    /// so a key cooled by the breaker came back with its counter still at
+    /// threshold → the first post-recovery shell re-tripped the breaker
+    /// instantly and the key oscillated Cool→shell→Cool forever.
+    #[tokio::test]
+    async fn reactivate_after_cooldown_clears_circuit_breaker_counters() {
+        let pool = build_pool_with_keys(&["k1"], 100.0, 10);
+        // Cool the key with a small Retry-After so ready_at is in the past by
+        // the time the test inspects state; we drive the transition manually
+        // via the extracted `reactivate_after_cooldown` helper (the same fn
+        // `cool_down_task` calls) to avoid the wall-clock sweep interval.
+        pool.mark_bad("k1", Some(0)).await;
+        // Put some cb failures on the key + model (as if prior shells).
+        pool.increment_circuit_breaker("k1", "z-ai/glm-5.2", 3).await;
+        pool.increment_circuit_breaker("k1", "z-ai/glm-5.2", 3).await;
+        {
+            let h = pool.inner.read().await.get("k1").cloned().unwrap();
+            let g = h.inner.read().await;
+            assert!(matches!(g.state, KeyState::Cooling { .. }));
+            assert_eq!(
+                g.circuit_breaker_failures.get("z-ai/glm-5.2"),
+                Some(&2),
+                "precondition: cb counter must be populated"
+            );
+        }
+        // Drive the cooldown-expiry transition explicitly.
+        let h = pool.inner.read().await.get("k1").cloned().unwrap();
+        let was_disabled = pool.reactivate_after_cooldown(&h).await;
+        assert!(!was_disabled, "a Cooling key reactivates as not-was-disabled");
+
+        let g = h.inner.read().await;
+        assert!(matches!(g.state, KeyState::Active), "must be Active");
+        assert!(
+            g.circuit_breaker_failures.is_empty(),
+            "cb counters must be cleared on cooldown-expiry reactivation, found: {:?}",
+            g.circuit_breaker_failures
+        );
     }
 }
 
