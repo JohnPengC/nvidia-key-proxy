@@ -67,10 +67,16 @@ pub fn token_total() -> &'static Counter {
 fn request_latency() -> &'static Histogram {
     static REQUEST_LATENCY: OnceLock<Histogram> = OnceLock::new();
     REQUEST_LATENCY.get_or_init(|| {
+        // 16 个桶：0.005s 起 ×2 上限 ≈ 0.005 * 2^15 ≈ 163.84s。此前是 12 个桶
+        //（止于 10.24s），任何 ≥10s 的请求（流式生成、长 prompt 思考）都落入
+        // `+Inf` 而失去 bisect 下游延迟的能力——长尾全部糊在 +Inf 桶里读不出
+        // 分布。16 桶把 +Inf 推到 ~164s，覆盖典型 `request_timeout_seconds`
+        //（60s）与流式默认超时，使 p99/p999 在真实分布上仍可读。`+Inf` 兜底
+        // 仍存在， blijven 在 >164s 才丢线性度。
         register_histogram!(
             "proxy_request_duration_seconds",
             "HTTP 请求延迟（秒）",
-            prometheus::exponential_buckets(0.005, 2.0, 12).unwrap()
+            prometheus::exponential_buckets(0.005, 2.0, 16).unwrap()
         )
         .unwrap()
     })

@@ -27,6 +27,45 @@ fn next_req_id() -> u64 {
     REQ_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
+/// 解析 `Retry-After` 头的值（RFC 7231 §7.1.3）。接受三种语法，按下列回退：
+///
+/// 1. 整数 delta-seconds（`120`）。
+/// 2. 小数 delta-seconds（`120.5`）——向上取整，保守地多冷却一秒而非少冷却。
+/// 3. HTTP-date / IMF-fixdate（`Sun, 06 Nov 1994 08:49:37 GMT`）——与**本机
+///    当前 UTC 时钟**的差；过去/无法解析返回 `None`，让调用方按"无 Retry-After"
+///    处理（由调用方各自的默认冷却兜底）。
+///
+/// 都解析不到返回 `None`。任何已解析出的秒数至少为 1（即便 delta 为 0 或 date
+/// 恰为现在）：上游既然给了 `Retry-After`，就是想叫我们别立刻再打——把它当
+/// `0` 冷却还不如没这条头。
+fn parse_retry_after(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    // 1) 纯整数。
+    if let Ok(secs) = s.parse::<u64>() {
+        return Some(secs.max(1));
+    }
+    // 2) 小数秒——向上取整。
+    if let Ok(secs_f) = s.parse::<f64>() {
+        if secs_f.is_finite() && secs_f > 0.0 {
+            return Some((secs_f.ceil() as u64).max(1));
+        }
+        return None;
+    }
+    // 3) HTTP-date（IMF-fixdate / RFC 1123 / asctime）。chrono 的 rfc2822 解析
+    //    能吃 IMF-fixdate；asctime 不是合法 Retry-After 形式，忽略。
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc2822(s) {
+        let now = chrono::Utc::now();
+        if let Ok(dur) = dt.signed_duration_since(now).to_std() {
+            return Some(dur.as_secs().max(1));
+        }
+        return None;
+    }
+    None
+}
+
 /// 每个模型并发槽的 RAII 持有者。`Drop` 会释放 `OwnedSemaphorePermit`，
 /// *并*刷新 `proxy_concurrency_current`，使 gauge 在请求结束时下降——而不是
 /// 在下一个请求开始时才下降。
@@ -2166,19 +2205,24 @@ impl Proxy {
                 };
 
                 let queue_timeout = Duration::from_millis(self.concurrency_queue_timeout_ms);
+                // H-tier：metrics label 走 `known_models` 白名单（见 `metrics_model`）。
+                // 不经白名单的话，client 发 `{"model":"…注入任意串…"}` 能把 Prometheus
+                // 时间序列标签基数吹爆、 имени 污染。内部信号量 map 仍按**原始** model
+                // 分桶（合法名才有错误-debug 价值），仅 metrics label 这层 sanitize。
+                let metrics_label = self.metrics_model(model.as_str()).to_string();
                 let permit = match tokio::time::timeout(queue_timeout, semaphore.clone().acquire_owned()).await {
                     Ok(Ok(permit)) => {
-                        self.metrics.inc_concurrency_acquire_total(&model, "ok");
+                        self.metrics.inc_concurrency_acquire_total(&metrics_label, "ok");
                         permit
                     }
                     Ok(Err(_)) => {
-                        self.metrics.inc_concurrency_acquire_total(&model, "closed");
+                        self.metrics.inc_concurrency_acquire_total(&metrics_label, "closed");
                         return Err(warp::reject::custom(ServiceUnavailable {
                             msg: format!("Concurrency semaphore closed for model {}", model),
                         }));
                     }
                     Err(_) => {
-                        self.metrics.inc_concurrency_acquire_total(&model, "timeout");
+                        self.metrics.inc_concurrency_acquire_total(&metrics_label, "timeout");
                         let resp = warp::http::Response::builder()
                             .status(warp::http::StatusCode::SERVICE_UNAVAILABLE)
                             .header("Retry-After", (self.concurrency_queue_timeout_ms / 1000).max(1).to_string())
@@ -2189,7 +2233,7 @@ impl Proxy {
                 };
 
                 // 获取时记录当前并发（取走 permit 后）。
-                self.metrics.set_concurrency_current(&model, semaphore.available_permits() as i64);
+                self.metrics.set_concurrency_current(&metrics_label, semaphore.available_permits() as i64);
 
                 // guard 持有 permit 并在 drop 时刷新 gauge。流式成功 body 它被移入
                 // 响应流（`GuardedStream`），故仅当客户端排空完 body 时槽才归还信号
@@ -2200,7 +2244,7 @@ impl Proxy {
                     permit,
                     semaphore: semaphore.clone(),
                     metrics: self.metrics.clone(),
-                    model: model.clone(),
+                    model: metrics_label,
                 };
                 concurrency_guard = Some(guard);
             }
@@ -2663,11 +2707,18 @@ impl Proxy {
 
         // `resp.headers()` 在 `resp.bytes()` 消费 `resp` 后已不可访问；此处从克隆的
         // `resp_headers` 快照一次性解析 Retry-After，以供所有 401/429/403 分支复用。
+        // HTTP/RFC 7231 允许 Retry-After 取两种语法：*delta-seconds*（整数，可带
+        // 小数，如 `120` / `120.5`）或 *HTTP-date*（IMF-fixdate，如
+        // `Sun, 06 Nov 1994 08:49:37 GMT`）。旧实现只 `s.parse::<u64>()`，对 date
+        // 形式一律得 `None`→按"无 Retry-After"处理，等于无视上游给的精确恢复
+        // 边界、提前重试。现在按三种语法依次回退：纯整数 → 小数秒（向上取整，
+        // 保守）→ HTTP-date（与本地时钟的差，到 0 则 floor 1s 以免冷却成 0）。
         let retry_after: Option<u64> = resp_headers
             .iter()
             .find(|(k, _)| k == req_header::RETRY_AFTER.as_str())
             .and_then(|(_, v)| std::str::from_utf8(v).ok())
-            .and_then(|s| s.parse::<u64>().ok());
+            .map(|s| s.trim())
+            .and_then(parse_retry_after);
 
         // 从此起 status 为非成功（成功路径已在上方返回）。
         if status == reqwest::StatusCode::UNAUTHORIZED {
@@ -2704,9 +2755,16 @@ impl Proxy {
             // retry_on_500 启用时，在另一个 key 上重试（镜像 503 路径）。此处不尊重
             // Retry-After，因为 NVIDIA 的 500 不带它；把 key 标为降权而非 bad。
             if !is_last_attempt && self.retry_on_500 {
-                self.key_pool
-                    .mark_failure(&key_str, self.retry_config.auth_fail_threshold)
-                    .await;
+                // 瞬态 per-request worker 失败：刻意**不**走 `mark_failure`（那条
+                // 路径累加 `fail_count` 并在 `auth_fail_threshold` 时把 key 置
+                // `Disabled`——一个偶发 GLM 5xx 连续 3 个 key 就会把本池好的 key
+                // 关进 600s 禁用，池自我收缩）。也**不**走 `mark_bad`（那是
+                // Cooling + ready_at 安全网，单 key 池里会让本次重试找不到任何
+                // active key → 502）。改用 `mark_transient_failure`：只把权重减
+                // 半让 multi-key 池优先换 key、单 key 池仍能续试、不动状态、不
+                // 累加禁用计数。`cool_down_task` 无需介入；下次成功 `mark_good`
+                // 把权重与健康指标复位。
+                self.key_pool.mark_transient_failure(&key_str).await;
                 warn!(
                     client_req_id = %client_req_id,
                     key = %mask_key(&key_str),
@@ -2757,16 +2815,17 @@ impl Proxy {
                             self.metrics.inc_error();
                             // 继续下去交付 503 响应
                         } else {
-                            // 探测成功，继续重试
-                            self.key_pool
-                                .mark_failure(&key_str, self.retry_config.auth_fail_threshold)
-                                .await;
+                            // 探测成功，继续重试。503 是瞬态容量耗尽，不是鉴权
+                            // 失败：用 `mark_transient_failure`（降权，不冷却、
+                            // 不累加禁用阈值）而非 `mark_failure` 或 `mark_bad`。
+                            // 理由见 500 路径同样的处理；`mark_bad` 会让单 key
+                            // 池本次重试找不到 active key → 502。
+                            self.key_pool.mark_transient_failure(&key_str).await;
                             return Ok(AttemptResponse::Retry);
                         }
                     } else {
-                        self.key_pool
-                            .mark_failure(&key_str, self.retry_config.auth_fail_threshold)
-                            .await;
+                        // 同上：不累加 auth_fail 计数、不 Cooling，降权即可。
+                        self.key_pool.mark_transient_failure(&key_str).await;
                         return Ok(AttemptResponse::Retry);
                     }
                 }
@@ -6089,5 +6148,43 @@ mod usage_accounting_tests {
         assert!(fp.contains("choiceslen=0"), "choiceslen should be 0, got: {fp}");
         assert!(fp.contains("usage=null"), "usage should be null, got: {fp}");
         assert!(fp.contains("created=0"), "created should be 0, got: {fp}");
+    }
+
+    // ==================== Retry-After 解析（H6）====================
+    #[test]
+    fn parse_retry_after_integer() {
+        assert_eq!(parse_retry_after("120"), Some(120));
+        assert_eq!(parse_retry_after("0"), Some(1), "0 应被 floor 到 1（上游给了头＝别立刻重打）");
+    }
+
+    #[test]
+    fn parse_retry_after_fractional_ceils() {
+        assert_eq!(parse_retry_after("120.5"), Some(121));
+        assert_eq!(parse_retry_after("0.25"), Some(1), "0.25 ceil=1 而非 0");
+    }
+
+    #[test]
+    fn parse_retry_after_http_date_relative_to_now() {
+        // 未来 2 分钟的 IMF-fixdate —— delta 应在 (60, 240] 区间内（留足时钟漂移）。
+        let future = chrono::Utc::now() + chrono::Duration::seconds(120);
+        let s = future.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+        let parsed = parse_retry_after(&s).expect("HTTP-date 必须被解析");
+        assert!((60..=240).contains(&parsed), "未来 120s 的 delta 应在 60..=240，实际 {parsed}");
+    }
+
+    #[test]
+    fn parse_retry_after_past_http_date_is_none_or_tiny() {
+        // 远过去的 HTTP-date：delta 为负 → None（交调用方兜底），不会给一个巨大冷却。
+        let past = chrono::Utc::now() - chrono::Duration::seconds(86_400);
+        let s = past.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+        assert_eq!(parse_retry_after(&s), None, "过去的 HTTP-date 应返回 None");
+    }
+
+    #[test]
+    fn parse_retry_after_garbage_is_none() {
+        assert_eq!(parse_retry_after("not-a-date"), None);
+        assert_eq!(parse_retry_after(""), None);
+        assert_eq!(parse_retry_after("   "), None);
+        assert_eq!(parse_retry_after("-5"), None, "负数/小数负值不应被当合法 delta");
     }
 }

@@ -671,6 +671,42 @@ impl KeyPool {
         false
     }
 
+    /// 瞬态上游失败（500 `Failed to generate completions`、不带 Retry-After 的
+    /// 503 容量耗尽）专用：**只降权、不冷却、不累加禁用计数**。
+    ///
+    /// 为什么不直接用 `mark_failure(threshold=u32::MAX)`：那条路径会累加
+    /// `fail_count`，长时段瞬态暴雨里 u32 溢出（debug 下 panic / release 下
+    /// wrap→ `fail_count >= threshold` 误判→ 把好 key 置 Disabled）。为什么
+    /// 不用 `mark_bad`：那是 Cooling + `cool_down_task` 的 ready_at 安全网，
+    /// 单 key 池里会让本次重试找不到任何 active key→ 502。瞬态失败希望的是
+    /// 「multi-key 池优先换 key、单 key 池仍能续试」——降权重恰好满足：acquire
+    /// 的加权随机按权重抽，单 key 时它的权重是唯一选项仍被选中；多 key 时
+    /// 半权大幅降低再撞它的概率。`fail_count` 不动→ `mark_good`/`reactivate`
+    /// 路径无需特殊清理。`circuit_breaker_failures` 也不动——那是 empty-shell /
+    /// 504 的独立计数器，500/503 走 `mark_bad`/CB 另有路径。
+    pub async fn mark_transient_failure(&self, key_str: &str) {
+        let read_guard = self.inner.read().await;
+        if let Some(handle) = read_guard.get(key_str).cloned() {
+            drop(read_guard);
+            // 在该 handle 的写锁内完成单次权重减半。状态不动（仍 Active）。
+            {
+                let mut guard = handle.inner.write().await;
+                // 已 Disabled/Cooling 的 key 不再画蛇添足。
+                if !matches!(guard.state, KeyState::Active) {
+                    return;
+                }
+                let w = guard.weight as i32;
+                let delta = -(w.max(1) / 2);
+                let nw = w + delta;
+                guard.weight = if nw > 0 { nw as u32 } else { 1 };
+            }
+            warn!(
+                key = %mask_key(key_str),
+                "瞬态上游失败；降权一半（不冷却、不计禁用阈值）",
+            );
+        }
+    }
+
     /// 强制将一个 key 置于 `Disabled` 状态（当健康检查发现某 key 的恢复探测
     /// 连续 `max_consecutive_failures` 次报错时使用）。与 `mark_failure` 中的
     /// `Disabled` 转换逻辑一致。
@@ -1294,6 +1330,58 @@ mod retry_state_machine_tests {
         assert!(!disabled2);
         let w2 = handle.weight().await;
         assert_eq!(w2, 2, "weight should halve again (4 → 2)");
+    }
+
+    #[tokio::test]
+    async fn mark_transient_failure_halves_weight_and_keeps_active() {
+        let pool = build_pool(&["k1"]);
+        let handle = pool.inner.read().await.get("k1").cloned().unwrap();
+        handle.add_weight(7).await; // weight = 1 + 7 = 8
+        assert_eq!(handle.weight().await, 8);
+        pool.mark_transient_failure("k1").await;
+        assert_eq!(
+            handle.weight().await,
+            4,
+            "瞬态失败应把权重减半（8 → 4）"
+        );
+        assert_eq!(handle.state().await, KeyState::Active, "状态应保持 Active（不冷却）");
+        assert_eq!(
+            handle.fail_count().await,
+            0,
+            "瞬态失败不应累加 fail_count（不计禁用阈值）"
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_transient_failure_repeated_never_disables_and_saturates_at_min_weight() {
+        // 模拟长时段瞬态暴雨：连续 mark_transient_failure 不该把 key 变 Disabled，
+        // 也不该让权重下穿到 0（floor 1，保证单 key 池仍能续试）。
+        let pool = build_pool(&["k1"]);
+        let handle = pool.inner.read().await.get("k1").cloned().unwrap();
+        for _ in 0..40 {
+            pool.mark_transient_failure("k1").await;
+        }
+        assert!(matches!(handle.state().await, KeyState::Active), "反复瞬态失败不得置 Disabled");
+        assert!(
+            handle.weight().await >= 1,
+            "权重不得下穿 1（保证单 key 池续试）"
+        );
+        assert_eq!(handle.fail_count().await, 0, "fail_count 仍为 0");
+    }
+
+    #[tokio::test]
+    async fn mark_transient_failure_no_ops_on_non_active() {
+        // 已 Disabled/Cooling 的 key 调用此方法应 no-op，不死减权重/不复活。
+        let pool = build_pool(&["k1"]);
+        let handle = pool.inner.read().await.get("k1").cloned().unwrap();
+        // 先把它置 Disabled（3 次鉴权失败）。
+        for _ in 0..3 {
+            pool.mark_failure("k1", 3).await;
+        }
+        let w_before = handle.weight().await;
+        pool.mark_transient_failure("k1").await;
+        assert_eq!(handle.weight().await, w_before, "Disabled key 上调用瞬态失败为 no-op");
+        assert!(matches!(handle.state().await, KeyState::Disabled { .. }));
     }
 }
 

@@ -861,6 +861,25 @@ impl Config {
                 self.request_max_prompt_tokens, self.empty_shell_no_retry_prompt_tokens
             );
         }
+        // 反向灰带：`request_max < no_retry`。软不重试阈值的语义是"prompt 超过这个
+        // 就不再耗一次重试"；硬上限是"超过这个就在入口直接 413 拒绝"。如果硬上限
+        // 严格低于软阈值，那么凡是超过硬上限的请求都被 413 拒绝在门外、根本到
+        // 不了 `no_retry` 判定——`empty_shell_no_retry_prompt_tokens` 实际上是个死
+        // 值、永不生效。它不会复活 forbidden 灰带（更小的硬上限是保守的），但启
+        // 用的 `retry_on_empty_shell` 在硬上限以内的合法请求上仍按 `no_retry` 截断
+        // 是无意义的。运维多半是调整其中一个忘了同步另一个；用 warn 提醒，不打
+        // 断启动（值合法、只是配置意图与生效行为不符）。
+        if self.request_max_prompt_tokens > 0
+            && self.empty_shell_no_retry_prompt_tokens > 0
+            && self.request_max_prompt_tokens < self.empty_shell_no_retry_prompt_tokens
+        {
+            warn!(
+                "request_max_prompt_tokens={} < empty_shell_no_retry_prompt_tokens={}；\
+                 硬上限低于软不重试阈值，令 `empty_shell_no_retry_prompt_tokens` 成为死值——\
+                 超过硬上限的请求在入口被 413 拦下、到不了 no_retry 判定。建议二者相等。",
+                self.request_max_prompt_tokens, self.empty_shell_no_retry_prompt_tokens
+            );
+        }
 
         // 前门鉴权开启却没配 bearer_token：见 `validate_auth` 的完整说明。
         // 一并入 `validate` 让 `Config::load` 自动 fail-fast。

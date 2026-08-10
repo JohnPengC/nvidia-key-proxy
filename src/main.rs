@@ -1,8 +1,42 @@
 use std::net::SocketAddr;
 
-use tracing::info;
+use tracing::{info, warn};
 
 use nvidia_key_proxy::{build_routes, AppState, Config, init_tracing};
+
+/// 优雅关停的硬上限。`bind_with_graceful_shutdown` 会在收到信号后排空在途请求，
+/// 但**不设上限**——一个不配合的流式调用方（一直不读 body、TCP 半开）能让单个
+/// 监听 future 永不退出，进程像僵在那。我们给整个关停流程一个硬墙：超时后强杀，
+/// 让 orchestrator（k8s/k8s preStop / systemd）的 `terminationGracePeriodSeconds`
+/// 真正生效——超时不如直接让上游重启我们，而不是被一个坏 client 卡死。
+const SHUTDOWN_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// 等待关停信号：Ctrl+C（SIGINT）或 SIGTERM。容器/k8s/systemd 停 pod 默认发
+/// SIGTERM，只听 Ctrl+C 会把 SIGTERM 当未捕获信号走默认动作（直接退出），
+/// 跳过整段在途排空——in-flight 请求被切、`failure.log` 尾记录丢、worker
+/// guard 不 drop。二者听其一即触发。
+async fn await_shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c().await.ok();
+    };
+    #[cfg(unix)]
+    let sigterm = async {
+        use tokio::signal::unix::{signal, SignalKind};
+        if let Ok(mut s) = signal(SignalKind::terminate()) {
+            s.recv().await;
+        } else {
+            // 退化为永远不触发，合并 future 等价于只听 Ctrl+C。
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(not(unix))]
+    let sigterm = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = sigterm => {},
+    }
+}
 
 #[tokio::main]
 async fn main() {
@@ -74,22 +108,44 @@ async fn main() {
         );
         let (_, fut) = warp::serve(routes.clone()).bind_with_graceful_shutdown(
             a,
-            async {
-                tokio::signal::ctrl_c().await.ok();
-                info!("收到关停信号，排空在途请求……");
-            },
+            // 共用同一个关停信号 future；触发 warp 优雅关停。绑定器之间不共享
+            // 同一个 future 实例（future 不可重入），故每个绑定者各自 await 它。
+            await_shutdown_signal(),
         );
         server_handles.push(tokio::spawn(fut));
     }
 
-    // 等所有监听者关停（每个都在 Ctrl+C 时停）。
-    for h in server_handles {
-        let _ = h.await;
+    // 一个独立 daemon：等关停信号一到，**立刻** `notify_waiters` 通知后台 task
+    // （坏 key 扫描、冷却计时）停。这样它们的收尾与 warp 在途请求排空**并行**，
+    // 而不是先等 drain 全部完成、再串行通知它们走关停分支，缩短整体关闭时延。
+    // `notify_waiters` 不累加，被等者只会被叫一次——daemon 触发一次即够。
+    let bg_stop = state.stop_signal.clone();
+    let bg_stop_handle = tokio::spawn(async move {
+        await_shutdown_signal().await;
+        bg_stop.notify_waiters();
+        info!("已通知后台 task 关停；等待在途请求排空……");
+    });
+
+    // 等所有监听者关停，或超时硬墙到——后者强退，避免坏 client 把进程卡死。
+    let drain = async {
+        for h in server_handles {
+            let _ = h.await;
+        }
+    };
+    tokio::select! {
+        _ = drain => {
+            info!("在途请求排空完成，关停完成");
+        }
+        _ = tokio::time::sleep(SHUTDOWN_DRAIN_TIMEOUT) => {
+            warn!(
+                "关停排空超时（{}s），仍存在不配合的在途请求/坏流式调用方；强退",
+                SHUTDOWN_DRAIN_TIMEOUT.as_secs()
+            );
+        }
     }
 
-    // 通知后台 task 停下并 drop 它们的 handle。
-    state.stop_signal.notify_waiters();
+    // drop background-task handle（已由 stop_signal 通知停）。
     drop(cooldown_handle);
     drop(bad_key_handle);
-    info!("关停完成");
+    drop(bg_stop_handle);
 }

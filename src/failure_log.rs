@@ -186,6 +186,14 @@ pub fn write_failure(
                             eprintln!("failure_log: 轮转后 reopen 失败（{}）：{}", path, e);
                             // `rot.file` 仍持有旧 handle；Unix 上对已打开文件
                             // rename 会让 fd 继续写到被移走的 inode，数据不丢。
+                            // **关键**：即使 reopen 失败也要把 `written` 归零，
+                            // 否则下一行 `written + len > max_bytes` 仍为真，会
+                            // 每行都重复 rename+reopen，对坏掉的文件系统形成一个
+                            // spin-on-every-line 的活锁——数据已安全落在被 roll
+                            // 走的旧 inode 上，没必要每行再试一遍。后续写入会继
+                            // 续在旧 handle（roll 走的文件）上累积，`written` 从 0
+                            // 起计，max_bytes 后再尝试一次 reopen（可能届时已恢复）。
+                            rot.written = 0;
                         }
                     }
                 }

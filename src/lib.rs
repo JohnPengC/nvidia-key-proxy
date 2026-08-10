@@ -264,16 +264,20 @@ pub fn build_routes(
         .and_then({
             let proxy = state.proxy.clone();
             let auth = state.config.auth.clone();
+            // 预计算期望的 `Bearer <token>` 串：`format!` 不必每请求都跑一次。
+            // `enabled = false` 时此串无人读，留空即可。
+            let expected_bearer: std::sync::Arc<str> =
+                std::sync::Arc::from(format!("Bearer {}", auth.bearer_token).as_str());
+            let auth_enabled = auth.enabled;
             move |path: String, method, headers: warp::http::HeaderMap, body, remote| {
                 let proxy = proxy.clone();
-                let auth = auth.clone();
+                let expected_bearer = expected_bearer.clone();
                 async move {
                     // 前置鉴权：开启后，转发前要求带匹配的
                     // `Authorization: Bearer <bearer_token>`。
-                    if auth.enabled {
-                        let expected = format!("Bearer {}", auth.bearer_token);
+                    if auth_enabled {
                         match headers.get("authorization").and_then(|v| v.to_str().ok()) {
-                            Some(v) if constant_time_eq(v.as_bytes(), expected.as_bytes()) => {}
+                            Some(v) if constant_time_eq(v.as_bytes(), expected_bearer.as_bytes()) => {}
                             _ => {
                                 return Err::<_, Rejection>(warp::reject::custom(Unauthorized));
                             }
@@ -295,6 +299,10 @@ pub fn build_routes(
     // 故不叠加前门。`/health` 始终豁免（见下）。此前 metrics 路由排在 `.or()`
     // 链中 proxy 的 auth 块之前，绕过了前门——这是 S1 的根因。
     let front_door_auth = state.config.auth.clone();
+    let front_door_enabled = front_door_auth.enabled;
+    // 预计算期望的 `Bearer <token>` 串（见前门 proxy 路由同样的处理）。
+    let front_door_expected: std::sync::Arc<str> =
+        std::sync::Arc::from(format!("Bearer {}", front_door_auth.bearer_token).as_str());
     let metrics_route = warp::path::full()
         .and_then(move |p: warp::path::FullPath| {
             let metrics_path = metrics_path.clone();
@@ -311,13 +319,13 @@ pub fn build_routes(
         .and(warp::header::headers_cloned())
         .and_then(move |headers: warp::http::HeaderMap| {
             let metrics = metrics.clone();
-            let front_door_auth = front_door_auth.clone();
+            let front_door_expected = front_door_expected.clone();
             async move {
                 // 复用前门 bearer 校验：开启时要求 `Authorization: Bearer <token>`。
-                if front_door_auth.enabled {
-                    let expected = format!("Bearer {}", front_door_auth.bearer_token);
+                if front_door_enabled {
                     match headers.get("authorization").and_then(|v| v.to_str().ok()) {
-                        Some(v) if constant_time_eq(v.as_bytes(), expected.as_bytes()) => {}
+                        Some(v)
+                            if constant_time_eq(v.as_bytes(), front_door_expected.as_bytes()) => {}
                         _ => {
                             return Err::<_, Rejection>(warp::reject::custom(Unauthorized));
                         }
@@ -415,13 +423,15 @@ impl warp::reject::Reject for AdminDisabled {}
 /// 一致；显然的长度侧信道被接受，因为格式良好的
 /// `Authorization: Bearer <token>` 头几乎总带固定 `Bearer ` 前缀）。逐字节
 /// 循环总是扫完整个公共长度、把差异累计进一个累加器，不短路。
+/// 常数时间字节比较。**不做长度短路**：长度差也被折叠进 `diff`，循环仍跑
+/// 较短序列的全长，因此调用方无法从耗时侧信道区分"长度对了但某字节错"与
+/// "长度就错"——对 bearer 令牌这种定长/几乎定长秘密，这是规避长度侧信道的
+/// 标准做法。仍是 polyfill：项目在所有路径上避免引入新 crate；见下文。
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff: u8 = 0;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
+    let mut diff: u8 = a.len() as u8 ^ b.len() as u8;
+    let n = a.len().min(b.len());
+    for i in 0..n {
+        diff |= a[i] ^ b[i];
     }
     diff == 0
 }
