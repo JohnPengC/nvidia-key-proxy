@@ -11,12 +11,12 @@ use warp::{self, Rejection, Reply};
 use crate::failure_log;
 use crate::key_pool::{mask_key, KeyPool, KeyStateHandle};
 use crate::metrics::Metrics;
-use std::pin::Pin;
-use std::task::{Context, Poll};
 use futures_util::{Stream, StreamExt};
 use reqwest::header::{self as req_header, HeaderValue as ReqHeaderValue};
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::Mutex as StdMutex;
+use std::task::{Context, Poll};
 
 /// 进程级单调计数器，用于为每次失败生成 `req_id`。
 /// 单调递增、永不复位——为同一逻辑客户端请求的重试链提供稳定关联 id
@@ -179,7 +179,6 @@ impl Drop for InFlightGuard {
     }
 }
 
-
 /// 我们会把模型名原样带入 Prometheus 标签的最大长度。任何超出该长度（无论
 /// 如何到达）的名称都会被塌缩为 `"_unknown"`——即使是运营者配置的、意外超长
 /// 的别名——这样单个 `model` 就无法膨胀 /metrics 输出。
@@ -303,7 +302,9 @@ enum SuccessOutcome {
     Response(warp::reply::Response),
     /// 上游返回了一个空壳软失败。携带解析后的 body，使调用方在自己选择不（或
     /// 无法）重试时可从中提取字段构造 502 detail 消息。
-    ShellFailure { body: serde_json::Value },
+    ShellFailure {
+        body: serde_json::Value,
+    },
 }
 
 /// 把一个 empty-`choices` 2xx body 判定为 NVIDIA 空壳软失败。
@@ -407,7 +408,9 @@ fn coerce_json_body(body: &Bytes) -> Bytes {
     match serde_json::from_slice::<serde_json::Value>(body) {
         Ok(mut v) => {
             coerce_error_code_json(&mut v);
-            serde_json::to_vec(&v).map(Bytes::from).unwrap_or_else(|_| body.clone())
+            serde_json::to_vec(&v)
+                .map(Bytes::from)
+                .unwrap_or_else(|_| body.clone())
         }
         Err(_) => body.clone(),
     }
@@ -467,8 +470,8 @@ fn coerce_sse_chunk(chunk: &Bytes) -> Bytes {
 /// body 的 JSON 错误响应。用于不支持的 API 形态（Responses / Anthropic
 /// Messages），使客户端拿到一个明确的类型化信号、而非一个困惑的上游 404。
 fn json_error(status: warp::http::StatusCode, message: &str) -> warp::reply::Response {
-    let body = serde_json::json!({ "error": { "message": message, "type": "not_supported" } })
-        .to_string();
+    let body =
+        serde_json::json!({ "error": { "message": message, "type": "not_supported" } }).to_string();
     warp::http::Response::builder()
         .status(status)
         .header("content-type", "application/json")
@@ -483,7 +486,10 @@ fn json_error(status: warp::http::StatusCode, message: &str) -> warp::reply::Res
 
 /// 用任意 `serde_json::Value`（例如上游 `/v1/models` 目录）构造一个 JSON
 /// 响应，在原样透传 NVIDIA 真实模型列表时使用。
-fn json_value_response(status: warp::http::StatusCode, v: &serde_json::Value) -> warp::reply::Response {
+fn json_value_response(
+    status: warp::http::StatusCode,
+    v: &serde_json::Value,
+) -> warp::reply::Response {
     let body = serde_json::to_vec(v).unwrap_or_default();
     warp::http::Response::builder()
         .status(status)
@@ -508,9 +514,9 @@ fn json_value_response(status: warp::http::StatusCode, v: &serde_json::Value) ->
 fn body_summary(parsed_body: &Option<serde_json::Value>) -> String {
     fn finalize(val: &serde_json::Value) -> serde_json::Value {
         match val {
-            serde_json::Value::Number(_) | serde_json::Value::String(_) | serde_json::Value::Bool(_) => {
-                val.clone()
-            }
+            serde_json::Value::Number(_)
+            | serde_json::Value::String(_)
+            | serde_json::Value::Bool(_) => val.clone(),
             serde_json::Value::Null => serde_json::Value::String("<present:null>".to_string()),
             // 对象/数组取不到标量，但「该键存在」对诊断仍是有用信号。
             _ => serde_json::Value::String("<present>".to_string()),
@@ -519,7 +525,10 @@ fn body_summary(parsed_body: &Option<serde_json::Value>) -> String {
     let mut summary = serde_json::Map::new();
     if let Some(v) = parsed_body {
         if let Some(m) = v.get("model").and_then(|x| x.as_str()) {
-            summary.insert("model".to_string(), serde_json::Value::String(m.to_string()));
+            summary.insert(
+                "model".to_string(),
+                serde_json::Value::String(m.to_string()),
+            );
         }
         if let Some(messages) = v.get("messages").and_then(|x| x.as_array()) {
             summary.insert(
@@ -583,13 +592,8 @@ fn write_empty_shell_failure_log(
 
     let req_fp = request_body_fingerprint(request_body);
     let shell_fp = shell_body_fingerprint(upstream_body);
-    let detail = build_empty_shell_detail(
-        &req_fp,
-        &shell_fp,
-        retry_attempt,
-        retry_reason,
-        elapsed_ms,
-    );
+    let detail =
+        build_empty_shell_detail(&req_fp, &shell_fp, retry_attempt, retry_reason, elapsed_ms);
 
     failure_log::write_failure(
         "POST",
@@ -823,9 +827,7 @@ impl EstPromptCosts {
 fn message_content_tokens(content: &serde_json::Value, costs: &EstPromptCosts) -> u64 {
     match content {
         serde_json::Value::String(s) => s.chars().count() as u64 / 4,
-        serde_json::Value::Array(parts) => {
-            parts.iter().map(|p| costs.part_cost(p)).sum::<u64>()
-        }
+        serde_json::Value::Array(parts) => parts.iter().map(|p| costs.part_cost(p)).sum::<u64>(),
         // 一个非字符串、非数组的标量（number/bool/null）——按其序列化字符 / 4
         // 计数，有上限。罕见，主要是防御性回退。
         other => {
@@ -866,16 +868,37 @@ fn estimate_prompt_tokens(body: &bytes::Bytes, costs: &EstPromptCosts) -> Option
 fn shell_body_fingerprint(body: &serde_json::Value) -> String {
     let id = body
         .get("id")
-        .map(|v| if v.is_null() { "null".to_string() } else { v.to_string() })
+        .map(|v| {
+            if v.is_null() {
+                "null".to_string()
+            } else {
+                v.to_string()
+            }
+        })
         .unwrap_or_else(|| "<absent>".to_string());
     let model = body
         .get("model")
-        .map(|v| if v.is_null() { "null".to_string() } else { v.to_string() })
+        .map(|v| {
+            if v.is_null() {
+                "null".to_string()
+            } else {
+                v.to_string()
+            }
+        })
         .unwrap_or_else(|| "<absent>".to_string());
-    let created = body.get("created").map(|v| v.to_string()).unwrap_or_else(|| "<absent>".to_string());
+    let created = body
+        .get("created")
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "<absent>".to_string());
     let usage = body
         .get("usage")
-        .map(|v| if v.is_null() { "null".to_string() } else { v.to_string() })
+        .map(|v| {
+            if v.is_null() {
+                "null".to_string()
+            } else {
+                v.to_string()
+            }
+        })
         .unwrap_or_else(|| "<absent>".to_string());
     let choiceslen = body
         .get("choices")
@@ -1021,11 +1044,10 @@ fn clamp_max_tokens(body: &bytes::Bytes, target: u64) -> Vec<u8> {
     // 仅当原始 max_tokens 超过 target 时才 clamp——否则原样不动（且根本无
     // max_tokens 时什么也不设，免得新增字段惊到客户端）。
     let clamp_needed = match obj.get("max_tokens") {
-        Some(serde_json::Value::Number(n)) => n
-            .as_u64()
-            .map(|x| x > target)
-            .unwrap_or(false),
-        Some(serde_json::Value::String(s)) => s.parse::<u64>().ok().map(|x| x > target).unwrap_or(false),
+        Some(serde_json::Value::Number(n)) => n.as_u64().map(|x| x > target).unwrap_or(false),
+        Some(serde_json::Value::String(s)) => {
+            s.parse::<u64>().ok().map(|x| x > target).unwrap_or(false)
+        }
         _ => false,
     };
     if !clamp_needed {
@@ -1037,7 +1059,6 @@ fn clamp_max_tokens(body: &bytes::Bytes, target: u64) -> Vec<u8> {
     );
     serde_json::to_vec(&v).unwrap_or_else(|_| body.to_vec())
 }
-
 
 /// 从上游 `usage` 对象提取的 token 用量。任一分量在省略时（如最终 chunk 之前的
 /// 流式 chunk，或无 usage 响应）都可能为 `None`。
@@ -1214,9 +1235,7 @@ where
                 // 到 None 时 carry/feed_buf 已被 flush_trailing 清空（含 lossy 收尾）。
                 std::task::Poll::Ready(None)
             }
-            std::task::Poll::Ready(Some(Err(e))) => {
-                std::task::Poll::Ready(Some(Err(e)))
-            }
+            std::task::Poll::Ready(Some(Err(e))) => std::task::Poll::Ready(Some(Err(e))),
             std::task::Poll::Ready(Some(Ok(chunk))) => {
                 let out = self.feed(&chunk);
                 std::task::Poll::Ready(Some(Ok(out)))
@@ -1493,8 +1512,7 @@ impl Proxy {
         // 为 metrics 标签基数收容而构建模型白名单：运营者在配置中显式点名的每个
         // 模型。客户端发来、不在此集合里的 `model` 会被上报为 "_unknown"
         //（见 metrics_model）。
-        let mut known_models: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+        let mut known_models: std::collections::HashSet<String> = std::collections::HashSet::new();
         for k in model_aliases.keys() {
             known_models.insert(k.clone());
         }
@@ -1746,9 +1764,7 @@ impl Proxy {
         // 不应消费我们池中的 key、也不应烧一个限流 token。NVIDIA 无需鉴权即应答该端点
         // 并返回其完整真实目录，因此我们透传并对结果缓存（见 `handle_models`）。我们不在
         // 该路径上转发 chat 流量。
-        if method == warp::http::Method::GET
-            && (path == "/v1/models" || path == "/v1/models/")
-        {
+        if method == warp::http::Method::GET && (path == "/v1/models" || path == "/v1/models/") {
             return Ok(self.handle_models().await);
         }
 
@@ -1799,10 +1815,7 @@ impl Proxy {
                 self.metrics.inc_key_switch_token_starvation();
                 switch_count += 1;
                 if switch_count <= max_switches as u32 {
-                    tracing::warn!(
-                        switch = switch_count,
-                        "当前 key token 饥饿；切换到另一个"
-                    );
+                    tracing::warn!(switch = switch_count, "当前 key token 饥饿；切换到另一个");
                 }
                 continue; // 循环试下一个 key
             }
@@ -1892,9 +1905,9 @@ impl Proxy {
                             false
                         }
                     }
-                    serde_json::Value::String(s) => {
-                        s.parse::<i64>().is_ok_and(|x| x >= 1 && (x as u64) <= max_allowed)
-                    }
+                    serde_json::Value::String(s) => s
+                        .parse::<i64>()
+                        .is_ok_and(|x| x >= 1 && (x as u64) <= max_allowed),
                     _ => false,
                 };
                 if !keep {
@@ -1949,7 +1962,11 @@ impl Proxy {
             }
 
             // model 别名重映射：客户端名 → NVIDIA 就绪名
-            if let Some(m) = obj.get("model").and_then(|x| x.as_str()).map(|s| s.to_string()) {
+            if let Some(m) = obj
+                .get("model")
+                .and_then(|x| x.as_str())
+                .map(|s| s.to_string())
+            {
                 // 在任意改写前记录客户端可见源，使上限/ 断路器查找优先用它（运营者
                 // 可按 X 或 Y 之一来索引这些 map）。
                 model_lookup_source = Some(m.clone());
@@ -2018,10 +2035,7 @@ impl Proxy {
             // `usage`。注入它使我们的流式请求 token 指标被填充，但绝不覆盖客户端已
             // 设的值（true 或 false）——仅当 `include_usage` 缺省时才注入。
             if self.inject_stream_usage {
-                let is_stream = obj
-                    .get("stream")
-                    .and_then(|s| s.as_bool())
-                    .unwrap_or(false);
+                let is_stream = obj.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
                 if is_stream {
                     let client_set = obj
                         .get("stream_options")
@@ -2032,14 +2046,8 @@ impl Proxy {
                             .get("stream_options")
                             .and_then(|v| v.as_object().cloned())
                             .unwrap_or_default();
-                        so.insert(
-                            "include_usage".to_string(),
-                            serde_json::Value::Bool(true),
-                        );
-                        obj.insert(
-                            "stream_options".to_string(),
-                            serde_json::Value::Object(so),
-                        );
+                        so.insert("include_usage".to_string(), serde_json::Value::Bool(true));
+                        obj.insert("stream_options".to_string(), serde_json::Value::Object(so));
                     }
                 }
             }
@@ -2082,10 +2090,7 @@ impl Proxy {
                     }
                     let need_name = tobj.get("name").is_none_or(serde_json::Value::is_null);
                     if need_name {
-                        tobj.insert(
-                            "name".to_string(),
-                            serde_json::Value::String(String::new()),
-                        );
+                        tobj.insert("name".to_string(), serde_json::Value::String(String::new()));
                         fixed += 1;
                     }
                 }
@@ -2121,9 +2126,11 @@ impl Proxy {
         let model = model_rewrite_log
             .clone()
             .or_else(|| {
-                body_value
-                    .as_ref()
-                    .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(|s| s.to_string()))
+                body_value.as_ref().and_then(|v| {
+                    v.get("model")
+                        .and_then(|m| m.as_str())
+                        .map(|s| s.to_string())
+                })
             })
             .unwrap_or_default();
 
@@ -2197,8 +2204,7 @@ impl Proxy {
         // 先按客户端可见源名查找（运营者自然按别名源 X 来为
         // `concurrency_limit_per_model` 作 key），回退到重映射后的目标 Y——于是按
         // 任一形态作 key 的上限都适用。见上文 `model_lookup_source`。
-        let cap_key: Option<String> =
-            model_lookup_source.clone().or_else(|| Some(model.clone()));
+        let cap_key: Option<String> = model_lookup_source.clone().or_else(|| Some(model.clone()));
         let cap_lookup = cap_key
             .as_ref()
             .and_then(|k| self.concurrency_limit_per_model.get(k))
@@ -2206,7 +2212,8 @@ impl Proxy {
         if let Some(&limit) = cap_lookup {
             if limit > 0 {
                 // 按模型惰性初始化信号量（用 StdMutex 做内部可变性、线程安全）
-                static SEMAPHORES: OnceLock<StdMutex<HashMap<String, Arc<Semaphore>>>> = OnceLock::new();
+                static SEMAPHORES: OnceLock<StdMutex<HashMap<String, Arc<Semaphore>>>> =
+                    OnceLock::new();
                 let semaphores = SEMAPHORES.get_or_init(|| StdMutex::new(HashMap::new()));
 
                 // 取或创建本模型信号量
@@ -2223,30 +2230,45 @@ impl Proxy {
                 // 时间序列标签基数吹爆、 имени 污染。内部信号量 map 仍按**原始** model
                 // 分桶（合法名才有错误-debug 价值），仅 metrics label 这层 sanitize。
                 let metrics_label = self.metrics_model(model.as_str()).to_string();
-                let permit = match tokio::time::timeout(queue_timeout, semaphore.clone().acquire_owned()).await {
-                    Ok(Ok(permit)) => {
-                        self.metrics.inc_concurrency_acquire_total(&metrics_label, "ok");
-                        permit
-                    }
-                    Ok(Err(_)) => {
-                        self.metrics.inc_concurrency_acquire_total(&metrics_label, "closed");
-                        return Err(warp::reject::custom(ServiceUnavailable {
-                            msg: format!("Concurrency semaphore closed for model {}", model),
-                        }));
-                    }
-                    Err(_) => {
-                        self.metrics.inc_concurrency_acquire_total(&metrics_label, "timeout");
-                        let resp = warp::http::Response::builder()
-                            .status(warp::http::StatusCode::SERVICE_UNAVAILABLE)
-                            .header("Retry-After", (self.concurrency_queue_timeout_ms / 1000).max(1).to_string())
-                            .body(warp::hyper::Body::from(format!("Model {} concurrency limit reached, queue timeout", model)))
-                            .unwrap();
-                        return Ok(resp);
-                    }
-                };
+                let permit =
+                    match tokio::time::timeout(queue_timeout, semaphore.clone().acquire_owned())
+                        .await
+                    {
+                        Ok(Ok(permit)) => {
+                            self.metrics
+                                .inc_concurrency_acquire_total(&metrics_label, "ok");
+                            permit
+                        }
+                        Ok(Err(_)) => {
+                            self.metrics
+                                .inc_concurrency_acquire_total(&metrics_label, "closed");
+                            return Err(warp::reject::custom(ServiceUnavailable {
+                                msg: format!("Concurrency semaphore closed for model {}", model),
+                            }));
+                        }
+                        Err(_) => {
+                            self.metrics
+                                .inc_concurrency_acquire_total(&metrics_label, "timeout");
+                            let resp = warp::http::Response::builder()
+                                .status(warp::http::StatusCode::SERVICE_UNAVAILABLE)
+                                .header(
+                                    "Retry-After",
+                                    (self.concurrency_queue_timeout_ms / 1000)
+                                        .max(1)
+                                        .to_string(),
+                                )
+                                .body(warp::hyper::Body::from(format!(
+                                    "Model {} concurrency limit reached, queue timeout",
+                                    model
+                                )))
+                                .unwrap();
+                            return Ok(resp);
+                        }
+                    };
 
                 // 获取时记录当前并发（取走 permit 后）。
-                self.metrics.set_concurrency_current(&metrics_label, semaphore.available_permits() as i64);
+                self.metrics
+                    .set_concurrency_current(&metrics_label, semaphore.available_permits() as i64);
 
                 // guard 持有 permit 并在 drop 时刷新 gauge。流式成功 body 它被移入
                 // 响应流（`GuardedStream`），故仅当客户端排空完 body 时槽才归还信号
@@ -2309,12 +2331,7 @@ impl Proxy {
             let result = if timeout_secs == 0 {
                 attempt_fut.await
             } else {
-                match tokio::time::timeout(
-                    Duration::from_secs(timeout_secs),
-                    attempt_fut,
-                )
-                .await
-                {
+                match tokio::time::timeout(Duration::from_secs(timeout_secs), attempt_fut).await {
                     Ok(r) => r,
                     Err(_) => {
                         let k = key_guard.handle().key().await;
@@ -2411,7 +2428,8 @@ impl Proxy {
                         if let Some(next) = self.acquire_retry_key(&mut tried_key_hashes).await {
                             let will_retry_again = false; // 网络上限 = 1 → 无进一步重试
                             self.metrics.inc_retry_attempt_failure();
-                            self.metrics.inc_network_errors_total(self.metrics_model(&model), "connection");
+                            self.metrics
+                                .inc_network_errors_total(self.metrics_model(&model), "connection");
                             key_guard.release();
                             let got_backup = next.try_consume_token(self.token_wait_ms).await;
                             let got_token = got_backup;
@@ -2611,7 +2629,15 @@ impl Proxy {
             body_summary = %body_summary,
             "上游尝试开始"
         );
-        let req_builder = self.build_upstream_request(url, method, headers, request_body, &key_str, is_streaming, request_body_is_json);
+        let req_builder = self.build_upstream_request(
+            url,
+            method,
+            headers,
+            request_body,
+            &key_str,
+            is_streaming,
+            request_body_is_json,
+        );
         let resp = req_builder.send().await.map_err(AttemptError::Network)?;
 
         let status = resp.status();
@@ -2643,7 +2669,13 @@ impl Proxy {
         // 而不缓冲。
         if is_streaming && is_sse && status.is_success() {
             let resp = self
-                .handle_passthrough_stream(resp, resp_headers, status, client_req_id, concurrency_guard.take())
+                .handle_passthrough_stream(
+                    resp,
+                    resp_headers,
+                    status,
+                    client_req_id,
+                    concurrency_guard.take(),
+                )
                 .await
                 .map_err(AttemptError::Fatal)?;
             return Ok(AttemptResponse::Done(resp));
@@ -2669,16 +2701,28 @@ impl Proxy {
             // 在默认阈值下几乎不可达。对遗留路径（合成禁用）我们无法检视 body，因此
             // 如前那样早早标 good。
             let outcome = if self.synthesize_empty_choices {
-                self.handle_success_maybe_synthesize(resp, resp_headers, status, client_req_id, concurrency_guard)
-                    .await
+                self.handle_success_maybe_synthesize(
+                    resp,
+                    resp_headers,
+                    status,
+                    client_req_id,
+                    concurrency_guard,
+                )
+                .await
             } else {
                 // 合成禁用——空壳重试路径无法检视 body，故原样透传（遗留行为）；
                 // 此为真实成功。
                 self.key_pool.mark_good(&key_str).await;
                 self.metrics.inc_success();
-                self.handle_passthrough_stream(resp, resp_headers, status, client_req_id, concurrency_guard.take())
-                    .await
-                    .map(SuccessOutcome::Response)
+                self.handle_passthrough_stream(
+                    resp,
+                    resp_headers,
+                    status,
+                    client_req_id,
+                    concurrency_guard.take(),
+                )
+                .await
+                .map(SuccessOutcome::Response)
             }
             .map_err(AttemptError::Fatal)?;
             return Ok(match outcome {
@@ -2901,9 +2945,19 @@ impl Proxy {
             // 504（Gateway Timeout）或 503（Service Unavailable: Worker local
             // total request limit reached）——计入断路器（若配置则按模型）
             if self.circuit_breaker_threshold > 0 {
-                let cb_model = if self.circuit_breaker_per_model { model } else { "global" };
-                self.key_pool.increment_circuit_breaker(&key_str, cb_model, self.circuit_breaker_threshold).await;
-                if self.key_pool.check_circuit_breaker(&key_str, cb_model, self.circuit_breaker_threshold).await {
+                let cb_model = if self.circuit_breaker_per_model {
+                    model
+                } else {
+                    "global"
+                };
+                self.key_pool
+                    .increment_circuit_breaker(&key_str, cb_model, self.circuit_breaker_threshold)
+                    .await;
+                if self
+                    .key_pool
+                    .check_circuit_breaker(&key_str, cb_model, self.circuit_breaker_threshold)
+                    .await
+                {
                     warn!(
                         key = %mask_key(&key_str),
                         model = %model,
@@ -3015,46 +3069,48 @@ impl Proxy {
         Ok(AttemptResponse::Done(resp))
     }
 
-/// 处理透传流式：把上游 SSE / 字节流转发给客户端。每个 chunk 经过
-/// `coerce_sse_chunk`，后者把 `data:` 行里数值型 `error.code` 改写为字符串；非
-/// `data:` 字节与不含 `code` 字段的 chunk 原样转发。一个 `UsageTap` 包住流以计入
-/// token 用量，并在（成功路径流上）响应没有真实 `choices` 内容时记录一条空 choices
-/// 诊断。
-async fn handle_passthrough_stream(
-    &self,
-    resp: reqwest::Response,
-    resp_headers: Vec<(String, Vec<u8>)>,
-    status: warp::http::StatusCode,
-    client_req_id: &str,
-    concurrency_guard: Option<ConcurrencyGuard>,
-) -> Result<warp::http::Response<warp::hyper::Body>, Rejection> {
-    let upstream = resp.bytes_stream();
-    // 先把上游 reqwest 错误映射为 std::io::Error，再用 CoerceSseTap 包住：把跨
-    // chunk 边界拆分的 `data:` 行重拼后强转数值 `error.code` 为字符串（治愈原逐-chunk
-    // coerce_sse_chunk 的盲区）。再由下游 UsageTap 计 usage / 诊断。两层 tap 正交。
-    let upstream = upstream.map(|r| r.map_err(|e| {
-        warn!("透传流读取错误: {}", e);
-        std::io::Error::other(e.to_string())
-    }));
-    let forwarded: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> =
-        Box::pin(CoerceSseTap {
-            inner: upstream,
-            feed_buf: Vec::new(),
-            carry: String::new(),
+    /// 处理透传流式：把上游 SSE / 字节流转发给客户端。每个 chunk 经过
+    /// `coerce_sse_chunk`，后者把 `data:` 行里数值型 `error.code` 改写为字符串；非
+    /// `data:` 字节与不含 `code` 字段的 chunk 原样转发。一个 `UsageTap` 包住流以计入
+    /// token 用量，并在（成功路径流上）响应没有真实 `choices` 内容时记录一条空 choices
+    /// 诊断。
+    async fn handle_passthrough_stream(
+        &self,
+        resp: reqwest::Response,
+        resp_headers: Vec<(String, Vec<u8>)>,
+        status: warp::http::StatusCode,
+        client_req_id: &str,
+        concurrency_guard: Option<ConcurrencyGuard>,
+    ) -> Result<warp::http::Response<warp::hyper::Body>, Rejection> {
+        let upstream = resp.bytes_stream();
+        // 先把上游 reqwest 错误映射为 std::io::Error，再用 CoerceSseTap 包住：把跨
+        // chunk 边界拆分的 `data:` 行重拼后强转数值 `error.code` 为字符串（治愈原逐-chunk
+        // coerce_sse_chunk 的盲区）。再由下游 UsageTap 计 usage / 诊断。两层 tap 正交。
+        let upstream = upstream.map(|r| {
+            r.map_err(|e| {
+                warn!("透传流读取错误: {}", e);
+                std::io::Error::other(e.to_string())
+            })
         });
-    let tapped: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> =
-        Box::pin(UsageTap {
-            inner: forwarded,
-            metrics: self.metrics.clone(),
-            carry: String::new(),
-            feed_buf: Vec::new(),
-            usage: None,
-            saw_choices: false,
-            saw_empty_choices: false,
-            saw_any_json: false,
-            status: Some(status.as_u16()),
-            client_req_id: client_req_id.to_string(),
-        });
+        let forwarded: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> =
+            Box::pin(CoerceSseTap {
+                inner: upstream,
+                feed_buf: Vec::new(),
+                carry: String::new(),
+            });
+        let tapped: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> =
+            Box::pin(UsageTap {
+                inner: forwarded,
+                metrics: self.metrics.clone(),
+                carry: String::new(),
+                feed_buf: Vec::new(),
+                usage: None,
+                saw_choices: false,
+                saw_empty_choices: false,
+                saw_any_json: false,
+                status: Some(status.as_u16()),
+                client_req_id: client_req_id.to_string(),
+            });
 
         let mut response_builder = warp::http::Response::builder().status(status);
         apply_forwarded_response_headers(&mut response_builder, resp_headers);
@@ -3141,11 +3197,8 @@ async fn handle_passthrough_stream(
                         }
                         // 确认是 cc-switch 422 触发源（形态 (a)）。合成并交付一个正常
                         //（缓冲）JSON body——上游已结束，无更多流可转发。
-                        let resp = self.respond_synthesized_empty_choices(
-                            v,
-                            resp_headers,
-                            client_req_id,
-                        )?;
+                        let resp =
+                            self.respond_synthesized_empty_choices(v, resp_headers, client_req_id)?;
                         return Ok(SuccessOutcome::Response(resp));
                     }
                     // 非空 choices：普通完成。停止 peek，把已读前缀 + 剩余部分透传。
@@ -3174,10 +3227,12 @@ async fn handle_passthrough_stream(
         // 后，纯透传路径与 peek 落入路径的强转语义完全一致。
         let prefix = Bytes::from(buf);
         let req_id_owned = client_req_id.to_string();
-        let rest_mapped = upstream.map(move |r| r.map_err(|e| {
-            warn!(client_req_id = %req_id_owned, "透传流读取错误: {}", e);
-            std::io::Error::other(e.to_string())
-        }));
+        let rest_mapped = upstream.map(move |r| {
+            r.map_err(|e| {
+                warn!(client_req_id = %req_id_owned, "透传流读取错误: {}", e);
+                std::io::Error::other(e.to_string())
+            })
+        });
         let prefixed: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> = {
             let head = futures_util::stream::iter(vec![Ok(prefix)]);
             Box::pin(head.chain(rest_mapped))
@@ -3355,9 +3410,19 @@ async fn handle_passthrough_stream(
 
         // 跟踪空壳响应的断路器（若配置则按模型）
         if self.circuit_breaker_threshold > 0 {
-            let cb_model = if self.circuit_breaker_per_model { model } else { "global" };
-            self.key_pool.increment_circuit_breaker(key_str, cb_model, self.circuit_breaker_threshold).await;
-            if self.key_pool.check_circuit_breaker(key_str, cb_model, self.circuit_breaker_threshold).await {
+            let cb_model = if self.circuit_breaker_per_model {
+                model
+            } else {
+                "global"
+            };
+            self.key_pool
+                .increment_circuit_breaker(key_str, cb_model, self.circuit_breaker_threshold)
+                .await;
+            if self
+                .key_pool
+                .check_circuit_breaker(key_str, cb_model, self.circuit_breaker_threshold)
+                .await
+            {
                 warn!(
                     key = %mask_key(key_str),
                     model = %model,
@@ -3371,19 +3436,22 @@ async fn handle_passthrough_stream(
 
         // 空壳指标
         let outcome = if can_retry { "first_shell" } else { "502" };
-        self.metrics.inc_empty_shell_total(self.metrics_model(model), outcome);
+        self.metrics
+            .inc_empty_shell_total(self.metrics_model(model), outcome);
 
         if can_retry {
             // 重试之间指数退避
             if retry_attempt_already_done > 0 {
-                let backoff = self.empty_shell_retry_backoff_base_ms
+                let backoff = self
+                    .empty_shell_retry_backoff_base_ms
                     .saturating_mul(1u64 << retry_attempt_already_done.min(10))
                     .min(self.empty_shell_retry_backoff_max_ms);
                 tokio::time::sleep(Duration::from_millis(backoff)).await;
             }
 
             // 重试尝试指标
-            self.metrics.inc_empty_shell_retry_attempts_total(self.metrics_model(model));
+            self.metrics
+                .inc_empty_shell_retry_attempts_total(self.metrics_model(model));
 
             // 决定本次重试的 max_tokens。首次上游调用已应用预 clamp（见
             // `forward_upstream`），故当它仍空壳时每次重试都直降到已配置的
@@ -3419,8 +3487,7 @@ async fn handle_passthrough_stream(
                 );
                 self.metrics.inc_error();
                 return Err(AttemptError::Fatal(warp::reject::custom(BadGateway {
-                    msg: "Upstream empty-shell failure; key rate-limited, retry skipped"
-                        .into(),
+                    msg: "Upstream empty-shell failure; key rate-limited, retry skipped".into(),
                 })));
             }
             let rebuild = self.build_upstream_request(
@@ -3482,7 +3549,8 @@ async fn handle_passthrough_stream(
                                     .mark_good_for_empty_shell_retry(key_str, model)
                                     .await;
                                 // 记录空壳重试成功指标
-                                self.metrics.inc_empty_shell_total(self.metrics_model(model), "retry_ok");
+                                self.metrics
+                                    .inc_empty_shell_total(self.metrics_model(model), "retry_ok");
                                 AttemptResponse::Done(resp)
                             }
                             // 重试仍空壳——或许再重试、或许外抛 502。
@@ -3495,10 +3563,18 @@ async fn handle_passthrough_stream(
                                     && next_attempt + 1 < self.retry_config.max_retries
                                 {
                                     return Box::pin(self.handle_empty_shell_failure(
-                                        body, method, url, headers, &retry_body,
-                                        model, key_str, body_summary, client_req_id,
+                                        body,
+                                        method,
+                                        url,
+                                        headers,
+                                        &retry_body,
+                                        model,
+                                        key_str,
+                                        body_summary,
+                                        client_req_id,
                                         next_attempt,
-                                    )).await;
+                                    ))
+                                    .await;
                                 }
                                 // 最后一次重试仍空壳——以正确 outcome 外抛 502。
                                 write_empty_shell_failure_log(
@@ -3515,10 +3591,13 @@ async fn handle_passthrough_stream(
                                     None,
                                 );
                                 // 记录最终空壳指标
-                                self.metrics.inc_empty_shell_total(self.metrics_model(model), "retry_shell");
+                                self.metrics.inc_empty_shell_total(
+                                    self.metrics_model(model),
+                                    "retry_shell",
+                                );
                                 return Ok(AttemptResponse::Done(empty_shell_bad_gateway(
-                                    request_body,  // 用于 fingerprint 的原始请求 body
-                                    &body,         // 重试空壳 body
+                                    request_body, // 用于 fingerprint 的原始请求 body
+                                    &body,        // 重试空壳 body
                                     client_req_id,
                                     Some((
                                         self.empty_shell_retry_max_tokens,
@@ -3549,10 +3628,18 @@ async fn handle_passthrough_stream(
                         && next_attempt + 1 < self.retry_config.max_retries
                     {
                         return Box::pin(self.handle_empty_shell_failure(
-                            shell_body, method, url, headers, request_body,
-                            model, key_str, body_summary, client_req_id,
+                            shell_body,
+                            method,
+                            url,
+                            headers,
+                            request_body,
+                            model,
+                            key_str,
+                            body_summary,
+                            client_req_id,
                             next_attempt,
-                        )).await;
+                        ))
+                        .await;
                     }
                     // 最后一次重试或无更多预算：外抛 502。
                     return Ok(AttemptResponse::Done(empty_shell_bad_gateway(
@@ -3615,20 +3702,22 @@ async fn handle_passthrough_stream(
             // 其它任何情况都是 parser guard 的 bug，故安全失败到原始透传路径。
             _ => return self.handle_passthrough_empty_synthesize_fallback(),
         };
-        obj.insert("choices".to_string(), serde_json::json!([{
-            "index": 0,
-            "message": {
-                "role": "assistant",
-                "content": ""
-            },
-            "finish_reason": "stop"
-        }]));
-        let out = serde_json::to_vec(&serde_json::Value::Object(obj))
-            .unwrap_or_else(|_| b"{}".to_vec());
-
-        let mut response_builder = warp::http::Response::builder().status(
-            warp::http::StatusCode::OK,
+        obj.insert(
+            "choices".to_string(),
+            serde_json::json!([{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": ""
+                },
+                "finish_reason": "stop"
+            }]),
         );
+        let out =
+            serde_json::to_vec(&serde_json::Value::Object(obj)).unwrap_or_else(|_| b"{}".to_vec());
+
+        let mut response_builder =
+            warp::http::Response::builder().status(warp::http::StatusCode::OK);
         apply_forwarded_response_headers(&mut response_builder, resp_headers);
         // 丢弃上游 Content-Length / transfer-encoding，设我们自己的，使客户端确切知道
         // 合成 body 在何处结束。
@@ -3716,16 +3805,16 @@ mod proxy_integration_tests {
     use warp::{Filter, Rejection, Reply};
     use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
 
+    use crate::config::default_empty_shell_pre_clamp_max_tokens;
+    use crate::config::default_request_max_prompt_tokens;
     use crate::config::{
         AuthConfig, Config, CooldownConfig, HealthCheckConfig, ObservabilityConfig,
         RateLimiterConfig, RetryConfig,
     };
     use crate::key_pool::KeyPool;
     use crate::metrics::Metrics;
-    use crate::proxy::Proxy;
     use crate::proxy::InFlightGuard;
-use crate::config::default_empty_shell_pre_clamp_max_tokens;
-use crate::config::default_request_max_prompt_tokens;
+    use crate::proxy::Proxy;
 
     // 进程级 guard：置一次，使本模块无任何集成测试写入用于生产诊断的磁盘
     // failure.log。
@@ -3745,11 +3834,7 @@ use crate::config::default_request_max_prompt_tokens;
         // acquire 把 `in_flight` 提到 1（acquire_excluding 行里的 `inc_in_flight`）。
         let handle = pool.acquire().await.expect("active key must be available");
         let h_probe = handle.clone();
-        assert_eq!(
-            h_probe.in_flight(),
-            1,
-            "acquire must bump in_flight to 1"
-        );
+        assert_eq!(h_probe.in_flight(), 1, "acquire must bump in_flight to 1");
         // 把 acquire 到的 handle 包进 guard。不调 release() 直接 drop——
         // 模拟 client 取消时把 future 在 await 中途 drop。
         drop(InFlightGuard::new(handle));
@@ -3819,7 +3904,7 @@ use crate::config::default_request_max_prompt_tokens;
         let h2_probe = h2.clone();
         assert_eq!(h1_probe.in_flight(), 2, "two acquires → in_flight=2");
         let mut guard = InFlightGuard::new(h1); // guard 拥有第一个 inc
-        // swap：release 旧的（in_flight 2→1），adopt 新的（其 inc 已算过）
+                                                // swap：release 旧的（in_flight 2→1），adopt 新的（其 inc 已算过）
         guard.swap(h2);
         assert_eq!(
             h1_probe.in_flight(),
@@ -3886,11 +3971,11 @@ use crate::config::default_request_max_prompt_tokens;
             retry_on_empty_shell: true,
             empty_shell_retry_max_tokens: 8192,
             empty_shell_retry_attempts: 1,
-            empty_shell_probe_before_retry: false,  // Disable probe for tests
+            empty_shell_probe_before_retry: false, // Disable probe for tests
             circuit_breaker_threshold: 3,
             circuit_breaker_per_model: true,
             retry_on_503: true,
-            probe_before_503_retry: false,  // Disable probe for tests
+            probe_before_503_retry: false, // Disable probe for tests
             retry_on_500: true,
             empty_shell_retry_backoff_base_ms: 500,
             empty_shell_retry_backoff_max_ms: 5000,
@@ -4330,7 +4415,10 @@ use crate::config::default_request_max_prompt_tokens;
             "retry must be reported as not attempted, got: {body}"
         );
         assert!(
-            !body["error"]["detail"].as_str().unwrap_or_default().contains("max_tokens=8192"),
+            !body["error"]["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("max_tokens=8192"),
             "retry-clamp detail must be absent when retry is skipped, got: {body}"
         );
     }
@@ -4554,8 +4642,7 @@ use crate::config::default_request_max_prompt_tokens;
         );
         // …但 content 数组与客户端所发逐字节一致。
         assert_eq!(
-            fwd["messages"][0]["content"],
-            content_arr,
+            fwd["messages"][0]["content"], content_arr,
             "multimodal content array must be preserved verbatim through normalization, got: {fwd}"
         );
     }
@@ -4632,15 +4719,13 @@ use crate::config::default_request_max_prompt_tokens;
         let mock_server = MockServer::start().await;
         Mock::given(matchers::method("POST"))
             .and(matchers::path("/v1/chat/completions"))
-            .respond_with(
-                ResponseTemplate::new(503).set_body_json(serde_json::json!({
-                    "error": {
-                        "message": "ResourceExhausted: All workers are busy, please retry later",
-                        "type": "Service Unavailable",
-                        "code": 503
-                    }
-                })),
-            )
+            .respond_with(ResponseTemplate::new(503).set_body_json(serde_json::json!({
+                "error": {
+                    "message": "ResourceExhausted: All workers are busy, please retry later",
+                    "type": "Service Unavailable",
+                    "code": 503
+                }
+            })))
             .mount(&mock_server)
             .await;
 
@@ -4720,9 +4805,7 @@ use crate::config::default_request_max_prompt_tokens;
     #[test]
     fn coerce_sse_chunk_turns_numeric_code_into_string() {
         let sse_error = "data: {\"error\":{\"message\":\"x\",\"code\":400}}\n\n";
-        let coerced = super::coerce_sse_chunk(
-            &bytes::Bytes::from_static(sse_error.as_bytes()),
-        );
+        let coerced = super::coerce_sse_chunk(&bytes::Bytes::from_static(sse_error.as_bytes()));
         let coerced_str = std::str::from_utf8(&coerced).unwrap();
         assert!(
             coerced_str.contains("\"code\":\"400\""),
@@ -5047,7 +5130,11 @@ use crate::config::default_request_max_prompt_tokens;
             .await
             .unwrap();
 
-        assert_eq!(resp.status(), 200, "non-canonical reasoning_effort should be dropped, not 400");
+        assert_eq!(
+            resp.status(),
+            200,
+            "non-canonical reasoning_effort should be dropped, not 400"
+        );
     }
 
     /// 布尔 `reasoning_effort: true` 被改写成 "high" 后转发，而不是被拒。
@@ -5075,7 +5162,11 @@ use crate::config::default_request_max_prompt_tokens;
             .await
             .unwrap();
 
-        assert_eq!(resp.status(), 200, "reasoning_effort=true should be rewritten to 'high' and forwarded");
+        assert_eq!(
+            resp.status(),
+            200,
+            "reasoning_effort=true should be rewritten to 'high' and forwarded"
+        );
     }
 
     /// 合法的 `reasoning_effort` 值正常转发。
@@ -5136,14 +5227,22 @@ use crate::config::default_request_max_prompt_tokens;
             .await
             .unwrap();
 
-        assert_eq!(resp.status(), 200, "flat tool with null description should be coerced, not 400");
+        assert_eq!(
+            resp.status(),
+            200,
+            "flat tool with null description should be coerced, not 400"
+        );
 
         let requests = mock_server.received_requests().await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
         let desc = body["tools"][0]["description"]
             .as_str()
             .expect("flat description should be a string after coercion");
-        assert_eq!(desc, "", "null description should become empty string, got {:?}", body["tools"][0]["description"]);
+        assert_eq!(
+            desc, "",
+            "null description should become empty string, got {:?}",
+            body["tools"][0]["description"]
+        );
     }
 
     /// 嵌套的 OpenAI 规范形状 `{type:function, function:{...}}` 若缺失
@@ -5171,7 +5270,11 @@ use crate::config::default_request_max_prompt_tokens;
             .await
             .unwrap();
 
-        assert_eq!(resp.status(), 200, "nested tool with missing description should be backfilled, not 400");
+        assert_eq!(
+            resp.status(),
+            200,
+            "nested tool with missing description should be backfilled, not 400"
+        );
 
         let requests = mock_server.received_requests().await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
@@ -5212,7 +5315,10 @@ use crate::config::default_request_max_prompt_tokens;
         assert_eq!(resp.status(), 200);
         let requests = mock_server.received_requests().await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
-        assert_eq!(body["tools"][0]["function"]["description"].as_str(), Some("real desc"));
+        assert_eq!(
+            body["tools"][0]["function"]["description"].as_str(),
+            Some("real desc")
+        );
     }
 
     // ── 空 choices 合成（cc-switch 422 缓解，不改 cc-switch）────────────
@@ -5310,7 +5416,10 @@ use crate::config::default_request_max_prompt_tokens;
         );
         // clamp 发生了：重试请求 body 带了 `max_tokens=8192`。
         assert!(
-            body["error"]["detail"].as_str().unwrap_or_default().contains("max_tokens=8192"),
+            body["error"]["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("max_tokens=8192"),
             "detail should record the clamped retry budget, got: {body}"
         );
         // 结构化 retry 字段（新的诊断面）。
@@ -5329,9 +5438,7 @@ use crate::config::default_request_max_prompt_tokens;
         // 第一次上游调用在发出前先 clamp（glm-5.2 → 8192），所以指纹记录的是
         // 被 clamp 后的 8192，而非客户端原始的 64000——pre-clamp 的全部意义
         // 就是避免空壳发生；即便仍发生，重试也停在 8192。
-        let req_fp = body["error"]["request_fingerprint"]
-            .as_str()
-            .unwrap_or("");
+        let req_fp = body["error"]["request_fingerprint"].as_str().unwrap_or("");
         assert!(
             req_fp.contains("max_tokens=8192") && req_fp.contains("messages=0"),
             "request_fingerprint should capture the pre-clamped max_tokens + message count, got: {req_fp}"
@@ -5393,7 +5500,11 @@ use crate::config::default_request_max_prompt_tokens;
             .await
             .unwrap();
 
-        assert_eq!(resp.status(), 200, "the clamped retry should succeed as 200");
+        assert_eq!(
+            resp.status(),
+            200,
+            "the clamped retry should succeed as 200"
+        );
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(
             body["choices"][0]["message"]["content"].as_str(),
@@ -5434,7 +5545,10 @@ use crate::config::default_request_max_prompt_tokens;
         assert_eq!(resp.status(), 502);
         let body: serde_json::Value = resp.json().await.unwrap();
         assert!(
-            body["error"]["detail"].as_str().unwrap_or_default().contains("not retried"),
+            body["error"]["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("not retried"),
             "detail should say the shell was not retried, got: {body}"
         );
         assert_eq!(
@@ -5532,7 +5646,10 @@ use crate::config::default_request_max_prompt_tokens;
         assert_eq!(resp.status(), 200);
         let body: serde_json::Value = resp.json().await.unwrap();
         // 逐字节保真：choices/content 不变，无任何注入。
-        assert_eq!(body["choices"][0]["message"]["content"].as_str(), Some("hi"));
+        assert_eq!(
+            body["choices"][0]["message"]["content"].as_str(),
+            Some("hi")
+        );
         assert_eq!(body["id"].as_str(), Some("cc-7"));
         assert_eq!(body["usage"]["total_tokens"].as_u64(), Some(2));
     }
@@ -5569,7 +5686,10 @@ use crate::config::default_request_max_prompt_tokens;
         assert_eq!(resp.status(), 200);
         let body: serde_json::Value = resp.json().await.unwrap();
         // 不变：choices 仍为空——合成是关闭的。
-        assert!(body["choices"].as_array().map(|a| a.is_empty()).unwrap_or(false));
+        assert!(body["choices"]
+            .as_array()
+            .map(|a| a.is_empty())
+            .unwrap_or(false));
         assert_eq!(body["id"].as_str(), Some("cc-1"));
     }
 
@@ -5598,7 +5718,10 @@ use crate::config::default_request_max_prompt_tokens;
             .header("openai-organization", "attacker-org")
             .header("cookie", "session=attacker-session")
             .header("x-forwarded-for", "1.2.3.4")
-            .header("traceparent", "00-0af7651916cd43dd8448123456789abcdef-0123456789abcdef-01")
+            .header(
+                "traceparent",
+                "00-0af7651916cd43dd8448123456789abcdef-0123456789abcdef-01",
+            )
             .body(r#"{"model":"m","messages":[]}"#)
             .send()
             .await
@@ -5723,7 +5846,7 @@ mod usage_accounting_tests {
     #[test]
     fn estimate_prompt_tokens_input_audio_sized_and_capped() {
         let costs = EstPromptCosts::default_costs(); // 16 per KiB, cap 10000
-        // 8192 字符 ≈ 8 "KiB"（chars/1024=8）× 16 = 128 token——远低于封顶。
+                                                     // 8192 字符 ≈ 8 "KiB"（chars/1024=8）× 16 = 128 token——远低于封顶。
         let mid_b64 = "B".repeat(8192);
         let body = serde_json::json!({
             "messages": [{
@@ -5735,7 +5858,10 @@ mod usage_accounting_tests {
         });
         let bytes = bytes::Bytes::from(body.to_string());
         let est = estimate_prompt_tokens(&bytes, &costs).expect("valid body");
-        assert_eq!(est, 128, "8KiB base64 audio @ 16/KiB = 128 tokens, got {est}");
+        assert_eq!(
+            est, 128,
+            "8KiB base64 audio @ 16/KiB = 128 tokens, got {est}"
+        );
 
         // 1_000_000 字符 ≈ 976 "KiB" × 16 = 15616 → 封顶到 10000。
         let huge_b64 = "C".repeat(1_000_000);
@@ -5749,7 +5875,10 @@ mod usage_accounting_tests {
         });
         let bytes = bytes::Bytes::from(body.to_string());
         let est = estimate_prompt_tokens(&bytes, &costs).expect("valid body");
-        assert_eq!(est, costs.audio_token_cap, "huge audio clip must hit the cap, got {est}");
+        assert_eq!(
+            est, costs.audio_token_cap,
+            "huge audio clip must hit the cap, got {est}"
+        );
     }
 
     /// 未知 content-block 类型按其序列化长度计、并封顶于
@@ -5789,7 +5918,9 @@ mod usage_accounting_tests {
         );
         // 无 `data` 的 input_audio → 0 字符 → 0 token
         assert_eq!(
-            costs.part_cost(&serde_json::json!({"type":"input_audio","input_audio":{"format":"wav"}})),
+            costs.part_cost(
+                &serde_json::json!({"type":"input_audio","input_audio":{"format":"wav"}})
+            ),
             0
         );
         // 完全没有 `type` → unknown 路径，封顶（且绝不 panic）
@@ -5824,7 +5955,10 @@ mod usage_accounting_tests {
         assert!(fp.contains("image=1"), "missing image census in: {fp}");
         assert!(fp.contains("audio=1"), "missing audio census in: {fp}");
         // 无 base64 载荷泄漏
-        assert!(!fp.contains("QQQQQ"), "base64 payload must not leak into fp: {fp}");
+        assert!(
+            !fp.contains("QQQQQ"),
+            "base64 payload must not leak into fp: {fp}"
+        );
         // 仍带 role + 一段有封顶的文本片段
         assert!(fp.contains("role=user"), "missing role in: {fp}");
         // est_prompt_tokens 必须是多模态粗粒度估算：image 1500 +
@@ -5925,8 +6059,7 @@ mod usage_accounting_tests {
         // 我们在 0xC3 之后切，使下次 feed 的首字节（0xA9）补全 é。
         // 该 chunk 还带一行完整的首条 data: 行 + 一个未闭合的 JSON
         // 对象，其字符串值正好在被截断的 é 中段结束。
-        let mut full1: Vec<u8> =
-            b"data: {\"choices\":[{\"delta\":{\"content\":\"caf".to_vec();
+        let mut full1: Vec<u8> = b"data: {\"choices\":[{\"delta\":{\"content\":\"caf".to_vec();
         full1.push(0xC3);
         let mut chunk2: Vec<u8> = vec![0xA9];
         chunk2.extend_from_slice(b"\"}}]}\n\n");
@@ -5934,15 +6067,23 @@ mod usage_accounting_tests {
             b"data: {\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":1,\"total_tokens\":5}}\n\n",
         );
         tap.feed(&Bytes::from(full1.clone()));
-        assert!(tap.usage.is_none(), "first chunk is a partial line + partial UTF-8");
+        assert!(
+            tap.usage.is_none(),
+            "first chunk is a partial line + partial UTF-8"
+        );
         tap.feed(&Bytes::from(chunk2.clone()));
-        let u = tap.usage.expect("usage captured across multibyte UTF-8 split");
+        let u = tap
+            .usage
+            .expect("usage captured across multibyte UTF-8 split");
         assert_eq!(u.prompt, Some(4));
         assert_eq!(u.completion, Some(1));
         assert_eq!(u.total, Some(5));
         // 而那条跨越边界的非空 choices 行也必须被分类——否则
         // 空 choices 诊断会假命中。
-        assert!(tap.saw_choices, "choices event spanning UTF-8 split must be parsed");
+        assert!(
+            tap.saw_choices,
+            "choices event spanning UTF-8 split must be parsed"
+        );
     }
 
     // ── 空 choices 诊断：分类但不误判 ──
@@ -6040,7 +6181,10 @@ mod usage_accounting_tests {
             "object": "chat.completion", "service_tier": null,
             "system_fingerprint": null, "usage": null,
         });
-        assert!(is_empty_shell_failure(&shell), "real NVIDIA shell should classify");
+        assert!(
+            is_empty_shell_failure(&shell),
+            "real NVIDIA shell should classify"
+        );
 
         let legit = serde_json::json!({
             "choices": [], "id": "cc-1", "model": "z-ai/glm-5.2",
@@ -6066,7 +6210,10 @@ mod usage_accounting_tests {
         let weird = serde_json::json!({
             "choices": [], "id": "", "usage": {"prompt_tokens": 3},
         });
-        assert!(!is_empty_shell_failure(&weird), "non-null usage wins over empty id");
+        assert!(
+            !is_empty_shell_failure(&weird),
+            "non-null usage wins over empty id"
+        );
     }
 
     /// 请求指纹必须呈现会影响 NVIDIA 对 GLM 类模型软拒绝的那些字段：
@@ -6079,17 +6226,32 @@ mod usage_accounting_tests {
             r#"{"model":"z-ai/glm-5.2","max_tokens":64000,"stream":false,"temperature":0.3,"top_p":0.9,"reasoning_effort":"high","tools":[{"type":"function"}],"tool_choice":"auto","messages":[{"role":"system","content":"You are Claude Code."},{"role":"user","content":"summarize this long transcript"}]}"#,
         );
         let fp = request_body_fingerprint(&body);
-        assert!(fp.contains("max_tokens=64000"), "missing max_tokens in: {fp}");
+        assert!(
+            fp.contains("max_tokens=64000"),
+            "missing max_tokens in: {fp}"
+        );
         assert!(fp.contains("stream=false"), "missing stream in: {fp}");
         assert!(fp.contains("messages=2"), "missing message count in: {fp}");
-        assert!(fp.contains("temperature=0.3"), "missing temperature in: {fp}");
+        assert!(
+            fp.contains("temperature=0.3"),
+            "missing temperature in: {fp}"
+        );
         assert!(fp.contains("top_p=0.9"), "missing top_p in: {fp}");
-        assert!(fp.contains("reasoning_effort=\"high\""), "missing reasoning_effort in: {fp}");
+        assert!(
+            fp.contains("reasoning_effort=\"high\""),
+            "missing reasoning_effort in: {fp}"
+        );
         assert!(fp.contains("tools=1"), "missing tools count in: {fp}");
-        assert!(fp.contains("tool_choice=\"auto\""), "missing tool_choice in: {fp}");
+        assert!(
+            fp.contains("tool_choice=\"auto\""),
+            "missing tool_choice in: {fp}"
+        );
         // 粗估：两条短 message ≈ 一小撮 token，绝非巨大数字——
         // 健全性检查它在场且大致非零。
-        assert!(fp.contains("est_prompt_tokens="), "missing token estimate in: {fp}");
+        assert!(
+            fp.contains("est_prompt_tokens="),
+            "missing token estimate in: {fp}"
+        );
     }
 
     #[test]
@@ -6107,10 +6269,19 @@ mod usage_accounting_tests {
         });
         let s = super::body_summary(&Some(parsed.clone()));
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
-        assert_eq!(v["max_tokens"], 64000, "max_tokens must be real int, got: {v}");
-        assert_eq!(v["temperature"], 0.3, "temperature must be real float, got: {v}");
+        assert_eq!(
+            v["max_tokens"], 64000,
+            "max_tokens must be real int, got: {v}"
+        );
+        assert_eq!(
+            v["temperature"], 0.3,
+            "temperature must be real float, got: {v}"
+        );
         assert_eq!(v["top_p"], 0.9, "top_p must be real float, got: {v}");
-        assert_eq!(v["reasoning_effort"], "high", "reasoning_effort must be real string, got: {v}");
+        assert_eq!(
+            v["reasoning_effort"], "high",
+            "reasoning_effort must be real string, got: {v}"
+        );
         assert_eq!(v["model"], "z-ai/glm-5.2");
         assert_eq!(v["messages"], 1);
         assert_eq!(v["stream"], true);
@@ -6127,7 +6298,10 @@ mod usage_accounting_tests {
         });
         let s = super::body_summary(&Some(parsed));
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
-        assert_eq!(v["max_tokens"], "<present>", "non-scalar must mark presence, got: {v}");
+        assert_eq!(
+            v["max_tokens"], "<present>",
+            "non-scalar must mark presence, got: {v}"
+        );
     }
 
     #[test]
@@ -6135,7 +6309,10 @@ mod usage_accounting_tests {
         let parsed: serde_json::Value = serde_json::json!({"model": "m", "messages": []});
         let s = super::body_summary(&Some(parsed));
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
-        assert!(v.get("max_tokens").is_none(), "absent fields must not appear, got: {v}");
+        assert!(
+            v.get("max_tokens").is_none(),
+            "absent fields must not appear, got: {v}"
+        );
         assert!(v.get("temperature").is_none());
     }
 
@@ -6144,8 +6321,14 @@ mod usage_accounting_tests {
         let body = bytes::Bytes::from(r#"{"model":"m","messages":[]}"#);
         let fp = request_body_fingerprint(&body);
         assert!(fp.contains("messages=0"), "no messages should show 0: {fp}");
-        assert!(fp.contains("max_tokens=<absent>"), "absent max_tokens should be visible: {fp}");
-        assert!(fp.contains("stream=<absent>"), "absent stream should be visible: {fp}");
+        assert!(
+            fp.contains("max_tokens=<absent>"),
+            "absent max_tokens should be visible: {fp}"
+        );
+        assert!(
+            fp.contains("stream=<absent>"),
+            "absent stream should be visible: {fp}"
+        );
     }
 
     #[test]
@@ -6156,9 +6339,18 @@ mod usage_accounting_tests {
             "system_fingerprint": null, "usage": null,
         });
         let fp = shell_body_fingerprint(&shell);
-        assert!(fp.contains("id=\"\""), "id should be empty-string, got: {fp}");
-        assert!(fp.contains("model=\"\""), "model should be empty-string, got: {fp}");
-        assert!(fp.contains("choiceslen=0"), "choiceslen should be 0, got: {fp}");
+        assert!(
+            fp.contains("id=\"\""),
+            "id should be empty-string, got: {fp}"
+        );
+        assert!(
+            fp.contains("model=\"\""),
+            "model should be empty-string, got: {fp}"
+        );
+        assert!(
+            fp.contains("choiceslen=0"),
+            "choiceslen should be 0, got: {fp}"
+        );
         assert!(fp.contains("usage=null"), "usage should be null, got: {fp}");
         assert!(fp.contains("created=0"), "created should be 0, got: {fp}");
     }
@@ -6167,7 +6359,11 @@ mod usage_accounting_tests {
     #[test]
     fn parse_retry_after_integer() {
         assert_eq!(parse_retry_after("120"), Some(120));
-        assert_eq!(parse_retry_after("0"), Some(1), "0 应被 floor 到 1（上游给了头＝别立刻重打）");
+        assert_eq!(
+            parse_retry_after("0"),
+            Some(1),
+            "0 应被 floor 到 1（上游给了头＝别立刻重打）"
+        );
     }
 
     #[test]
@@ -6182,7 +6378,10 @@ mod usage_accounting_tests {
         let future = chrono::Utc::now() + chrono::Duration::seconds(120);
         let s = future.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
         let parsed = parse_retry_after(&s).expect("HTTP-date 必须被解析");
-        assert!((60..=240).contains(&parsed), "未来 120s 的 delta 应在 60..=240，实际 {parsed}");
+        assert!(
+            (60..=240).contains(&parsed),
+            "未来 120s 的 delta 应在 60..=240，实际 {parsed}"
+        );
     }
 
     #[test]
@@ -6198,6 +6397,10 @@ mod usage_accounting_tests {
         assert_eq!(parse_retry_after("not-a-date"), None);
         assert_eq!(parse_retry_after(""), None);
         assert_eq!(parse_retry_after("   "), None);
-        assert_eq!(parse_retry_after("-5"), None, "负数/小数负值不应被当合法 delta");
+        assert_eq!(
+            parse_retry_after("-5"),
+            None,
+            "负数/小数负值不应被当合法 delta"
+        );
     }
 }

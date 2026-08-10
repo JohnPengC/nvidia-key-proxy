@@ -162,7 +162,10 @@ impl KeyStateHandle {
     /// 增加某 model 的熔断失败计数。超过阈值时返回 true。
     pub async fn increment_circuit_breaker(&self, model: &str, threshold: u32) -> bool {
         let mut guard = self.inner.write().await;
-        let count = guard.circuit_breaker_failures.entry(model.to_string()).or_insert(0);
+        let count = guard
+            .circuit_breaker_failures
+            .entry(model.to_string())
+            .or_insert(0);
         *count += 1;
         *count >= threshold
     }
@@ -170,7 +173,10 @@ impl KeyStateHandle {
     /// 检查某 model 是否已超过熔断阈值。
     pub async fn check_circuit_breaker(&self, model: &str, threshold: u32) -> bool {
         let guard = self.inner.read().await;
-        guard.circuit_breaker_failures.get(model).is_some_and(|c| *c >= threshold)
+        guard
+            .circuit_breaker_failures
+            .get(model)
+            .is_some_and(|c| *c >= threshold)
     }
 
     /// 重置某 model 的熔断失败计数。
@@ -264,7 +270,11 @@ impl TokenBucket {
     fn store_approx(&self, v: f64) {
         // 夹到容量上限——refill 路径在锁内已夹过，但守住并发写下的数值边界，
         // 也避免 NaN 的 bits（NaN 在 load 端会还原成 NaN，破坏排序）。
-        let clamped = if v.is_finite() { v.min(self.capacity).max(0.0) } else { self.capacity };
+        let clamped = if v.is_finite() {
+            v.min(self.capacity).max(0.0)
+        } else {
+            self.capacity
+        };
         self.approx_tokens
             .store(clamped.to_bits(), std::sync::atomic::Ordering::Relaxed);
     }
@@ -273,7 +283,9 @@ impl TokenBucket {
     /// 热路径使用。值为"最近一次某条持有者观察桶时所留下的快照"，故可能略微
     /// 滞后于真实 refill 累积值，但恒在 `[0, capacity]`。详细说明见结构体注释。
     pub fn approx_available_tokens(&self) -> f64 {
-        let bits = self.approx_tokens.load(std::sync::atomic::Ordering::Relaxed);
+        let bits = self
+            .approx_tokens
+            .load(std::sync::atomic::Ordering::Relaxed);
         f64::from_bits(bits)
     }
 
@@ -525,10 +537,7 @@ impl KeyPool {
     /// key 在下一轮循环里可能被再次选中（`mark_failure` 只把它的权重减半，
     /// 而非归零），白白浪费一个槽位和一次令牌消费尝试。没有活跃且未被排除的
     /// key 时返回 `None`。
-    pub async fn acquire_excluding(
-        &self,
-        exclude_hashes: &[u64],
-    ) -> Option<KeyStateHandle> {
+    pub async fn acquire_excluding(&self, exclude_hashes: &[u64]) -> Option<KeyStateHandle> {
         let handles: Vec<KeyStateHandle> = {
             let read_guard = self.inner.read().await;
             read_guard.values().cloned().collect()
@@ -544,10 +553,9 @@ impl KeyPool {
         for handle in handles {
             // 跳过调用方显式排除的 key（本请求已试过）。identity 是共享的
             // `inner` Arc 指针，在句柄克隆之间保持稳定。
-            if !exclude_hashes.is_empty()
-                && exclude_hashes.contains(&handle.identity()) {
-                    continue;
-                }
+            if !exclude_hashes.is_empty() && exclude_hashes.contains(&handle.identity()) {
+                continue;
+            }
             let guard = handle.inner.read().await;
             let is_active = matches!(guard.state, KeyState::Active);
             if !is_active {
@@ -656,8 +664,9 @@ impl KeyPool {
         let Some(handle) = handle else { return false };
         // 单次写锁内完成 increment + halve-weight + 按 threshold 转 Disabled。
         let disable_after = Duration::from_secs(self.config.cooldown.max_seconds);
-        let (fail_count, already_disabled, disabled_now) =
-            handle.record_failure_and_maybe_disable(threshold, disable_after).await;
+        let (fail_count, already_disabled, disabled_now) = handle
+            .record_failure_and_maybe_disable(threshold, disable_after)
+            .await;
         if already_disabled {
             // 已禁用；无需再做什么（权重已是 1）。
             return true;
@@ -912,7 +921,12 @@ impl KeyPool {
 
     /// 增加某 key、某 model 的熔断失败计数（针对空壳/504 响应）。超过阈值
     /// 返回 true。
-    pub async fn increment_circuit_breaker(&self, key_str: &str, model: &str, threshold: u32) -> bool {
+    pub async fn increment_circuit_breaker(
+        &self,
+        key_str: &str,
+        model: &str,
+        threshold: u32,
+    ) -> bool {
         let read_guard = self.inner.read().await;
         if let Some(handle) = read_guard.get(key_str) {
             let handle = handle.clone();
@@ -1106,8 +1120,7 @@ impl KeyPool {
                 }
             }
             for (key_str, handle) in to_update {
-                let was_disabled =
-                    self.reactivate_after_cooldown(&handle).await;
+                let was_disabled = self.reactivate_after_cooldown(&handle).await;
                 if was_disabled {
                     info!(key = %mask_key(&key_str), "冷却到期重新激活被禁用的 key（探测可能正在失败）");
                 } else {
@@ -1158,9 +1171,8 @@ impl KeyPool {
 mod retry_state_machine_tests {
     use super::*;
     use crate::config::{
-        AuthConfig, CooldownConfig, HealthCheckConfig, ObservabilityConfig, RateLimiterConfig,
-        default_empty_shell_pre_clamp_max_tokens,
-        default_request_max_prompt_tokens,
+        default_empty_shell_pre_clamp_max_tokens, default_request_max_prompt_tokens, AuthConfig,
+        CooldownConfig, HealthCheckConfig, ObservabilityConfig, RateLimiterConfig,
     };
 
     fn build_pool(keys: &[&str]) -> KeyPool {
@@ -1350,12 +1362,12 @@ mod retry_state_machine_tests {
         handle.add_weight(7).await; // weight = 1 + 7 = 8
         assert_eq!(handle.weight().await, 8);
         pool.mark_transient_failure("k1").await;
+        assert_eq!(handle.weight().await, 4, "瞬态失败应把权重减半（8 → 4）");
         assert_eq!(
-            handle.weight().await,
-            4,
-            "瞬态失败应把权重减半（8 → 4）"
+            handle.state().await,
+            KeyState::Active,
+            "状态应保持 Active（不冷却）"
         );
-        assert_eq!(handle.state().await, KeyState::Active, "状态应保持 Active（不冷却）");
         assert_eq!(
             handle.fail_count().await,
             0,
@@ -1372,7 +1384,10 @@ mod retry_state_machine_tests {
         for _ in 0..40 {
             pool.mark_transient_failure("k1").await;
         }
-        assert!(matches!(handle.state().await, KeyState::Active), "反复瞬态失败不得置 Disabled");
+        assert!(
+            matches!(handle.state().await, KeyState::Active),
+            "反复瞬态失败不得置 Disabled"
+        );
         assert!(
             handle.weight().await >= 1,
             "权重不得下穿 1（保证单 key 池续试）"
@@ -1391,7 +1406,11 @@ mod retry_state_machine_tests {
         }
         let w_before = handle.weight().await;
         pool.mark_transient_failure("k1").await;
-        assert_eq!(handle.weight().await, w_before, "Disabled key 上调用瞬态失败为 no-op");
+        assert_eq!(
+            handle.weight().await,
+            w_before,
+            "Disabled key 上调用瞬态失败为 no-op"
+        );
         assert!(matches!(handle.state().await, KeyState::Disabled { .. }));
     }
 }
@@ -1424,9 +1443,8 @@ mod mask_key_tests {
 mod score_selection_tests {
     use super::*;
     use crate::config::{
-        AuthConfig, CooldownConfig, HealthCheckConfig, ObservabilityConfig, RateLimiterConfig,
-        default_empty_shell_pre_clamp_max_tokens,
-        default_request_max_prompt_tokens,
+        default_empty_shell_pre_clamp_max_tokens, default_request_max_prompt_tokens, AuthConfig,
+        CooldownConfig, HealthCheckConfig, ObservabilityConfig, RateLimiterConfig,
     };
 
     fn build_pool_with_keys(keys: &[&str], qps: f64, burst: u64) -> KeyPool {
@@ -1566,7 +1584,11 @@ mod score_selection_tests {
             let g = h_inner.inner.read().await;
             g.bucket.approx_available_tokens()
         };
-        assert!((approx0 - 10.0).abs() < 1e-9, "approx starts at capacity: {}", approx0);
+        assert!(
+            (approx0 - 10.0).abs() < 1e-9,
+            "approx starts at capacity: {}",
+            approx0
+        );
 
         // 消费两个令牌（try_consume_token 硬编码消费 1.0；循环两次）。
         assert!(handle.try_consume_token(0).await, "consume 1");
@@ -1578,7 +1600,8 @@ mod score_selection_tests {
         assert!(
             approx1 < approx0,
             "approx must strictly decrease after consumption: {} -> {}",
-            approx0, approx1
+            approx0,
+            approx1
         );
         // 近似值必须落在合理区间内：消费了 2 个令牌，桶 1/s 补充，耗时 < 0.1s 间
         // 不会补超过 0.1，所以近似应 < 9（充分宽松，只锁单调性 + 数量级）。
@@ -1707,8 +1730,10 @@ mod score_selection_tests {
         // 的扫描间隔。
         pool.mark_bad("k1", Some(0)).await;
         // 给该 key + model 放一些熔断失败（仿佛之前出现过空壳）。
-        pool.increment_circuit_breaker("k1", "z-ai/glm-5.2", 3).await;
-        pool.increment_circuit_breaker("k1", "z-ai/glm-5.2", 3).await;
+        pool.increment_circuit_breaker("k1", "z-ai/glm-5.2", 3)
+            .await;
+        pool.increment_circuit_breaker("k1", "z-ai/glm-5.2", 3)
+            .await;
         {
             let h = pool.inner.read().await.get("k1").cloned().unwrap();
             let g = h.inner.read().await;
@@ -1722,7 +1747,10 @@ mod score_selection_tests {
         // 显式驱动冷却到期的状态转换。
         let h = pool.inner.read().await.get("k1").cloned().unwrap();
         let was_disabled = pool.reactivate_after_cooldown(&h).await;
-        assert!(!was_disabled, "a Cooling key reactivates as not-was-disabled");
+        assert!(
+            !was_disabled,
+            "a Cooling key reactivates as not-was-disabled"
+        );
 
         let g = h.inner.read().await;
         assert!(matches!(g.state, KeyState::Active), "must be Active");
@@ -1741,18 +1769,26 @@ mod score_selection_tests {
     async fn mark_good_for_empty_shell_retry_clears_only_that_model_cb() {
         let pool = build_pool_with_keys(&["k1"], 100.0, 10);
         // 两个 model 各累两次 CB（达到默认阈值 3 的 2/3）。
-        pool.increment_circuit_breaker("k1", "z-ai/glm-5.2", 3).await;
-        pool.increment_circuit_breaker("k1", "z-ai/glm-5.2", 3).await;
-        pool.increment_circuit_breaker("k1", "meta/llama-3.1-405b", 3).await;
-        pool.increment_circuit_breaker("k1", "meta/llama-3.1-405b", 3).await;
+        pool.increment_circuit_breaker("k1", "z-ai/glm-5.2", 3)
+            .await;
+        pool.increment_circuit_breaker("k1", "z-ai/glm-5.2", 3)
+            .await;
+        pool.increment_circuit_breaker("k1", "meta/llama-3.1-405b", 3)
+            .await;
+        pool.increment_circuit_breaker("k1", "meta/llama-3.1-405b", 3)
+            .await;
         {
             let h = pool.inner.read().await.get("k1").cloned().unwrap();
             let g = h.inner.read().await;
             assert_eq!(g.circuit_breaker_failures.get("z-ai/glm-5.2"), Some(&2));
-            assert_eq!(g.circuit_breaker_failures.get("meta/llama-3.1-405b"), Some(&2));
+            assert_eq!(
+                g.circuit_breaker_failures.get("meta/llama-3.1-405b"),
+                Some(&2)
+            );
         }
         // 空壳重试成功——只清本 model（glm）。
-        pool.mark_good_for_empty_shell_retry("k1", "z-ai/glm-5.2").await;
+        pool.mark_good_for_empty_shell_retry("k1", "z-ai/glm-5.2")
+            .await;
         let h = pool.inner.read().await.get("k1").cloned().unwrap();
         let g = h.inner.read().await;
         assert!(
@@ -1799,7 +1835,10 @@ mod score_selection_tests {
         }
         // 现在 reactivate 不该把它置 Active——ready_at 还没到。
         let was_disabled = pool.reactivate_after_cooldown(&h).await;
-        assert!(!was_disabled, "must not report was_disabled for Cooling key");
+        assert!(
+            !was_disabled,
+            "must not report was_disabled for Cooling key"
+        );
         let g = h.inner.read().await;
         assert!(
             matches!(g.state, KeyState::Cooling { .. }),
@@ -1813,9 +1852,8 @@ mod score_selection_tests {
 mod runtime_key_tests {
     use super::*;
     use crate::config::{
-        AuthConfig, CooldownConfig, HealthCheckConfig, ObservabilityConfig, RateLimiterConfig,
-        default_empty_shell_pre_clamp_max_tokens,
-        default_request_max_prompt_tokens,
+        default_empty_shell_pre_clamp_max_tokens, default_request_max_prompt_tokens, AuthConfig,
+        CooldownConfig, HealthCheckConfig, ObservabilityConfig, RateLimiterConfig,
     };
 
     fn pool(keys: &[&str]) -> KeyPool {

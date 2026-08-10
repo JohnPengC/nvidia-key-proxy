@@ -1,26 +1,21 @@
 use std::sync::OnceLock;
 
-use prometheus::{register_counter, register_counter_vec, register_gauge, register_gauge_vec, register_histogram, Counter, CounterVec, Gauge, GaugeVec, Histogram};
+use prometheus::{
+    register_counter, register_counter_vec, register_gauge, register_gauge_vec, register_histogram,
+    Counter, CounterVec, Gauge, GaugeVec, Histogram,
+};
 
 fn request_count() -> &'static Counter {
     static REQUEST_COUNT: OnceLock<Counter> = OnceLock::new();
     REQUEST_COUNT.get_or_init(|| {
-        register_counter!(
-            "proxy_requests_total",
-            "处理过的 HTTP 请求总数"
-        )
-        .unwrap()
+        register_counter!("proxy_requests_total", "处理过的 HTTP 请求总数").unwrap()
     })
 }
 
 fn request_success() -> &'static Counter {
     static REQUEST_SUCCESS: OnceLock<Counter> = OnceLock::new();
     REQUEST_SUCCESS.get_or_init(|| {
-        register_counter!(
-            "proxy_requests_success_total",
-            "成功请求数（状态 2xx）"
-        )
-        .unwrap()
+        register_counter!("proxy_requests_success_total", "成功请求数（状态 2xx）").unwrap()
     })
 }
 
@@ -96,34 +91,21 @@ fn retry_attempt_failure() -> &'static Counter {
 fn key_active() -> &'static Gauge {
     static KEY_ACTIVE: OnceLock<Gauge> = OnceLock::new();
     KEY_ACTIVE.get_or_init(|| {
-        register_gauge!(
-            "proxy_key_active",
-            "当前处于 active 状态的 API key 数量"
-        )
-        .unwrap()
+        register_gauge!("proxy_key_active", "当前处于 active 状态的 API key 数量").unwrap()
     })
 }
 
 fn key_cooldown() -> &'static Gauge {
     static KEY_COOLDOWN: OnceLock<Gauge> = OnceLock::new();
     KEY_COOLDOWN.get_or_init(|| {
-        register_gauge!(
-            "proxy_key_cooldown",
-            "当前处于冷却中的 API key 数量"
-        )
-        .unwrap()
+        register_gauge!("proxy_key_cooldown", "当前处于冷却中的 API key 数量").unwrap()
     })
 }
 
 fn key_disabled() -> &'static Gauge {
     static KEY_DISABLED: OnceLock<Gauge> = OnceLock::new();
-    KEY_DISABLED.get_or_init(|| {
-        register_gauge!(
-            "proxy_key_disabled",
-            "当前被禁用的 API key 数量"
-        )
-        .unwrap()
-    })
+    KEY_DISABLED
+        .get_or_init(|| register_gauge!("proxy_key_disabled", "当前被禁用的 API key 数量").unwrap())
 }
 
 // ── token 饥饿切换与 403 即时冷却的新指标 ──
@@ -294,28 +276,40 @@ impl Metrics {
     }
 
     pub fn inc_empty_shell_total(&self, model: &str, outcome: &str) {
-        empty_shell_total().with_label_values(&[model, outcome]).inc();
+        empty_shell_total()
+            .with_label_values(&[model, outcome])
+            .inc();
     }
 
     /// 递增硬上限 413 拒绝计数。见 `prompt_rejected_total`。
     pub fn inc_prompt_rejected_total(&self, model: &str, outcome: &str) {
-        prompt_rejected_total().with_label_values(&[model, outcome]).inc();
+        prompt_rejected_total()
+            .with_label_values(&[model, outcome])
+            .inc();
     }
 
     pub fn inc_empty_shell_retry_attempts_total(&self, model: &str) {
-        empty_shell_retry_attempts_total().with_label_values(&[model]).inc();
+        empty_shell_retry_attempts_total()
+            .with_label_values(&[model])
+            .inc();
     }
 
     pub fn set_concurrency_current(&self, model: &str, current: i64) {
-        concurrency_current().with_label_values(&[model]).set(current as f64);
+        concurrency_current()
+            .with_label_values(&[model])
+            .set(current as f64);
     }
 
     pub fn inc_concurrency_acquire_total(&self, model: &str, result: &str) {
-        concurrency_acquire_total().with_label_values(&[model, result]).inc();
+        concurrency_acquire_total()
+            .with_label_values(&[model, result])
+            .inc();
     }
 
     pub fn inc_network_errors_total(&self, model: &str, error_type: &str) {
-        network_errors_total().with_label_values(&[model, error_type]).inc();
+        network_errors_total()
+            .with_label_values(&[model, error_type])
+            .inc();
     }
 
     /// 记录从上游响应抽出的 token 用量。每个请求调一次（非流式 body 读完后，

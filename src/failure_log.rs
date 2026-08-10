@@ -59,9 +59,7 @@ fn ensure_open() {
     // 写入 panic（这条路径本不该 panic，但 `writeln!`/`flush` 在 fd 损坏时
     // 确实可能 panic），我们仍希望失败日志通道继续写，而不是把之后每条
     // 失败记录都级联 panic 掉。
-    let mut guard = FAILURE_FILE
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let mut guard = FAILURE_FILE.lock().unwrap_or_else(|p| p.into_inner());
     if guard.is_none() {
         let path = log_path();
         match OpenOptions::new().create(true).append(true).open(&path) {
@@ -119,9 +117,7 @@ pub fn write_failure(
         return;
     }
     ensure_open();
-    let mut guard = FAILURE_FILE
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let mut guard = FAILURE_FILE.lock().unwrap_or_else(|p| p.into_inner());
     let rot = match guard.as_mut() {
         Some(r) => r,
         None => return,

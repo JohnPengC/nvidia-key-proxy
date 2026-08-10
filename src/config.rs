@@ -15,9 +15,7 @@ fn host_of_url(url: &str) -> Option<String> {
     let idx = url.find("://")?;
     let after = &url[idx + 3..];
     // authority 部分到第一个 '/'、'?' 或 '#' 为止。
-    let end = after
-        .find(['/', '?', '#'])
-        .unwrap_or(after.len());
+    let end = after.find(['/', '?', '#']).unwrap_or(after.len());
     let authority = &after[..end];
     // 若存在 `userinfo@` 则剥掉它。
     let authority = match authority.rfind('@') {
@@ -422,8 +420,7 @@ fn default_max_tokens_max() -> u64 {
 }
 
 /// 前门鉴权配置。理由见 `Config::auth`。
-#[derive(Debug, Deserialize, Clone)]
-#[derive(Default)]
+#[derive(Debug, Deserialize, Clone, Default)]
 pub struct AuthConfig {
     /// 要求客户端在代理转发其请求前完成鉴权。为 false 时，请求会被转发
     /// 且不校验 token。
@@ -440,7 +437,6 @@ pub struct AuthConfig {
     pub admin_token: String,
 }
 
-
 impl fmt::Debug for Config {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let masked_keys: Vec<String> = self.keys.iter().map(|k| mask_key(k)).collect();
@@ -456,7 +452,10 @@ impl fmt::Debug for Config {
             .field("health_check", &self.health_check)
             .field("observability", &self.observability)
             .field("request_timeout_seconds", &self.request_timeout_seconds)
-            .field("request_timeout_streaming_seconds", &self.request_timeout_streaming_seconds)
+            .field(
+                "request_timeout_streaming_seconds",
+                &self.request_timeout_streaming_seconds,
+            )
             .field("retry", &self.retry)
             .field("model_aliases", &self.model_aliases)
             .field("allow_local_base_url", &self.allow_local_base_url)
@@ -491,37 +490,37 @@ impl fmt::Debug for Config {
                 "empty_shell_no_retry_prompt_tokens",
                 &self.empty_shell_no_retry_prompt_tokens,
             )
-            .field(
-                "request_max_prompt_tokens",
-                &self.request_max_prompt_tokens,
-            )
-            .field(
-                "est_image_token_cost",
-                &self.est_image_token_cost,
-            )
-            .field(
-                "est_audio_token_per_kb",
-                &self.est_audio_token_per_kb,
-            )
+            .field("request_max_prompt_tokens", &self.request_max_prompt_tokens)
+            .field("est_image_token_cost", &self.est_image_token_cost)
+            .field("est_audio_token_per_kb", &self.est_audio_token_per_kb)
             .field("est_audio_token_cap", &self.est_audio_token_cap)
             .field(
                 "est_unknown_part_token_cap",
                 &self.est_unknown_part_token_cap,
             )
-            .field(
-                "circuit_breaker_threshold",
-                &self.circuit_breaker_threshold,
-            )
-            .field(
-                "circuit_breaker_per_model",
-                &self.circuit_breaker_per_model,
-            )
+            .field("circuit_breaker_threshold", &self.circuit_breaker_threshold)
+            .field("circuit_breaker_per_model", &self.circuit_breaker_per_model)
             .field("max_tokens_max", &self.max_tokens_max)
-            .field("concurrency_limit_per_model", &self.concurrency_limit_per_model)
-            .field("concurrency_queue_timeout_ms", &self.concurrency_queue_timeout_ms)
-            .field("request_timeout_streaming_seconds", &self.request_timeout_streaming_seconds)
-            .field("upstream_connect_timeout_secs", &self.upstream_connect_timeout_secs)
-            .field("upstream_pool_idle_timeout_secs", &self.upstream_pool_idle_timeout_secs)
+            .field(
+                "concurrency_limit_per_model",
+                &self.concurrency_limit_per_model,
+            )
+            .field(
+                "concurrency_queue_timeout_ms",
+                &self.concurrency_queue_timeout_ms,
+            )
+            .field(
+                "request_timeout_streaming_seconds",
+                &self.request_timeout_streaming_seconds,
+            )
+            .field(
+                "upstream_connect_timeout_secs",
+                &self.upstream_connect_timeout_secs,
+            )
+            .field(
+                "upstream_pool_idle_timeout_secs",
+                &self.upstream_pool_idle_timeout_secs,
+            )
             .field("retry_jitter_ms", &self.retry_jitter_ms)
             .field(
                 "auth",
@@ -840,7 +839,8 @@ impl Config {
             );
         }
         // 若配置了流式超时但过短，则告警
-        if self.request_timeout_streaming_seconds > 0 && self.request_timeout_streaming_seconds < 5 {
+        if self.request_timeout_streaming_seconds > 0 && self.request_timeout_streaming_seconds < 5
+        {
             warn!(
                 "request_timeout_streaming_seconds={} 过短；流式建议 60 秒以上",
                 self.request_timeout_streaming_seconds
@@ -898,7 +898,8 @@ impl Config {
         if self.cooldown.base_seconds == 0 {
             return Err(
                 "cooldown.base_seconds must be > 0 (0 makes mark_bad effect a no-op → \
-                 bad keys never really cool, retry loop burns the upstream).".into(),
+                 bad keys never really cool, retry loop burns the upstream)."
+                    .into(),
             );
         }
         // `max_seconds < base_seconds`：`mark_bad` 里有 `delay =
@@ -918,7 +919,8 @@ impl Config {
         if self.rate_limiter.burst == 0 && self.rate_limiter.qps_per_key > 0.0 {
             return Err(
                 "rate_limiter.burst must be > 0 when qps_per_key > 0 (burst=0 starves every \
-                 request; set qps_per_key=0 to actually disable rate limiting).".into(),
+                 request; set qps_per_key=0 to actually disable rate limiting)."
+                    .into(),
             );
         }
         // `qps_per_key` 必须 finite 且有限正数（或 0）。NaN/Inf 在 token 桶的浮点
@@ -988,7 +990,11 @@ impl Config {
     /// 与 `env_parse_into` 相同，但用于可 serde 反序列化的 override
     ///（两个 `*_per_model` JSON-map 字段）。解析错误的告警用 `Display`，
     /// 因为 serde_json 的错误在 Debug-friendly 上并不一致。
-    fn env_json_into<T: serde::de::DeserializeOwned>(key: &str, value: &str, target: &mut T) -> bool {
+    fn env_json_into<T: serde::de::DeserializeOwned>(
+        key: &str,
+        value: &str,
+        target: &mut T,
+    ) -> bool {
         match serde_json::from_str::<T>(value) {
             Ok(v) => {
                 *target = v;
@@ -1062,16 +1068,56 @@ impl Config {
                         .collect();
                     applied.push(key_lower.clone());
                 }
-                "rate_limiter_qps_per_key" => record!(Self::env_parse_into(key, &value, &mut config.rate_limiter.qps_per_key)),
-                "rate_limiter_burst" => record!(Self::env_parse_into(key, &value, &mut config.rate_limiter.burst)),
-                "rate_limiter_token_wait_ms" => record!(Self::env_parse_into(key, &value, &mut config.rate_limiter.token_wait_ms)),
-                "cooldown_base_seconds" => record!(Self::env_parse_into(key, &value, &mut config.cooldown.base_seconds)),
-                "cooldown_max_seconds" => record!(Self::env_parse_into(key, &value, &mut config.cooldown.max_seconds)),
-                "cooldown_scan_interval_seconds" => record!(Self::env_parse_into(key, &value, &mut config.cooldown.scan_interval_seconds)),
-                "health_check_interval_seconds" => record!(Self::env_parse_into(key, &value, &mut config.health_check.interval_seconds)),
-                "health_check_timeout_seconds" => record!(Self::env_parse_into(key, &value, &mut config.health_check.timeout_seconds)),
-                "health_check_max_consecutive_failures" => record!(Self::env_parse_into(key, &value, &mut config.health_check.max_consecutive_failures)),
-                "observability_enable_metrics" => record!(Self::env_parse_into(key, &value, &mut config.observability.enable_metrics)),
+                "rate_limiter_qps_per_key" => record!(Self::env_parse_into(
+                    key,
+                    &value,
+                    &mut config.rate_limiter.qps_per_key
+                )),
+                "rate_limiter_burst" => record!(Self::env_parse_into(
+                    key,
+                    &value,
+                    &mut config.rate_limiter.burst
+                )),
+                "rate_limiter_token_wait_ms" => record!(Self::env_parse_into(
+                    key,
+                    &value,
+                    &mut config.rate_limiter.token_wait_ms
+                )),
+                "cooldown_base_seconds" => record!(Self::env_parse_into(
+                    key,
+                    &value,
+                    &mut config.cooldown.base_seconds
+                )),
+                "cooldown_max_seconds" => record!(Self::env_parse_into(
+                    key,
+                    &value,
+                    &mut config.cooldown.max_seconds
+                )),
+                "cooldown_scan_interval_seconds" => record!(Self::env_parse_into(
+                    key,
+                    &value,
+                    &mut config.cooldown.scan_interval_seconds
+                )),
+                "health_check_interval_seconds" => record!(Self::env_parse_into(
+                    key,
+                    &value,
+                    &mut config.health_check.interval_seconds
+                )),
+                "health_check_timeout_seconds" => record!(Self::env_parse_into(
+                    key,
+                    &value,
+                    &mut config.health_check.timeout_seconds
+                )),
+                "health_check_max_consecutive_failures" => record!(Self::env_parse_into(
+                    key,
+                    &value,
+                    &mut config.health_check.max_consecutive_failures
+                )),
+                "observability_enable_metrics" => record!(Self::env_parse_into(
+                    key,
+                    &value,
+                    &mut config.observability.enable_metrics
+                )),
                 "observability_metrics_path" => {
                     config.observability.metrics_path = value;
                     applied.push(key_lower.clone());
@@ -1080,14 +1126,44 @@ impl Config {
                     config.observability.log_level = value;
                     applied.push(key_lower.clone());
                 }
-                "request_timeout_seconds" => record!(Self::env_parse_into(key, &value, &mut config.request_timeout_seconds)),
-                "retry_max_retries" => record!(Self::env_parse_into(key, &value, &mut config.retry.max_retries)),
-                "retry_backoff_base_ms" => record!(Self::env_parse_into(key, &value, &mut config.retry.backoff_base_ms)),
-                "retry_backoff_max_ms" => record!(Self::env_parse_into(key, &value, &mut config.retry.backoff_max_ms)),
-                "retry_auth_fail_threshold" => record!(Self::env_parse_into(key, &value, &mut config.retry.auth_fail_threshold)),
-                "retry_max_key_switches" => record!(Self::env_parse_into(key, &value, &mut config.retry.max_key_switches)),
-                "allow_local_base_url" => record!(Self::env_parse_into(key, &value, &mut config.allow_local_base_url)),
-                "auth_enabled" => record!(Self::env_parse_into(key, &value, &mut config.auth.enabled)),
+                "request_timeout_seconds" => record!(Self::env_parse_into(
+                    key,
+                    &value,
+                    &mut config.request_timeout_seconds
+                )),
+                "retry_max_retries" => record!(Self::env_parse_into(
+                    key,
+                    &value,
+                    &mut config.retry.max_retries
+                )),
+                "retry_backoff_base_ms" => record!(Self::env_parse_into(
+                    key,
+                    &value,
+                    &mut config.retry.backoff_base_ms
+                )),
+                "retry_backoff_max_ms" => record!(Self::env_parse_into(
+                    key,
+                    &value,
+                    &mut config.retry.backoff_max_ms
+                )),
+                "retry_auth_fail_threshold" => record!(Self::env_parse_into(
+                    key,
+                    &value,
+                    &mut config.retry.auth_fail_threshold
+                )),
+                "retry_max_key_switches" => record!(Self::env_parse_into(
+                    key,
+                    &value,
+                    &mut config.retry.max_key_switches
+                )),
+                "allow_local_base_url" => record!(Self::env_parse_into(
+                    key,
+                    &value,
+                    &mut config.allow_local_base_url
+                )),
+                "auth_enabled" => {
+                    record!(Self::env_parse_into(key, &value, &mut config.auth.enabled))
+                }
                 "auth_bearer_token" => {
                     config.auth.bearer_token = value;
                     applied.push(key_lower.clone());
@@ -1096,33 +1172,137 @@ impl Config {
                     config.auth.admin_token = value;
                     applied.push(key_lower.clone());
                 }
-                "inject_stream_usage" => record!(Self::env_parse_into(key, &value, &mut config.inject_stream_usage)),
-                "synthesize_empty_choices" => record!(Self::env_parse_into(key, &value, &mut config.synthesize_empty_choices)),
-                "retry_on_empty_shell" => record!(Self::env_parse_into(key, &value, &mut config.retry_on_empty_shell)),
-                "empty_shell_retry_max_tokens" => record!(Self::env_parse_into(key, &value, &mut config.empty_shell_retry_max_tokens)),
-                "empty_shell_retry_attempts" => record!(Self::env_parse_into(key, &value, &mut config.empty_shell_retry_attempts)),
-                "empty_shell_probe_before_retry" => record!(Self::env_parse_into(key, &value, &mut config.empty_shell_probe_before_retry)),
-                "circuit_breaker_threshold" => record!(Self::env_parse_into(key, &value, &mut config.circuit_breaker_threshold)),
-                "circuit_breaker_per_model" => record!(Self::env_parse_into(key, &value, &mut config.circuit_breaker_per_model)),
-                "empty_shell_retry_backoff_base_ms" => record!(Self::env_parse_into(key, &value, &mut config.empty_shell_retry_backoff_base_ms)),
-                "empty_shell_retry_backoff_max_ms" => record!(Self::env_parse_into(key, &value, &mut config.empty_shell_retry_backoff_max_ms)),
-                "empty_shell_pre_clamp_max_tokens" => record!(Self::env_json_into(key, &value, &mut config.empty_shell_pre_clamp_max_tokens)),
-                "empty_shell_no_retry_prompt_tokens" => record!(Self::env_parse_into(key, &value, &mut config.empty_shell_no_retry_prompt_tokens)),
-                "request_max_prompt_tokens" => record!(Self::env_parse_into(key, &value, &mut config.request_max_prompt_tokens)),
-                "est_image_token_cost" => record!(Self::env_parse_into(key, &value, &mut config.est_image_token_cost)),
-                "est_audio_token_per_kb" => record!(Self::env_parse_into(key, &value, &mut config.est_audio_token_per_kb)),
-                "est_audio_token_cap" => record!(Self::env_parse_into(key, &value, &mut config.est_audio_token_cap)),
-                "est_unknown_part_token_cap" => record!(Self::env_parse_into(key, &value, &mut config.est_unknown_part_token_cap)),
-                "max_tokens_max" => record!(Self::env_parse_into(key, &value, &mut config.max_tokens_max)),
-                "retry_on_503" => record!(Self::env_parse_into(key, &value, &mut config.retry_on_503)),
-                "probe_before_503_retry" => record!(Self::env_parse_into(key, &value, &mut config.probe_before_503_retry)),
-                "retry_on_500" => record!(Self::env_parse_into(key, &value, &mut config.retry_on_500)),
-                "request_timeout_streaming_seconds" => record!(Self::env_parse_into(key, &value, &mut config.request_timeout_streaming_seconds)),
-                "concurrency_limit_per_model" => record!(Self::env_json_into(key, &value, &mut config.concurrency_limit_per_model)),
-                "concurrency_queue_timeout_ms" => record!(Self::env_parse_into(key, &value, &mut config.concurrency_queue_timeout_ms)),
-                "upstream_connect_timeout_secs" => record!(Self::env_parse_into(key, &value, &mut config.upstream_connect_timeout_secs)),
-                "upstream_pool_idle_timeout_secs" => record!(Self::env_parse_into(key, &value, &mut config.upstream_pool_idle_timeout_secs)),
-                "retry_jitter_ms" => record!(Self::env_parse_into(key, &value, &mut config.retry_jitter_ms)),
+                "inject_stream_usage" => record!(Self::env_parse_into(
+                    key,
+                    &value,
+                    &mut config.inject_stream_usage
+                )),
+                "synthesize_empty_choices" => record!(Self::env_parse_into(
+                    key,
+                    &value,
+                    &mut config.synthesize_empty_choices
+                )),
+                "retry_on_empty_shell" => record!(Self::env_parse_into(
+                    key,
+                    &value,
+                    &mut config.retry_on_empty_shell
+                )),
+                "empty_shell_retry_max_tokens" => record!(Self::env_parse_into(
+                    key,
+                    &value,
+                    &mut config.empty_shell_retry_max_tokens
+                )),
+                "empty_shell_retry_attempts" => record!(Self::env_parse_into(
+                    key,
+                    &value,
+                    &mut config.empty_shell_retry_attempts
+                )),
+                "empty_shell_probe_before_retry" => record!(Self::env_parse_into(
+                    key,
+                    &value,
+                    &mut config.empty_shell_probe_before_retry
+                )),
+                "circuit_breaker_threshold" => record!(Self::env_parse_into(
+                    key,
+                    &value,
+                    &mut config.circuit_breaker_threshold
+                )),
+                "circuit_breaker_per_model" => record!(Self::env_parse_into(
+                    key,
+                    &value,
+                    &mut config.circuit_breaker_per_model
+                )),
+                "empty_shell_retry_backoff_base_ms" => record!(Self::env_parse_into(
+                    key,
+                    &value,
+                    &mut config.empty_shell_retry_backoff_base_ms
+                )),
+                "empty_shell_retry_backoff_max_ms" => record!(Self::env_parse_into(
+                    key,
+                    &value,
+                    &mut config.empty_shell_retry_backoff_max_ms
+                )),
+                "empty_shell_pre_clamp_max_tokens" => record!(Self::env_json_into(
+                    key,
+                    &value,
+                    &mut config.empty_shell_pre_clamp_max_tokens
+                )),
+                "empty_shell_no_retry_prompt_tokens" => record!(Self::env_parse_into(
+                    key,
+                    &value,
+                    &mut config.empty_shell_no_retry_prompt_tokens
+                )),
+                "request_max_prompt_tokens" => record!(Self::env_parse_into(
+                    key,
+                    &value,
+                    &mut config.request_max_prompt_tokens
+                )),
+                "est_image_token_cost" => record!(Self::env_parse_into(
+                    key,
+                    &value,
+                    &mut config.est_image_token_cost
+                )),
+                "est_audio_token_per_kb" => record!(Self::env_parse_into(
+                    key,
+                    &value,
+                    &mut config.est_audio_token_per_kb
+                )),
+                "est_audio_token_cap" => record!(Self::env_parse_into(
+                    key,
+                    &value,
+                    &mut config.est_audio_token_cap
+                )),
+                "est_unknown_part_token_cap" => record!(Self::env_parse_into(
+                    key,
+                    &value,
+                    &mut config.est_unknown_part_token_cap
+                )),
+                "max_tokens_max" => record!(Self::env_parse_into(
+                    key,
+                    &value,
+                    &mut config.max_tokens_max
+                )),
+                "retry_on_503" => {
+                    record!(Self::env_parse_into(key, &value, &mut config.retry_on_503))
+                }
+                "probe_before_503_retry" => record!(Self::env_parse_into(
+                    key,
+                    &value,
+                    &mut config.probe_before_503_retry
+                )),
+                "retry_on_500" => {
+                    record!(Self::env_parse_into(key, &value, &mut config.retry_on_500))
+                }
+                "request_timeout_streaming_seconds" => record!(Self::env_parse_into(
+                    key,
+                    &value,
+                    &mut config.request_timeout_streaming_seconds
+                )),
+                "concurrency_limit_per_model" => record!(Self::env_json_into(
+                    key,
+                    &value,
+                    &mut config.concurrency_limit_per_model
+                )),
+                "concurrency_queue_timeout_ms" => record!(Self::env_parse_into(
+                    key,
+                    &value,
+                    &mut config.concurrency_queue_timeout_ms
+                )),
+                "upstream_connect_timeout_secs" => record!(Self::env_parse_into(
+                    key,
+                    &value,
+                    &mut config.upstream_connect_timeout_secs
+                )),
+                "upstream_pool_idle_timeout_secs" => record!(Self::env_parse_into(
+                    key,
+                    &value,
+                    &mut config.upstream_pool_idle_timeout_secs
+                )),
+                "retry_jitter_ms" => record!(Self::env_parse_into(
+                    key,
+                    &value,
+                    &mut config.retry_jitter_ms
+                )),
                 _ => {}
             }
         }
@@ -1217,7 +1397,11 @@ mod config_validation_tests {
         cfg.base_url = "http://example.com".to_string();
         let err = cfg.validate().expect_err("should fail");
         let msg = err.to_string();
-        assert!(msg.contains("placeholder"), "error should mention placeholder: {}", msg);
+        assert!(
+            msg.contains("placeholder"),
+            "error should mention placeholder: {}",
+            msg
+        );
     }
 
     #[test]
@@ -1268,8 +1452,7 @@ mod config_validation_tests {
         // 两者相等（默认形态）—— validate 绝不能 err。
         let cfg = base_valid_config();
         assert_eq!(
-            cfg.request_max_prompt_tokens,
-            cfg.empty_shell_no_retry_prompt_tokens,
+            cfg.request_max_prompt_tokens, cfg.empty_shell_no_retry_prompt_tokens,
             "base fixture 应保持默认两者相等"
         );
         assert!(cfg.validate().is_ok());
@@ -1393,7 +1576,13 @@ mod config_validation_tests {
         assert_eq!(host_of_url("http://[::1]:8080/v1").as_deref(), Some("::1"));
         assert_eq!(host_of_url("http://[::1]/v1").as_deref(), Some("::1"));
         // 仍能剥 IPv4 + port。
-        assert_eq!(host_of_url("http://127.0.0.1:8080/v1").as_deref(), Some("127.0.0.1"));
-        assert_eq!(host_of_url("https://api.nvidia.com/v1").as_deref(), Some("api.nvidia.com"));
+        assert_eq!(
+            host_of_url("http://127.0.0.1:8080/v1").as_deref(),
+            Some("127.0.0.1")
+        );
+        assert_eq!(
+            host_of_url("https://api.nvidia.com/v1").as_deref(),
+            Some("api.nvidia.com")
+        );
     }
 }

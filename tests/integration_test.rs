@@ -26,7 +26,7 @@ fn test_config() -> Config {
         cooldown: CooldownConfig {
             base_seconds: 1,
             max_seconds: 10,
-                scan_interval_seconds: 5,
+            scan_interval_seconds: 5,
         },
         health_check: HealthCheckConfig {
             interval_seconds: 30,
@@ -171,7 +171,11 @@ async fn metrics_open_when_front_door_auth_disabled() {
     let cfg = test_config_with_auth(false, "secret-bearer", "");
     let state = AppState::new(cfg);
     let filter = build_routes(&state);
-    let resp = request().method("GET").path("/metrics").reply(&filter).await;
+    let resp = request()
+        .method("GET")
+        .path("/metrics")
+        .reply(&filter)
+        .await;
     assert_eq!(resp.status(), 200);
 }
 
@@ -183,7 +187,9 @@ async fn validate_rejects_auth_enabled_with_empty_bearer_token() {
     // 给一个看起来合法的 key，避免被前置的 fake/placeholder key 校验先行拒下，
     // 从而让本测试确实是在断言 *auth* 校验分支。
     cfg.keys = vec!["nvapi-validkey-1234".to_string()];
-    let err = cfg.validate().expect_err("空 bearer + auth.enabled 必须被校验拒绝");
+    let err = cfg
+        .validate()
+        .expect_err("空 bearer + auth.enabled 必须被校验拒绝");
     let msg = err.to_string();
     assert!(
         msg.contains("bearer_token"),
@@ -363,7 +369,6 @@ async fn admin_keys_add_rejects_oversized_body() {
         std::str::from_utf8(resp.body()).unwrap_or("")
     );
 }
-
 
 #[tokio::test]
 async fn front_door_auth_enforced() {

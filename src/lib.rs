@@ -24,10 +24,7 @@ use crate::proxy::Proxy;
 
 struct LocalTimer;
 impl tracing_subscriber::fmt::time::FormatTime for LocalTimer {
-    fn format_time(
-        &self,
-        w: &mut tracing_subscriber::fmt::format::Writer<'_>,
-    ) -> std::fmt::Result {
+    fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
         let now = Local::now();
         write!(w, "{}", now.format("%Y-%m-%d %H:%M:%S%.3f %:z"))
     }
@@ -62,7 +59,8 @@ impl AppState {
             "[config-load] request_timeout_seconds={}",
             config.request_timeout_seconds
         );
-        let config_path = std::env::var("NVIDIA_CONFIG_PATH").unwrap_or_else(|_| "config.toml".to_string());
+        let config_path =
+            std::env::var("NVIDIA_CONFIG_PATH").unwrap_or_else(|_| "config.toml".to_string());
         eprintln!("[config-load] config_path={}", config_path);
         if let Ok(content) = std::fs::read_to_string(&config_path) {
             eprintln!("[config-load] config_file_len={}", content.len());
@@ -71,14 +69,13 @@ impl AppState {
         }
 
         let metrics = Arc::new(Metrics::new());
-        let active_keys_cached = Arc::new(std::sync::atomic::AtomicI64::new(
-            config.keys.len() as i64,
-        ));
+        let active_keys_cached =
+            Arc::new(std::sync::atomic::AtomicI64::new(config.keys.len() as i64));
         let mut key_pool_unwrapped = KeyPool::new(&config, metrics.clone());
         // S6：挂 `/health` 活跃计数缓存（在包 Arc 之前 mutate，绕开 Arc 不可变借用）。
         key_pool_unwrapped.set_active_keys_cache(active_keys_cached.clone());
         let key_pool = Arc::new(key_pool_unwrapped);
-            let request_timeout = config.request_timeout_seconds;
+        let request_timeout = config.request_timeout_seconds;
         let request_timeout_streaming = config.request_timeout_streaming_seconds;
         let retry_config = config.retry.clone();
         let model_aliases = config.model_aliases.clone();
@@ -207,52 +204,53 @@ pub fn build_routes(
     let entry_log = warp::path::full()
         .and(warp::method())
         .and(warp::header::headers_cloned())
-        .map(|path: warp::path::FullPath, method: warp::http::Method, headers: warp::http::HeaderMap| {
-            let host = headers
-                .get("host")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("")
-                .to_string();
-            let ua = headers
-                .get("user-agent")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("")
-                .to_string();
-            tracing::debug!(
-                target: "proxy::entry",
-                method = %method,
-                path = %path.as_str(),
-                host = %host,
-                user_agent = %ua,
-                "收到请求"
-            );
-            
-        })
+        .map(
+            |path: warp::path::FullPath,
+             method: warp::http::Method,
+             headers: warp::http::HeaderMap| {
+                let host = headers
+                    .get("host")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                let ua = headers
+                    .get("user-agent")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                tracing::debug!(
+                    target: "proxy::entry",
+                    method = %method,
+                    path = %path.as_str(),
+                    host = %host,
+                    user_agent = %ua,
+                    "收到请求"
+                );
+            },
+        )
         .untuple_one();
 
     let health_ready = state.health_ready.clone();
     let active_keys_cached = state.active_keys_cached.clone();
-    let health_route = warp::path!("health")
-        .and(warp::get())
-        .map(move || {
-            // S5：启动健康检查（`HealthChecker::run_startup`）完成前回 503，使
-            // 负载均衡器/探针在此期间摘掉本实例，避免把流量打到尚未对池做完一次
-            // 初始清点的代理上。`run_startup` 在退出前把 `health_ready` 置 true。
-            //
-            // S6：启动就绪**之后**仍要反映池子活性——若所有 key 都漂到
-            // Cooling/Disabled（凭证轮换全失效、或冷却/禁用 bug 叠加），回 204
-            // 会让 LB 继续打流量、全 503。这里读一个由 `cool_down_task`/健康 task
-            // 周期刷新的 `AtomicI64` 缓存（同步读，无需 async——`count_states` 是
-            // async 不能在 `map` 里 await）。缓存至多落后一个扫描周期，对探针
-            // 频率而言可接受。始终豁免前门鉴权。
-            if !health_ready.load(std::sync::atomic::Ordering::Relaxed) {
-                return warp::http::Response::builder().status(503).body("");
-            }
-            if active_keys_cached.load(std::sync::atomic::Ordering::Relaxed) <= 0 {
-                return warp::http::Response::builder().status(503).body("");
-            }
-            warp::http::Response::builder().status(204).body("")
-        });
+    let health_route = warp::path!("health").and(warp::get()).map(move || {
+        // S5：启动健康检查（`HealthChecker::run_startup`）完成前回 503，使
+        // 负载均衡器/探针在此期间摘掉本实例，避免把流量打到尚未对池做完一次
+        // 初始清点的代理上。`run_startup` 在退出前把 `health_ready` 置 true。
+        //
+        // S6：启动就绪**之后**仍要反映池子活性——若所有 key 都漂到
+        // Cooling/Disabled（凭证轮换全失效、或冷却/禁用 bug 叠加），回 204
+        // 会让 LB 继续打流量、全 503。这里读一个由 `cool_down_task`/健康 task
+        // 周期刷新的 `AtomicI64` 缓存（同步读，无需 async——`count_states` 是
+        // async 不能在 `map` 里 await）。缓存至多落后一个扫描周期，对探针
+        // 频率而言可接受。始终豁免前门鉴权。
+        if !health_ready.load(std::sync::atomic::Ordering::Relaxed) {
+            return warp::http::Response::builder().status(503).body("");
+        }
+        if active_keys_cached.load(std::sync::atomic::Ordering::Relaxed) <= 0 {
+            return warp::http::Response::builder().status(503).body("");
+        }
+        warp::http::Response::builder().status(204).body("")
+    });
 
     let proxy_route = warp::path::full()
         .and_then(|p: warp::path::FullPath| {
@@ -285,7 +283,8 @@ pub fn build_routes(
                     // `Authorization: Bearer <bearer_token>`。
                     if auth_enabled {
                         match headers.get("authorization").and_then(|v| v.to_str().ok()) {
-                            Some(v) if constant_time_eq(v.as_bytes(), expected_bearer.as_bytes()) => {}
+                            Some(v)
+                                if constant_time_eq(v.as_bytes(), expected_bearer.as_bytes()) => {}
                             _ => {
                                 return Err::<_, Rejection>(warp::reject::custom(Unauthorized));
                             }
@@ -358,12 +357,7 @@ pub fn build_routes(
     let admin = admin_api(state.clone());
 
     entry_log
-        .and(
-            metrics_route
-                .or(health_route)
-                .or(admin)
-                .or(proxy_route),
-        )
+        .and(metrics_route.or(health_route).or(admin).or(proxy_route))
         .recover(handle_rejection)
 }
 
@@ -447,10 +441,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// 从请求头里校验管理 bearer token。`admin_token` 为空时整个管理面被藏
 /// 起来（404）、无法被探测；否则调用方必须提供
 /// `Authorization: Bearer <admin_token>`。
-fn check_admin_token(
-    admin_token: &str,
-    headers: &warp::http::HeaderMap,
-) -> Result<(), Rejection> {
+fn check_admin_token(admin_token: &str, headers: &warp::http::HeaderMap) -> Result<(), Rejection> {
     if admin_token.is_empty() {
         return Err(warp::reject::custom(AdminDisabled));
     }
@@ -535,8 +526,7 @@ fn admin_api(state: AppState) -> impl Filter<Extract = impl Reply, Error = Rejec
                 async move {
                     check_admin_token(&s.config.auth.admin_token, &headers)?;
                     let keys = extract_keys(&body);
-                    let (added, already_present, invalid) =
-                        s.key_pool.add_keys_batch(keys).await;
+                    let (added, already_present, invalid) = s.key_pool.add_keys_batch(keys).await;
                     Ok::<_, Rejection>(json_reply(
                         200,
                         &serde_json::json!({

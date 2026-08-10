@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 
 use tracing::{info, warn};
 
-use nvidia_key_proxy::{build_routes, AppState, Config, init_tracing};
+use nvidia_key_proxy::{build_routes, init_tracing, AppState, Config};
 
 /// 优雅关停的硬上限。`bind_with_graceful_shutdown` 会在收到信号后排空在途请求，
 /// 但**不设上限**——一个不配合的流式调用方（一直不读 body、TCP 半开）能让单个
