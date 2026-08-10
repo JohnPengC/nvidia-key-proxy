@@ -26,6 +26,7 @@ fn test_config() -> Config {
         cooldown: CooldownConfig {
             base_seconds: 1,
             max_seconds: 10,
+                scan_interval_seconds: 5,
         },
         health_check: HealthCheckConfig {
             interval_seconds: 30,
@@ -79,11 +80,31 @@ fn test_config_with_base(base_url: &str) -> Config {
 }
 
 #[tokio::test]
-async fn health_endpoint_returns_204() {
+async fn health_endpoint_returns_204_when_ready() {
     let state = AppState::new(test_config());
+    // S5：模拟启动健康检查已完成（`run_startup` 在退出前置此 flag）。
+    state
+        .health_ready
+        .store(true, std::sync::atomic::Ordering::Relaxed);
     let filter = build_routes(&state);
     let resp = request().method("GET").path("/health").reply(&filter).await;
     assert_eq!(resp.status(), 204);
+}
+
+#[tokio::test]
+async fn health_endpoint_returns_503_before_startup_check_completes() {
+    // S5：AppState 构造后 `health_ready` 默认 false —— `/health` 在 `run_startup`
+    // 跑完前回 503，让负载均衡器在初始清点期间摘掉本实例。
+    let state = AppState::new(test_config());
+    assert!(
+        !state
+            .health_ready
+            .load(std::sync::atomic::Ordering::Relaxed),
+        "ready flag must start false"
+    );
+    let filter = build_routes(&state);
+    let resp = request().method("GET").path("/health").reply(&filter).await;
+    assert_eq!(resp.status(), 503);
 }
 
 #[tokio::test]
@@ -207,7 +228,7 @@ async fn admin_keys_list_and_add_and_remove() {
         .await;
     assert_eq!(resp.status(), 200);
     let list: serde_json::Value = serde_json::from_slice(resp.body()).unwrap();
-    assert!(list.as_array().unwrap().len() >= 1);
+    assert!(!list.as_array().unwrap().is_empty());
 
     // 加一个新 key。
     let resp = request()

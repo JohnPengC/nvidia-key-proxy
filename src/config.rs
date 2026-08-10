@@ -16,7 +16,7 @@ fn host_of_url(url: &str) -> Option<String> {
     let after = &url[idx + 3..];
     // authority 部分到第一个 '/'、'?' 或 '#' 为止。
     let end = after
-        .find(|c| c == '/' || c == '?' || c == '#')
+        .find(['/', '?', '#'])
         .unwrap_or(after.len());
     let authority = &after[..end];
     // 若存在 `userinfo@` 则剥掉它。
@@ -420,6 +420,7 @@ fn default_max_tokens_max() -> u64 {
 
 /// 前门鉴权配置。理由见 `Config::auth`。
 #[derive(Debug, Deserialize, Clone)]
+#[derive(Default)]
 pub struct AuthConfig {
     /// 要求客户端在代理转发其请求前完成鉴权。为 false 时，请求会被转发
     /// 且不校验 token。
@@ -436,15 +437,6 @@ pub struct AuthConfig {
     pub admin_token: String,
 }
 
-impl Default for AuthConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            bearer_token: String::new(),
-            admin_token: String::new(),
-        }
-    }
-}
 
 impl fmt::Debug for Config {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -567,6 +559,21 @@ fn default_token_wait_ms() -> u64 {
 pub struct CooldownConfig {
     pub base_seconds: u64,
     pub max_seconds: u64,
+    /// `cool_down_task` 扫描"冷却是否已到期"的独立周期（秒）。
+    ///
+    /// 此前该任务复用 `health_check.interval_seconds`（默认 30s）作扫描周期，
+    /// 这在最坏情况下把一次冷却的恢复延迟整整一个扫描间隔——例如
+    /// `base_seconds=60` + 一次刚过 tick 的失败，要等到 *下一个* 30s tick 才
+    /// 期发现 `ready_at` 已过，恢复延迟 ≈ 90s。把冷却扫描周期从健康检查周期
+    /// 解耦，让冷却恢复延迟可控。0 = 回退到旧行为（用
+    /// `health_check.interval_seconds`）。默认 5。可通过
+    /// `NVIDIA_COOLDOWN_SCAN_INTERVAL_SECONDS` 覆盖。
+    #[serde(default = "default_cooldown_scan_interval_seconds")]
+    pub scan_interval_seconds: u64,
+}
+
+fn default_cooldown_scan_interval_seconds() -> u64 {
+    5
 }
 
 /// 代理 → NVIDIA 的重试/上游错误策略。
@@ -662,6 +669,7 @@ impl Config {
             cooldown: CooldownConfig {
                 base_seconds: 60,
                 max_seconds: 600,
+                scan_interval_seconds: default_cooldown_scan_interval_seconds(),
             },
             health_check: HealthCheckConfig {
                 interval_seconds: 30,
@@ -836,6 +844,24 @@ impl Config {
             );
         }
 
+        // 硬 prompt 软上限（`empty_shell_no_retry_prompt_tokens`，413 以下的软不重试
+        // 阈值）与硬上限（`request_max_prompt_tokens`，413 入口拒绝）必须**相等**——
+        // 两者之间任何灰带都会复活 forbidden 灰带（见
+        // `default_request_max_prompt_tokens` 文档里两轮实测：[90k,95k) 的灰带让 32/32
+        // /compact 空壳、客户端重试约 10 分钟）。这里只在"硬上限严格高于软不重试阈值"
+        // 时 warn——逆向默认就是两者相等。不阻断启动（运维可能在调试期主动留灰带）。
+        if self.request_max_prompt_tokens > 0
+            && self.empty_shell_no_retry_prompt_tokens > 0
+            && self.request_max_prompt_tokens > self.empty_shell_no_retry_prompt_tokens
+        {
+            warn!(
+                "request_max_prompt_tokens={} > empty_shell_no_retry_prompt_tokens={}；\
+                 硬上限高于软不重试阈值会在其间复活「打一发就过但注定空壳 + 误导 502」的灰带。\
+                 建议二者相等（默认都 90000）。",
+                self.request_max_prompt_tokens, self.empty_shell_no_retry_prompt_tokens
+            );
+        }
+
         info!("配置校验通过");
         Ok(())
     }
@@ -845,50 +871,88 @@ impl Config {
     /// 手误（如 `NVIDIA_REQUEST_MAX_PROMPT_TOKENS=90kk`）——否则
     /// override 会被忽略，默认/已配置值静默保留，此前这让该操作看起来像
     /// 一次没有任何诊断的无操作。
-    fn env_parse_into<T: std::str::FromStr>(key: &str, value: &str, target: &mut T)
+    ///
+    /// 返回 `true` = override 成功应用；`false` = 解析失败（已 warn）。调用方
+    ///（`apply_env_overrides`）用它收集"已生效 override"清单，在启动时 info 一行，
+    /// 让运维能确认一堆 `NVIDIA_*` 旋钮里到底哪些命中了——解析失败的那条已有 warn，
+    /// 但解析成功一直是静默的，此前 40+ 旋钮下难以确认 override 是否生效。
+    fn env_parse_into<T: std::str::FromStr>(key: &str, value: &str, target: &mut T) -> bool
     where
         <T as std::str::FromStr>::Err: std::fmt::Debug,
     {
         match value.parse::<T>() {
-            Ok(v) => *target = v,
-            Err(e) => warn!(
-                env = key,
-                raw = value,
-                error = ?e,
-                "忽略格式错误的 NVIDIA_* override；使用已配置/默认值",
-            ),
+            Ok(v) => {
+                *target = v;
+                true
+            }
+            Err(e) => {
+                warn!(
+                    env = key,
+                    raw = value,
+                    error = ?e,
+                    "忽略格式错误的 NVIDIA_* override；使用已配置/默认值",
+                );
+                false
+            }
         }
     }
 
     /// 与 `env_parse_into` 相同，但用于可 serde 反序列化的 override
     ///（两个 `*_per_model` JSON-map 字段）。解析错误的告警用 `Display`，
     /// 因为 serde_json 的错误在 Debug-friendly 上并不一致。
-    fn env_json_into<T: serde::de::DeserializeOwned>(key: &str, value: &str, target: &mut T) {
+    fn env_json_into<T: serde::de::DeserializeOwned>(key: &str, value: &str, target: &mut T) -> bool {
         match serde_json::from_str::<T>(value) {
-            Ok(v) => *target = v,
-            Err(e) => warn!(
-                env = key,
-                raw = value,
-                error = %e,
-                "忽略格式错误的 NVIDIA_* JSON override；使用已配置/默认值",
-            ),
+            Ok(v) => {
+                *target = v;
+                true
+            }
+            Err(e) => {
+                warn!(
+                    env = key,
+                    raw = value,
+                    error = %e,
+                    "忽略格式错误的 NVIDIA_* JSON override；使用已配置/默认值",
+                );
+                false
+            }
         }
     }
 
+    /// 应用所有 `NVIDIA_*` 环境变量 override，并在结束时输出一条 info，列出
+    /// **实际生效**的 override 名（不含 `NVIDIA_` 前缀的小写形）。注意：一个
+    /// `NVIDIA_*` 变量是否被认得取决于下面 match 中的分支；只被覆盖到目标字段、
+    /// 且解析成功，才算"命中"。不在其列的 `NVIDIA_*` 变量名（拼错、或本版本尚未
+    /// 接线的字段）不会被列入，也不 warn——它们仍是无操作，保留运维自行核对。
+    /// 单条解析失败已由上面的 helper warn；这里只汇总成功的那批。
     fn apply_env_overrides(config: &mut Config) {
+        // 已生效 override 名（小写、不含 `NVIDIA_` 前缀）。仅在解析/赋值成功后 push。
+        let mut applied: Vec<String> = Vec::new();
         for (key, value) in std::env::vars() {
             if !key.starts_with("NVIDIA_") {
                 continue;
             }
             let key = &key["NVIDIA_".len()..];
             let key_lower = key.to_ascii_lowercase();
+            // 用本地宏减少噪声：在解析型分支里写 `record!(Self::env_parse_into(...))`
+            // 就能"调用 + 命中即记"。字符串赋值型分支直接 `applied.push(key_lower.clone())`。
+            macro_rules! record {
+                ($ok:expr) => {{
+                    let ok = $ok;
+                    if ok {
+                        applied.push(key_lower.clone());
+                    }
+                }};
+            }
             match key_lower.as_str() {
                 "listen_addr" => {
                     // SocketAddr 不是直接存在结构体里（存的是 String），
                     // 所以先 parse 再 stringify；格式错误时告警，让
                     // NVIDIA_LISTEN_ADDR 里的手误足够显眼，而不是一次无操作。
                     match value.parse::<SocketAddr>() {
-                        Ok(addr) => config.listen_addr = addr.to_string(),
+                        Ok(addr) => {
+                            config.listen_addr = addr.to_string();
+                            applied.push(key_lower.clone());
+                        }
                         Err(e) => warn!(
                             env = key,
                             raw = value,
@@ -897,7 +961,10 @@ impl Config {
                         ),
                     }
                 }
-                "base_url" => config.base_url = value,
+                "base_url" => {
+                    config.base_url = value;
+                    applied.push(key_lower.clone());
+                }
                 // keys：逗号分隔的列表
                 "keys" => {
                     config.keys = value
@@ -905,65 +972,76 @@ impl Config {
                         .map(|s| s.trim().to_string())
                         .filter(|s| !s.is_empty())
                         .collect();
+                    applied.push(key_lower.clone());
                 }
-                "rate_limiter_qps_per_key" => Self::env_parse_into(&key, &value, &mut config.rate_limiter.qps_per_key),
-                "rate_limiter_burst" => Self::env_parse_into(&key, &value, &mut config.rate_limiter.burst),
-                "rate_limiter_token_wait_ms" => Self::env_parse_into(&key, &value, &mut config.rate_limiter.token_wait_ms),
-                "cooldown_base_seconds" => Self::env_parse_into(&key, &value, &mut config.cooldown.base_seconds),
-                "cooldown_max_seconds" => Self::env_parse_into(&key, &value, &mut config.cooldown.max_seconds),
-                "health_check_interval_seconds" => Self::env_parse_into(&key, &value, &mut config.health_check.interval_seconds),
-                "health_check_timeout_seconds" => Self::env_parse_into(&key, &value, &mut config.health_check.timeout_seconds),
-                "health_check_max_consecutive_failures" => Self::env_parse_into(&key, &value, &mut config.health_check.max_consecutive_failures),
-                "observability_enable_metrics" => Self::env_parse_into(&key, &value, &mut config.observability.enable_metrics),
+                "rate_limiter_qps_per_key" => record!(Self::env_parse_into(key, &value, &mut config.rate_limiter.qps_per_key)),
+                "rate_limiter_burst" => record!(Self::env_parse_into(key, &value, &mut config.rate_limiter.burst)),
+                "rate_limiter_token_wait_ms" => record!(Self::env_parse_into(key, &value, &mut config.rate_limiter.token_wait_ms)),
+                "cooldown_base_seconds" => record!(Self::env_parse_into(key, &value, &mut config.cooldown.base_seconds)),
+                "cooldown_max_seconds" => record!(Self::env_parse_into(key, &value, &mut config.cooldown.max_seconds)),
+                "cooldown_scan_interval_seconds" => record!(Self::env_parse_into(key, &value, &mut config.cooldown.scan_interval_seconds)),
+                "health_check_interval_seconds" => record!(Self::env_parse_into(key, &value, &mut config.health_check.interval_seconds)),
+                "health_check_timeout_seconds" => record!(Self::env_parse_into(key, &value, &mut config.health_check.timeout_seconds)),
+                "health_check_max_consecutive_failures" => record!(Self::env_parse_into(key, &value, &mut config.health_check.max_consecutive_failures)),
+                "observability_enable_metrics" => record!(Self::env_parse_into(key, &value, &mut config.observability.enable_metrics)),
                 "observability_metrics_path" => {
                     config.observability.metrics_path = value;
+                    applied.push(key_lower.clone());
                 }
                 "observability_log_level" => {
                     config.observability.log_level = value;
+                    applied.push(key_lower.clone());
                 }
-                "request_timeout_seconds" => Self::env_parse_into(&key, &value, &mut config.request_timeout_seconds),
-                "retry_max_retries" => Self::env_parse_into(&key, &value, &mut config.retry.max_retries),
-                "retry_backoff_base_ms" => Self::env_parse_into(&key, &value, &mut config.retry.backoff_base_ms),
-                "retry_backoff_max_ms" => Self::env_parse_into(&key, &value, &mut config.retry.backoff_max_ms),
-                "retry_auth_fail_threshold" => Self::env_parse_into(&key, &value, &mut config.retry.auth_fail_threshold),
-                "retry_max_key_switches" => Self::env_parse_into(&key, &value, &mut config.retry.max_key_switches),
-                "allow_local_base_url" => Self::env_parse_into(&key, &value, &mut config.allow_local_base_url),
-                "auth_enabled" => Self::env_parse_into(&key, &value, &mut config.auth.enabled),
+                "request_timeout_seconds" => record!(Self::env_parse_into(key, &value, &mut config.request_timeout_seconds)),
+                "retry_max_retries" => record!(Self::env_parse_into(key, &value, &mut config.retry.max_retries)),
+                "retry_backoff_base_ms" => record!(Self::env_parse_into(key, &value, &mut config.retry.backoff_base_ms)),
+                "retry_backoff_max_ms" => record!(Self::env_parse_into(key, &value, &mut config.retry.backoff_max_ms)),
+                "retry_auth_fail_threshold" => record!(Self::env_parse_into(key, &value, &mut config.retry.auth_fail_threshold)),
+                "retry_max_key_switches" => record!(Self::env_parse_into(key, &value, &mut config.retry.max_key_switches)),
+                "allow_local_base_url" => record!(Self::env_parse_into(key, &value, &mut config.allow_local_base_url)),
+                "auth_enabled" => record!(Self::env_parse_into(key, &value, &mut config.auth.enabled)),
                 "auth_bearer_token" => {
                     config.auth.bearer_token = value;
+                    applied.push(key_lower.clone());
                 }
                 "auth_admin_token" => {
                     config.auth.admin_token = value;
+                    applied.push(key_lower.clone());
                 }
-                "inject_stream_usage" => Self::env_parse_into(&key, &value, &mut config.inject_stream_usage),
-                "synthesize_empty_choices" => Self::env_parse_into(&key, &value, &mut config.synthesize_empty_choices),
-                "retry_on_empty_shell" => Self::env_parse_into(&key, &value, &mut config.retry_on_empty_shell),
-                "empty_shell_retry_max_tokens" => Self::env_parse_into(&key, &value, &mut config.empty_shell_retry_max_tokens),
-                "empty_shell_retry_attempts" => Self::env_parse_into(&key, &value, &mut config.empty_shell_retry_attempts),
-                "empty_shell_probe_before_retry" => Self::env_parse_into(&key, &value, &mut config.empty_shell_probe_before_retry),
-                "circuit_breaker_threshold" => Self::env_parse_into(&key, &value, &mut config.circuit_breaker_threshold),
-                "circuit_breaker_per_model" => Self::env_parse_into(&key, &value, &mut config.circuit_breaker_per_model),
-                "empty_shell_retry_backoff_base_ms" => Self::env_parse_into(&key, &value, &mut config.empty_shell_retry_backoff_base_ms),
-                "empty_shell_retry_backoff_max_ms" => Self::env_parse_into(&key, &value, &mut config.empty_shell_retry_backoff_max_ms),
-                "empty_shell_pre_clamp_max_tokens" => Self::env_json_into(&key, &value, &mut config.empty_shell_pre_clamp_max_tokens),
-                "empty_shell_no_retry_prompt_tokens" => Self::env_parse_into(&key, &value, &mut config.empty_shell_no_retry_prompt_tokens),
-                "request_max_prompt_tokens" => Self::env_parse_into(&key, &value, &mut config.request_max_prompt_tokens),
-                "est_image_token_cost" => Self::env_parse_into(&key, &value, &mut config.est_image_token_cost),
-                "est_audio_token_per_kb" => Self::env_parse_into(&key, &value, &mut config.est_audio_token_per_kb),
-                "est_audio_token_cap" => Self::env_parse_into(&key, &value, &mut config.est_audio_token_cap),
-                "est_unknown_part_token_cap" => Self::env_parse_into(&key, &value, &mut config.est_unknown_part_token_cap),
-                "max_tokens_max" => Self::env_parse_into(&key, &value, &mut config.max_tokens_max),
-                "retry_on_503" => Self::env_parse_into(&key, &value, &mut config.retry_on_503),
-                "probe_before_503_retry" => Self::env_parse_into(&key, &value, &mut config.probe_before_503_retry),
-                "retry_on_500" => Self::env_parse_into(&key, &value, &mut config.retry_on_500),
-                "request_timeout_streaming_seconds" => Self::env_parse_into(&key, &value, &mut config.request_timeout_streaming_seconds),
-                "concurrency_limit_per_model" => Self::env_json_into(&key, &value, &mut config.concurrency_limit_per_model),
-                "concurrency_queue_timeout_ms" => Self::env_parse_into(&key, &value, &mut config.concurrency_queue_timeout_ms),
-                "upstream_connect_timeout_secs" => Self::env_parse_into(&key, &value, &mut config.upstream_connect_timeout_secs),
-                "upstream_pool_idle_timeout_secs" => Self::env_parse_into(&key, &value, &mut config.upstream_pool_idle_timeout_secs),
-                "retry_jitter_ms" => Self::env_parse_into(&key, &value, &mut config.retry_jitter_ms),
+                "inject_stream_usage" => record!(Self::env_parse_into(key, &value, &mut config.inject_stream_usage)),
+                "synthesize_empty_choices" => record!(Self::env_parse_into(key, &value, &mut config.synthesize_empty_choices)),
+                "retry_on_empty_shell" => record!(Self::env_parse_into(key, &value, &mut config.retry_on_empty_shell)),
+                "empty_shell_retry_max_tokens" => record!(Self::env_parse_into(key, &value, &mut config.empty_shell_retry_max_tokens)),
+                "empty_shell_retry_attempts" => record!(Self::env_parse_into(key, &value, &mut config.empty_shell_retry_attempts)),
+                "empty_shell_probe_before_retry" => record!(Self::env_parse_into(key, &value, &mut config.empty_shell_probe_before_retry)),
+                "circuit_breaker_threshold" => record!(Self::env_parse_into(key, &value, &mut config.circuit_breaker_threshold)),
+                "circuit_breaker_per_model" => record!(Self::env_parse_into(key, &value, &mut config.circuit_breaker_per_model)),
+                "empty_shell_retry_backoff_base_ms" => record!(Self::env_parse_into(key, &value, &mut config.empty_shell_retry_backoff_base_ms)),
+                "empty_shell_retry_backoff_max_ms" => record!(Self::env_parse_into(key, &value, &mut config.empty_shell_retry_backoff_max_ms)),
+                "empty_shell_pre_clamp_max_tokens" => record!(Self::env_json_into(key, &value, &mut config.empty_shell_pre_clamp_max_tokens)),
+                "empty_shell_no_retry_prompt_tokens" => record!(Self::env_parse_into(key, &value, &mut config.empty_shell_no_retry_prompt_tokens)),
+                "request_max_prompt_tokens" => record!(Self::env_parse_into(key, &value, &mut config.request_max_prompt_tokens)),
+                "est_image_token_cost" => record!(Self::env_parse_into(key, &value, &mut config.est_image_token_cost)),
+                "est_audio_token_per_kb" => record!(Self::env_parse_into(key, &value, &mut config.est_audio_token_per_kb)),
+                "est_audio_token_cap" => record!(Self::env_parse_into(key, &value, &mut config.est_audio_token_cap)),
+                "est_unknown_part_token_cap" => record!(Self::env_parse_into(key, &value, &mut config.est_unknown_part_token_cap)),
+                "max_tokens_max" => record!(Self::env_parse_into(key, &value, &mut config.max_tokens_max)),
+                "retry_on_503" => record!(Self::env_parse_into(key, &value, &mut config.retry_on_503)),
+                "probe_before_503_retry" => record!(Self::env_parse_into(key, &value, &mut config.probe_before_503_retry)),
+                "retry_on_500" => record!(Self::env_parse_into(key, &value, &mut config.retry_on_500)),
+                "request_timeout_streaming_seconds" => record!(Self::env_parse_into(key, &value, &mut config.request_timeout_streaming_seconds)),
+                "concurrency_limit_per_model" => record!(Self::env_json_into(key, &value, &mut config.concurrency_limit_per_model)),
+                "concurrency_queue_timeout_ms" => record!(Self::env_parse_into(key, &value, &mut config.concurrency_queue_timeout_ms)),
+                "upstream_connect_timeout_secs" => record!(Self::env_parse_into(key, &value, &mut config.upstream_connect_timeout_secs)),
+                "upstream_pool_idle_timeout_secs" => record!(Self::env_parse_into(key, &value, &mut config.upstream_pool_idle_timeout_secs)),
+                "retry_jitter_ms" => record!(Self::env_parse_into(key, &value, &mut config.retry_jitter_ms)),
                 _ => {}
             }
+        }
+        if !applied.is_empty() {
+            // 稳定排序，使同一环境在不同次启动里输出一致、便于 diff 日志。
+            applied.sort();
+            info!(applied = ?applied, "已生效的 NVIDIA_* env override");
         }
     }
 }
@@ -985,6 +1063,7 @@ mod config_validation_tests {
             cooldown: CooldownConfig {
                 base_seconds: 60,
                 max_seconds: 600,
+                scan_interval_seconds: 5,
             },
             health_check: HealthCheckConfig {
                 interval_seconds: 30,
@@ -1094,5 +1173,50 @@ mod config_validation_tests {
         let mut cfg = base_valid_config();
         cfg.keys = vec![];
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn equal_prompt_ceilings_passes_silently() {
+        // 两者相等（默认形态）—— validate 绝不能 err。
+        let cfg = base_valid_config();
+        assert_eq!(
+            cfg.request_max_prompt_tokens,
+            cfg.empty_shell_no_retry_prompt_tokens,
+            "base fixture 应保持默认两者相等"
+        );
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn hard_ceiling_above_soft_no_retry_warns_but_passes() {
+        // 硬上限严格高于软不重试阈值——复活灰带。validate 不阻断（只 warn），
+        // 但仍要 ok（运维可能在调试期主动留灰带）。
+        let mut cfg = base_valid_config();
+        cfg.request_max_prompt_tokens = 100_000;
+        cfg.empty_shell_no_retry_prompt_tokens = 90_000;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn soft_below_hard_when_equal_is_fine() {
+        // 软 == 硬，或硬低于软都不触发告警分支（本测试只覆盖等号路径）。
+        let mut cfg = base_valid_config();
+        cfg.request_max_prompt_tokens = 90_000;
+        cfg.empty_shell_no_retry_prompt_tokens = 90_000;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn disabled_ceilings_skip_gray_zone_check() {
+        // 任一为 0（关闭）时跳过该告警分支，validate 仍 ok。
+        let mut cfg = base_valid_config();
+        cfg.request_max_prompt_tokens = 0;
+        cfg.empty_shell_no_retry_prompt_tokens = 90_000;
+        assert!(cfg.validate().is_ok());
+
+        let mut cfg = base_valid_config();
+        cfg.request_max_prompt_tokens = 100_000;
+        cfg.empty_shell_no_retry_prompt_tokens = 0;
+        assert!(cfg.validate().is_ok());
     }
 }

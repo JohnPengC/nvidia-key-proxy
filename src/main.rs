@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 
 use tracing::info;
 
-use nvidia_key_proxy::{build_routes, AppState, Config};
+use nvidia_key_proxy::{build_routes, AppState, Config, init_tracing};
 
 #[tokio::main]
 async fn main() {
@@ -19,7 +19,12 @@ async fn main() {
         std::process::exit(1);
     });
 
-    // 构建共享应用状态——同时初始化 tracing。
+    // 异步 tracing：guard 绑在 main 栈上活到函数末——`async fn main` return 时
+    // guard drop、后台 worker 排空尾部事件再退，不丢尾部日志。必须排在
+    // `AppState::new`（发出第一条 `info!("已加载配置")`）之前。
+    let _log_guard = init_tracing(&config);
+
+    // 构建共享应用状态（不再自调 init_tracing）。
     let state = AppState::new(config);
     // 让指标反映 key pool 的初始状态。
     state.key_pool.refresh_metrics().await;

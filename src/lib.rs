@@ -43,12 +43,15 @@ pub struct AppState {
     pub health_checker: Arc<HealthChecker>,
     pub stop_signal: Arc<tokio::sync::Notify>,
     pub config: Config,
+    /// 启动健康检查完成标志；`/health` 在其为 false 时回 503。
+    pub health_ready: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AppState {
     pub fn new(config: Config) -> Self {
-        // tracing 必须在任何日志发出前初始化。
-        init_tracing(&config);
+        // tracing 由调用方（`main` / 测试入口）先于本函数调 `init_tracing` 完成；
+        // 这里不再自调，避免在每个 `AppState::new`（main 一次、集成测试 N 次）里
+        // 重试装 subscriber 并误关 log channel guard。详见 `init_tracing` 文档。
         tracing::info!("已加载配置：{:?}", config);
         eprintln!(
             "[config-load] request_timeout_seconds={}",
@@ -63,9 +66,7 @@ impl AppState {
         }
 
         let metrics = Arc::new(Metrics::new());
-        let key_pool = Arc::new(KeyPool::new(&config, metrics.clone()));
-
-        let request_timeout = config.request_timeout_seconds;
+        let key_pool = Arc::new(KeyPool::new(&config, metrics.clone()));        let request_timeout = config.request_timeout_seconds;
         let request_timeout_streaming = config.request_timeout_streaming_seconds;
         let retry_config = config.retry.clone();
         let model_aliases = config.model_aliases.clone();
@@ -107,12 +108,14 @@ impl AppState {
             config.upstream_pool_idle_timeout_secs,
             config.retry_jitter_ms,
         );
+        let health_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let health_checker = Arc::new(HealthChecker::new(
             key_pool.clone(),
             config.base_url.clone(),
             config.health_check.interval_seconds,
             config.health_check.timeout_seconds,
             config.health_check.max_consecutive_failures,
+            health_ready.clone(),
         ));
         let stop_signal = Arc::new(tokio::sync::Notify::new());
 
@@ -123,23 +126,51 @@ impl AppState {
             health_checker,
             stop_signal,
             config,
+            health_ready,
         }
     }
 }
 
 /// 基于环境变量**和**配置文件初始化 tracing。
 ///
-/// 幂等：一旦装好全局默认 subscriber，后续调用（例如测试里建多个
-/// `AppState` 时）静默忽略。
-pub fn init_tracing(config: &Config) {
+/// **异步输出**：subscriber 写到 `tracing_appender::non_blocking` 包装的
+/// stdout，日志的格式化与 `write` syscall 由一个专用后台 worker 挪走，业务
+/// 协程只 `try_send` 到 channel 即返回——不再因 stdout 被慢消费方（`docker logs`
+/// 抓取慢、journald 限速、管道拥塞）占用而把 IO 抖动落在请求路径上。
+///
+/// 返回 `Some(WorkerGuard)` 当且仅这一次真的把 subscriber 装上了（首次调用）。
+/// Guard drop 时把 channel 残留事件排空后关 worker——这是不可丢尾部日志的关
+/// 键：**调用方必须把返回的 guard 持到进程退出之前**。`main` 把它绑在栈上，
+/// `async fn main` return 时栈解、guard drop、worker flush 完最后几行再退。
+///
+/// **不要**把 guard 放进进程级 `static`：Rust 进程正常退出时不 drop static
+///（不像 C++ thread-local atexit 那种确定性析构），尾部日志会被吞。guard 必须
+/// 是有**确定生命周期**的栈变量。`try_init` 在 subscriber 已存在时返回 Err，
+/// 本函数返回 None——第二次调用者拿不到 guard（subscriber 只装一次）。集成测
+/// 试不调用 `init_tracing`：它们没有 tracing subscriber，宏变 no-op，测试不读
+/// stdout，但也不会因 guard 生命周期问题丢东西。
+pub fn init_tracing(config: &Config) -> Option<tracing_appender::non_blocking::WorkerGuard> {
     let filter = EnvFilter::try_from_default_env()
         .or_else(|_| EnvFilter::try_new(&config.observability.log_level))
         .unwrap_or_else(|_| EnvFilter::new("info"));
-    // `try_init` 在全局默认 subscriber 已存在时返回 Err；那种情况无事可做。
-    let _ = tracing_subscriber::fmt()
+    // non_blocking(stdout)：写挪到后台线程，业务协程非阻塞。无界 channel——
+    // info 级日志量远未到压垮内存，无界保证不丢日志，符合"日志不能丢"的运维
+    // 预期；debug 级 verbose 通常临时排障、不是常驻，无需为它上背压。
+    let (nb, guard) = tracing_appender::non_blocking(std::io::stdout());
+    let installed = tracing_subscriber::fmt()
         .with_timer(LocalTimer)
+        .with_writer(nb)
         .with_env_filter(filter)
-        .try_init();
+        .try_init()
+        .is_ok();
+    if installed {
+        Some(guard)
+    } else {
+        // subscriber 已存在：drop guard 让这个 channel flush 后关，避免泄漏。
+        // 调用方拿到 None，不持这个 guard。
+        drop(guard);
+        None
+    }
 }
 
 /// 用共享 `AppState` 构造所有 warp 路由。
@@ -147,10 +178,11 @@ pub fn build_routes(
     state: &AppState,
 ) -> impl Filter<Extract = impl Reply, Error = Rejection> + Clone {
     // 最外层请求日志——在*任何*路径匹配或 guard 之前触发，所以 warp 处理的
-    // 每条连接都会出现在 stdout。这是"client 到底有没有够到我们"的基准信号，
+    // 每条连接都会记一行 DEBUG。这是"client 到底有没有够到我们"的基准信号，
     // 用来诊断误指代理的 cc-switch / Cursor / IDE 配置。没有它，guard 拒绝
     //（404）和 handler 拒绝（503）落在既有 `Proxying request to ...` 日志行
-    // 之前，就看不见了。
+    // 之前，就看不见了。默认 INFO 级下不可见——调查连接/误指问题时把
+    // `observability.log_level = "debug"` 临时调高即可。
     let entry_log = warp::path::full()
         .and(warp::method())
         .and(warp::header::headers_cloned())
@@ -165,7 +197,7 @@ pub fn build_routes(
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("")
                 .to_string();
-            tracing::info!(
+            tracing::debug!(
                 target: "proxy::entry",
                 method = %method,
                 path = %path.as_str(),
@@ -173,13 +205,23 @@ pub fn build_routes(
                 user_agent = %ua,
                 "收到请求"
             );
-            ()
+            
         })
         .untuple_one();
 
+    let health_ready = state.health_ready.clone();
     let health_route = warp::path!("health")
         .and(warp::get())
-        .map(|| warp::http::Response::builder().status(204).body(""));
+        .map(move || {
+            // S5：启动健康检查（`HealthChecker::run_startup`）完成前回 503，使
+            // 负载均衡器/探针在此期间摘掉本实例，避免把流量打到尚未对池做完一次
+            // 初始清点的代理上。`run_startup` 在退出前把 `health_ready` 置 true。
+            if health_ready.load(std::sync::atomic::Ordering::Relaxed) {
+                warp::http::Response::builder().status(204).body("")
+            } else {
+                warp::http::Response::builder().status(503).body("")
+            }
+        });
 
     let proxy_route = warp::path::full()
         .and_then(|p: warp::path::FullPath| {
@@ -269,7 +311,7 @@ pub async fn handle_rejection(err: Rejection) -> Result<impl Reply, Rejection> {
             "Authentication required".to_string(),
             StatusCode::UNAUTHORIZED,
         ));
-    }    if err.find::<AdminDisabled>().is_some() {
+    } else if err.find::<AdminDisabled>().is_some() {
         return Ok(warp::reply::with_status(
             "Not found".to_string(),
             StatusCode::NOT_FOUND,

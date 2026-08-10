@@ -5,7 +5,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
-use tracing::{error, info, warn};
+use tracing::{debug, error, warn};
 use warp::{self, Rejection, Reply};
 
 use crate::failure_log;
@@ -460,8 +460,23 @@ fn json_value_response(status: warp::http::StatusCode, v: &serde_json::Value) ->
 
 /// 为日志构造一个紧凑、稳定的请求 body 摘要。捕获最可能与上游失败相关联的
 /// 字段：model、message 数量、是否流式，以及 reasoning_effort / temperature /
-/// max_tokens 等参数的存在与否。摘要是 JSON 字符串，便于 `jq` 直接过滤。
+/// max_tokens / top_p 的**真实值**（而非仅存在性）。摘要是 JSON 字符串，便于
+/// `jq` 直接过滤。
+///
+/// 真值优先级：若字段是标量（数/串/布），原样记入；否则（对象/数组/JSON null）
+/// 记一个 `"<present>"` 字符串占位，保留「该键存在」这一信号，便于 failure.log
+/// 里区分「未设」与「设了但取不到标量」。
 fn body_summary(parsed_body: &Option<serde_json::Value>) -> String {
+    fn finalize(val: &serde_json::Value) -> serde_json::Value {
+        match val {
+            serde_json::Value::Number(_) | serde_json::Value::String(_) | serde_json::Value::Bool(_) => {
+                val.clone()
+            }
+            serde_json::Value::Null => serde_json::Value::String("<present:null>".to_string()),
+            // 对象/数组取不到标量，但「该键存在」对诊断仍是有用信号。
+            _ => serde_json::Value::String("<present>".to_string()),
+        }
+    }
     let mut summary = serde_json::Map::new();
     if let Some(v) = parsed_body {
         if let Some(m) = v.get("model").and_then(|x| x.as_str()) {
@@ -477,8 +492,8 @@ fn body_summary(parsed_body: &Option<serde_json::Value>) -> String {
             summary.insert("stream".to_string(), serde_json::Value::Bool(stream));
         }
         for field in ["reasoning_effort", "temperature", "max_tokens", "top_p"] {
-            if v.get(field).is_some() {
-                summary.insert(field.to_string(), serde_json::Value::Bool(true));
+            if let Some(val) = v.get(field) {
+                summary.insert(field.to_string(), finalize(val));
             }
         }
     }
@@ -1014,6 +1029,164 @@ fn parse_usage(v: &serde_json::Value) -> Option<Usage> {
     })
 }
 
+/// `coerce_sse_chunk` 的有状态流包装：把跨 chunk 边界拆分的 `data:` 行重拼
+/// 后再强转其数值型 `error.code`，治愈原逐-chunk 实现的盲区。
+///
+/// 旧的 `coerce_sse_chunk(chunk)` 对单个 chunk 操作、不带跨 chunk 状态：当一个
+/// `data: {"error":{"code":400}}\n\n` 事件被上游的 `bytes_stream()` 拆到两个
+/// chunk 边界上时，每一半的 JSON 解析都失败、原样转发 → 数值 `code` 漏过做强转，
+/// 客户端仍可能拿到数值 `code` 触发 cc-switch 422。NVIDIA 的错误事件虽短、大多
+/// 单 chunk 到达，但流式 body 在上面这种小事件之外也可能被任意切分。
+///
+/// 本 tap 维护一个原始字节累加器 `feed_buf`（与 `UsageTap` 同样的 `valid_up_to`
+/// 策略处理跨 chunk 的多字节 UTF-8 码点）和一个待处理行 carry。每次 feed 一 chunk：
+/// 累加字节 → 剥离最长有效 UTF-8 前缀 → 处理所有以 `\n` 结尾的完整行（每行跑一遍
+/// `coerce_sse_chunk` 的逐行强转逻辑）→ 把不完整的尾行留在 carry 里等下一 chunk。
+/// 没有发生任何强转时，poll_next 直接转发原始 chunk 字节；发生强转时转发改写后的
+/// 字节。hold-back 的代价仅是一个不完整尾行的延迟（下一 chunk 到来即放行）。
+///
+/// 注意：本结构体只持有重组 + 强转所需状态；不读 usage、不发 metric——那些由下游
+/// 的 `UsageTap` 负责。两层 tap 因此正交、可独立演进。
+struct CoerceSseTap<S> {
+    inner: S,
+    /// 原始字节累加器，处理跨 chunk 的多字节 UTF-8 与跨 chunk 的 `\n` 行边界。
+    feed_buf: Vec<u8>,
+    /// 已确认 UTF-8 完整、等待按 `\n` 切行的待处理文本。
+    carry: String,
+}
+
+impl<S> CoerceSseTap<S>
+where
+    S: Stream<Item = Result<Bytes, std::io::Error>> + Unpin + Send,
+{
+    /// feed 一个 chunk：累加字节、剥离 UTF-8、按完整 `\n` 行强转、保留尾残行。
+    /// 返回本 chunk 处理后应当向下游 emit 的字节（可能等于原 chunk 前 `<=len`
+    /// 部分，也可能是改写后的、可能更短/更长）。未到 `\n` 的尾行不在此 emit、
+    /// 留 carry 等下一 chunk；故 emit 的字节数严格等于「本 chunk 中截至最后一个
+    /// `\n`（含）的字节数」，除非 carry 里前一段不完整尾行也在本 chunk 被补全——
+    /// 那时 emit 里会带上那前段的强转结果，但本 chunk 的对应字节只 emit 一次。
+    fn feed(&mut self, chunk: &Bytes) -> Bytes {
+        self.feed_buf.extend_from_slice(chunk);
+        // 剥离最长有效 UTF-8 前缀；非法尾字节（部分多字节码点）留在 feed_buf。
+        let (text, consumed) = match std::str::from_utf8(&self.feed_buf) {
+            Ok(s) => (s, self.feed_buf.len()),
+            Err(e) => {
+                let up = e.valid_up_to();
+                if up == 0 {
+                    // 整段至今非 UTF-8（例如上游 gzipped body）：不常驻全 body，
+                    // 清空缓冲、原样转发本 chunk（强转不可能在这些字节上成立）。
+                    self.feed_buf.clear();
+                    return chunk.clone();
+                }
+                let t = std::str::from_utf8(&self.feed_buf[..up])
+                    .expect("valid_up_to bytes are valid UTF-8");
+                (t, up)
+            }
+        };
+        let appended = text.to_string();
+        self.feed_buf.drain(..consumed);
+        // carry = 上一 chunk 留下的不完整尾行（无 `\n`）；先接上本次的新文本，
+        // 形成一个连续文本块，再按 `\n` 切完整行强转、把尾残行留回 carry。
+        let mut block = std::mem::take(&mut self.carry);
+        block.push_str(&appended);
+        // 找最后一个 `\n`：它之前（含）是完整行（含 carry 前缀被本次补全的），
+        // 之后是无 `\n` 的尾残行，留回 carry 等下一 chunk。若根本没有 `\n`，
+        // 整段块都是尾残行 → 留 carry、emit 空（不向下游 emit 本 chunk 任何字节；
+        // 它会在下一 chunk 把这行补全后一起放行）。
+        let split = match block.rfind('\n') {
+            Some(i) => i + 1, // 完整行截止于 `\n` 之后一字节
+            None => {
+                // 整段都是不完整尾行：留 carry，本 chunk 不 emit 任何字节。
+                self.carry = block;
+                return Bytes::new();
+            }
+        };
+        let complete: String = block.drain(..split).collect();
+        // block 里剩的（若有）即新的尾残行。
+        if !block.is_empty() {
+            self.carry = block;
+        }
+        // 对完整行段跑逐行强转。逐行跑 coerce_sse_chunk（其内部对单行做
+        // `data:` JSON 解析 + code 强转 + 重序列化）。
+        let mut changed = false;
+        let mut out = String::with_capacity(complete.len() + 64);
+        for line in complete.split_inclusive('\n') {
+            let coerced_line = coerce_sse_chunk(&Bytes::from(line.to_string()));
+            if coerced_line.len() != line.len() || coerced_line.as_ref() != line.as_bytes() {
+                changed = true;
+                out.push_str(std::str::from_utf8(&coerced_line).unwrap_or(line));
+            } else {
+                out.push_str(line);
+            }
+        }
+        if !changed {
+            // 无强转：emit 完整行段的原样字节。注意 split 切的是 carry+appended
+            // 的连接结果，而 emit 应当保持字节身份稳定——这里直接返回 complete
+            // 的 String（与原始字节语义等价，因 carry 已在本 chunk 把上次的尾残
+            // 行补全且未做任何改动）。客户端最终看到的字节流与上游逐字节一致。
+            return Bytes::from(complete);
+        }
+        Bytes::from(out)
+    }
+
+    /// 流结束：把 carry 里的尾残行（无最终 `\n`）也强转一次再放行。若无残行
+    /// 或强转未改动则返回 None。
+    fn flush_trailing(&mut self) -> Option<Bytes> {
+        // 先把 feed_buf 里残留的任何字节（最终部分码点）尽力转成 lossy 字符串。
+        if !self.feed_buf.is_empty() {
+            let rest = String::from_utf8_lossy(&self.feed_buf).into_owned();
+            self.carry.push_str(&rest);
+            self.feed_buf.clear();
+        }
+        if self.carry.is_empty() {
+            return None;
+        }
+        let line = std::mem::take(&mut self.carry);
+        let coerced = coerce_sse_chunk(&Bytes::from(line.clone()));
+        if coerced.len() == line.len() && coerced.as_ref() == line.as_bytes() {
+            // 未改动：仍需把原尾行放行（否则丢字节）。
+            Some(Bytes::from(line))
+        } else {
+            Some(coerced)
+        }
+    }
+}
+
+impl<S> Stream for CoerceSseTap<S>
+where
+    S: Stream<Item = Result<Bytes, std::io::Error>> + Unpin + Send,
+{
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        use std::pin::Pin;
+        // 单次 poll：每个分支都直接 return，因此不需要外层 loop——上游流每个
+        // wake 对应一次 poll_next，我们的状态推进只在「拿到一个 chunk / 流结束」
+        // 这两个事件上发生，无需自旋。
+        match Pin::new(&mut self.inner).poll_next(cx) {
+            std::task::Poll::Ready(None) => {
+                // 上游流结束：把 carry 里尾残行强转放行（若有）。
+                if let Some(b) = self.flush_trailing() {
+                    return std::task::Poll::Ready(Some(Ok(b)));
+                }
+                // 到 None 时 carry/feed_buf 已被 flush_trailing 清空（含 lossy 收尾）。
+                std::task::Poll::Ready(None)
+            }
+            std::task::Poll::Ready(Some(Err(e))) => {
+                std::task::Poll::Ready(Some(Err(e)))
+            }
+            std::task::Poll::Ready(Some(Ok(chunk))) => {
+                let out = self.feed(&chunk);
+                std::task::Poll::Ready(Some(Ok(out)))
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
 /// 一个流包装器，扫描每个转发的 chunk 中的 `usage`（处理 SSE `data:` 行
 /// 和裸 JSON，带一个 carry 缓冲以应对跨 chunk 拆分的行），并在上游流结束后把
 /// 最近一次 usage 记到 Prometheus 计数器。正是它使
@@ -1428,6 +1601,7 @@ impl Proxy {
     /// 对一个客户端随后按 SSE 解析的请求返回缓冲 JSON——并使代理缓冲一个长 body，
     /// 触发 worker 背压（503 ResourceExhausted）。把 Accept 头与 `stream` 字段
     /// 同步强制使两端在传输形态上保持一致。
+    #[allow(clippy::too_many_arguments)]
     fn build_upstream_request(
         &self,
         url: &str,
@@ -1740,7 +1914,7 @@ impl Proxy {
                 model_lookup_source = Some(m.clone());
                 if let Some(target) = self.model_aliases.get(&m).cloned() {
                     if target != m {
-                        info!(
+                        debug!(
                             client_req_id = %client_req_id,
                             "重映射模型别名 '{}' -> '{}'", m, target
                         );
@@ -1784,7 +1958,7 @@ impl Proxy {
                     // failure.log 显示 216/216 首次尝试空壳都带 max_tokens == 已配置
                     // 的 32000 target，即严格 `>` 在它们身上从不触发。
                     if cur >= target {
-                        info!(
+                        debug!(
                             client_req_id = %client_req_id,
                             max_tokens_before = cur,
                             max_tokens_after = target,
@@ -1857,7 +2031,7 @@ impl Proxy {
                     // 具链路经我们往返后留下的空 ""）保持原样。
                     let need_desc = tobj
                         .get("description")
-                        .map_or(true, serde_json::Value::is_null);
+                        .is_none_or(serde_json::Value::is_null);
                     if need_desc {
                         tobj.insert(
                             "description".to_string(),
@@ -1865,7 +2039,7 @@ impl Proxy {
                         );
                         fixed += 1;
                     }
-                    let need_name = tobj.get("name").map_or(true, serde_json::Value::is_null);
+                    let need_name = tobj.get("name").is_none_or(serde_json::Value::is_null);
                     if need_name {
                         tobj.insert(
                             "name".to_string(),
@@ -1965,7 +2139,7 @@ impl Proxy {
         let mut url = self.base_url.clone();
         url.push_str(&path);
 
-        info!(client_req_id = %client_req_id, body_summary = %body_summary, "代理请求至: {} {}", method.as_str(), url);
+        debug!(client_req_id = %client_req_id, body_summary = %body_summary, "代理请求至: {} {}", method.as_str(), url);
 
         // ---- 并发信号量（Priority 2）----
         // 在我们试图取 key 之前，先为本模型并发上限获取一个槽。这避免压垮上游
@@ -2101,7 +2275,7 @@ impl Proxy {
                 Ok(AttemptResponse::Done(resp)) => {
                     key_guard.release();
                     self.metrics.observe_latency(start.elapsed().as_secs_f64());
-                    info!(
+                    debug!(
                         client_req_id = %client_req_id,
                         total_attempts = attempt + 1,
                         elapsed_ms = start.elapsed().as_millis(),
@@ -2375,7 +2549,7 @@ impl Proxy {
             let addr = key_handle as *const crate::key_pool::KeyStateHandle as usize;
             addr as u64
         };
-        info!(
+        debug!(
             client_req_id = %client_req_id,
             attempt = attempt,
             key = %mask_key(&key_str),
@@ -2393,7 +2567,7 @@ impl Proxy {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
-        info!(
+        debug!(
             client_req_id = %client_req_id,
             attempt = attempt,
             status = %status,
@@ -2619,15 +2793,23 @@ impl Proxy {
                     self.key_pool.mark_bad(&key_str, None).await;
                     self.metrics.inc_key_403_auth_cooldown();
                 } else {
+                    // 不带 Retry-After 的 429（或非 auth-ban 的 403）属于上游的
+                    // 确定性限流 / 区域-账号门控，*不是*认证失败。改用短路冷却
+                    //（`mark_bad(None) → cooldown.base_seconds`），让 cool_down_task
+                    // 在 60s 后把它无探测转回 active，或健康探测在 ready_at 后
+                    // 探活恢复。刻意**不**走 `mark_failure`：那条路径会累加
+                    // `fail_count` 并在达到 `auth_fail_threshold`（默认 3）时把
+                    // 该 key 置入 `Disabled`（兜底 `cooldown.max_seconds`=600s，
+                    // 且探测对 429 也救不回来）。一个被 NVIDIA 限流的合法 key
+                    // 累计 3 次这样的 429 就会被关进 600s 禁用，池在真实流量下
+                    // 会自我收缩到零。这里只降权（避免本轮重试再次命中它）+ 短冷却。
                     warn!(
                         key = %mask_key(&key_str),
                         status = %status,
-                        "上游 {} 不带 Retry-After；降权，反复失败后可能禁用",
+                        "上游 {} 不带 Retry-After；短冷却（base_seconds），不计入禁用阈值",
                         status.as_u16()
                     );
-                    self.key_pool
-                        .mark_failure(&key_str, self.retry_config.auth_fail_threshold)
-                        .await;
+                    self.key_pool.mark_bad(&key_str, None).await;
                 }
             }
             self.metrics.inc_error();
@@ -2778,13 +2960,19 @@ async fn handle_passthrough_stream(
     concurrency_guard: Option<ConcurrencyGuard>,
 ) -> Result<warp::http::Response<warp::hyper::Body>, Rejection> {
     let upstream = resp.bytes_stream();
+    // 先把上游 reqwest 错误映射为 std::io::Error，再用 CoerceSseTap 包住：把跨
+    // chunk 边界拆分的 `data:` 行重拼后强转数值 `error.code` 为字符串（治愈原逐-chunk
+    // coerce_sse_chunk 的盲区）。再由下游 UsageTap 计 usage / 诊断。两层 tap 正交。
+    let upstream = upstream.map(|r| r.map_err(|e| {
+        warn!("透传流读取错误: {}", e);
+        std::io::Error::other(e.to_string())
+    }));
     let forwarded: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> =
-        Box::pin(upstream.map(|r| {
-            r.map(|chunk| coerce_sse_chunk(&chunk)).map_err(|e| {
-                warn!("透传流读取错误: {}", e);
-                std::io::Error::other(e.to_string())
-            })
-        }));
+        Box::pin(CoerceSseTap {
+            inner: upstream,
+            feed_buf: Vec::new(),
+            carry: String::new(),
+        });
     let tapped: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> =
         Box::pin(UsageTap {
             inner: forwarded,
@@ -2907,27 +3095,30 @@ async fn handle_passthrough_stream(
         }
 
         // 落入透传：把缓冲前缀 prepend 到剩余上游流。这与 `handle_passthrough_stream`
-        // 保持逐字节一致（未发生合成），*包括*把缓冲前缀也跑一遍 `coerce_sse_chunk`——
-        // 否则一个落在 peek 前缀内的 `data: {"error":{"code":400}}` 事件会在此被未 coerce
-        // 转发，而纯透传路径会 coerce 每个 chunk。流的前几个 chunk 恰是 NVIDIA 易于
-        // 外抛错误事件之处，故在前缀上跳过 coerce 会重新引入该 coerce 存在所防的数值
-        // `code` 422。
+        // 保持逐字节一致（未发生合成），*包括*把前缀也做强转——否则一个落在 peek
+        // 前缀内的 `data: {"error":{"code":400}}` 事件会在此被未 coerce 转发，而纯
+        // 透传路径会 coerce 每行。流的前几个 chunk 恰是 NVIDIA 易于外抛错误事件之处，
+        // 跳过强转会重新引入该 coerce 存在所防的数值 `code` 422。
+        //
+        // 把前缀作为 CoerceSseTap 的首个 chunk 喂入，从而让「前缀尾残行 ↔ rest 首
+        // chunk 头」的跨边界 `data:` 行也被重拼强转——这正是 S4 修复点。统一走 tap
+        // 后，纯透传路径与 peek 落入路径的强转语义完全一致。
         let prefix = Bytes::from(buf);
-        let coerced_prefix = coerce_sse_chunk(&prefix);
         let req_id_owned = client_req_id.to_string();
-        let rest = upstream.map(move |r| {
-            r.map(|chunk| coerce_sse_chunk(&chunk)).map_err(|e| {
-                warn!(client_req_id = %req_id_owned, "透传流读取错误: {}", e);
-                std::io::Error::other(e.to_string())
-            })
-        });
+        let rest_mapped = upstream.map(move |r| r.map_err(|e| {
+            warn!(client_req_id = %req_id_owned, "透传流读取错误: {}", e);
+            std::io::Error::other(e.to_string())
+        }));
+        let prefixed: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> = {
+            let head = futures_util::stream::iter(vec![Ok(prefix)]);
+            Box::pin(head.chain(rest_mapped))
+        };
         let pref: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> =
-            if coerced_prefix.is_empty() {
-                Box::pin(rest)
-            } else {
-                let head = futures_util::stream::iter(vec![Ok(coerced_prefix)]);
-                Box::pin(head.chain(rest))
-            };
+            Box::pin(CoerceSseTap {
+                inner: prefixed,
+                feed_buf: Vec::new(),
+                carry: String::new(),
+            });
 
         let tapped: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> =
             Box::pin(UsageTap {
@@ -3164,7 +3355,7 @@ async fn handle_passthrough_stream(
                         .iter()
                         .map(|(k, v)| (k.as_str().to_string(), v.as_bytes().to_vec()))
                         .collect();
-                    info!(
+                    debug!(
                         client_req_id = %client_req_id,
                         attempt = retry_attempt_already_done + 1,
                         status = %resp_status,
@@ -3569,6 +3760,7 @@ use crate::config::default_request_max_prompt_tokens;
             cooldown: CooldownConfig {
                 base_seconds: 1,
                 max_seconds: 2,
+                scan_interval_seconds: 5,
             },
             health_check: HealthCheckConfig {
                 interval_seconds: 30,
@@ -4444,6 +4636,93 @@ use crate::config::default_request_max_prompt_tokens;
             !coerced_str.contains("\"code\":400"),
             "no raw numeric code should remain, got: {}",
             coerced_str
+        );
+    }
+
+    #[tokio::test]
+    async fn coerce_sse_tap_reassembles_data_line_split_across_chunks() {
+        // S4：一个数值 `error.code` 事件被拆到两个 chunk 边界上——前半截缺尾 `\n`，
+        // 后半截补全事件尾。旧逐-chunk coerce_sse_chunk 会在每半失败 JSON 解析、
+        // 原样透传 → 数值 code 漏过。CoerceSseTap 必须把整行重拼后再强转。
+        let whole = "data: {\"error\":{\"message\":\"x\",\"code\":400}}\n\n".to_string();
+        let half = whole.len() / 2;
+        let (a, b) = whole.split_at(half);
+        let chunks: Vec<Result<bytes::Bytes, std::io::Error>> = vec![
+            Ok(bytes::Bytes::from(a.to_string())),
+            Ok(bytes::Bytes::from(b.to_string())),
+        ];
+        let stream = futures_util::stream::iter(chunks);
+        let mut tap = super::CoerceSseTap {
+            inner: stream,
+            feed_buf: Vec::new(),
+            carry: String::new(),
+        };
+        let mut collected = Vec::new();
+        use futures_util::StreamExt;
+        while let Some(r) = tap.next().await {
+            collected.extend_from_slice(&r.unwrap());
+        }
+        let out = String::from_utf8(collected).unwrap();
+        assert!(
+            out.contains("\"code\":\"400\""),
+            "split-chunk numeric code must be coerced to string, got: {}",
+            out
+        );
+        assert!(
+            !out.contains("\"code\":400"),
+            "no raw numeric code should remain after reassembly, got: {}",
+            out
+        );
+    }
+
+    #[tokio::test]
+    async fn coerce_sse_tap_preserves_bytes_when_no_coercion_applies() {
+        // 非 `code` 的普通 delta chunk：CoerceSseTap 不得改动任何字节，且整段
+        //（chunk 以 `\n\n` 结束）必须一次性 emit，无 hold-back。
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n".to_string();
+        let chunks: Vec<Result<bytes::Bytes, std::io::Error>> =
+            vec![Ok(bytes::Bytes::from(body.clone()))];
+        let stream = futures_util::stream::iter(chunks);
+        let mut tap = super::CoerceSseTap {
+            inner: stream,
+            feed_buf: Vec::new(),
+            carry: String::new(),
+        };
+        let mut collected = Vec::new();
+        use futures_util::StreamExt;
+        while let Some(r) = tap.next().await {
+            collected.extend_from_slice(&r.unwrap());
+        }
+        assert_eq!(
+            String::from_utf8(collected).unwrap(),
+            body,
+            "non-coerced SSE body must pass through byte-identical"
+        );
+    }
+
+    #[tokio::test]
+    async fn coerce_sse_tap_never_loses_trailing_fragment_on_stream_end() {
+        // 一个无最终 `\n` 的尾残行（合法 SSE 不会这样，但防御）：流结束时
+        // flush_trailing 必须把它放行，字节不丢。
+        let body = "data: {\"error\":{\"message\":\"x\",\"code\":401}}".to_string(); // 无尾 \n\n
+        let chunks: Vec<Result<bytes::Bytes, std::io::Error>> =
+            vec![Ok(bytes::Bytes::from(body.clone()))];
+        let stream = futures_util::stream::iter(chunks);
+        let mut tap = super::CoerceSseTap {
+            inner: stream,
+            feed_buf: Vec::new(),
+            carry: String::new(),
+        };
+        let mut collected = Vec::new();
+        use futures_util::StreamExt;
+        while let Some(r) = tap.next().await {
+            collected.extend_from_slice(&r.unwrap());
+        }
+        let out = String::from_utf8(collected).unwrap();
+        assert!(
+            out.contains("\"code\":\"401\""),
+            "trailing fragment must be flushed & coerced, got: {}",
+            out
         );
     }
 
@@ -5650,8 +5929,53 @@ mod usage_accounting_tests {
         assert!(fp.contains("est_prompt_tokens="), "missing token estimate in: {fp}");
     }
 
-    /// 缺失字段以 `<absent>`/`0` 呈现，而不是 panic 或静默改写请求
-    /// 形态——保持指纹对集成测试里那种最小请求依然可读。
+    #[test]
+    fn body_summary_records_real_scalar_values_not_presence_flags() {
+        // U3：max_tokens / temperature / top_p / reasoning_effort 必须记入真实标量，
+        // 而非旧的 `Bool(true)` 存在性标志。
+        let parsed: serde_json::Value = serde_json::json!({
+            "model": "z-ai/glm-5.2",
+            "messages": [{"role":"user","content":"hi"}],
+            "stream": true,
+            "max_tokens": 64000,
+            "temperature": 0.3,
+            "top_p": 0.9,
+            "reasoning_effort": "high",
+        });
+        let s = super::body_summary(&Some(parsed.clone()));
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["max_tokens"], 64000, "max_tokens must be real int, got: {v}");
+        assert_eq!(v["temperature"], 0.3, "temperature must be real float, got: {v}");
+        assert_eq!(v["top_p"], 0.9, "top_p must be real float, got: {v}");
+        assert_eq!(v["reasoning_effort"], "high", "reasoning_effort must be real string, got: {v}");
+        assert_eq!(v["model"], "z-ai/glm-5.2");
+        assert_eq!(v["messages"], 1);
+        assert_eq!(v["stream"], true);
+    }
+
+    #[test]
+    fn body_summary_non_scalar_value_keeps_presence_marker() {
+        // U3：当一个参数取了对象/数组（非标量），我们无法精确记录真值，但仍要
+        // 保留「该键存在」这一诊断信号 —— 用 `<present>` 占位，而非静默丢失。
+        let parsed: serde_json::Value = serde_json::json!({
+            "model": "m",
+            "messages": [],
+            "max_tokens": {"weird": true},
+        });
+        let s = super::body_summary(&Some(parsed));
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["max_tokens"], "<present>", "non-scalar must mark presence, got: {v}");
+    }
+
+    #[test]
+    fn body_summary_omits_absent_fields() {
+        let parsed: serde_json::Value = serde_json::json!({"model": "m", "messages": []});
+        let s = super::body_summary(&Some(parsed));
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert!(v.get("max_tokens").is_none(), "absent fields must not appear, got: {v}");
+        assert!(v.get("temperature").is_none());
+    }
+
     #[test]
     fn request_body_fingerprint_handles_minimal_body() {
         let body = bytes::Bytes::from(r#"{"model":"m","messages":[]}"#);

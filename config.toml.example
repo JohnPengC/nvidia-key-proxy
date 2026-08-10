@@ -1,86 +1,178 @@
+# =============================================================================
+# NVIDIA OpenAI-compatible key-balancing proxy —— 示例配置
+#
+# 把本文件复制为 config.toml 后按需修改。运行时优先级：
+#   1) NVIDIA_* 环境变量（见各字段注释）—— 最高
+#   2) 本文件里的值
+#   3) 代码内 default_* 函数给出的默认值（注释里写明）
+# 无法识别 / 解析失败的 NVIDIA_* override 会被忽略并打一条 warn，不会静默
+# 改动其他字段。每个 NVIDIA_* 字段名都列在对应注释里。
+# =============================================================================
+
 listen_addr = "0.0.0.0:8888"
 base_url    = "https://integrate.api.nvidia.com"
 
-# 允许把 base_url 指向回环/localhost 地址（例如用于本地测试的
-# NVIDIA 兼容模拟器）。默认关闭。
+# 允许把 base_url 指向回环/localhost 地址（例如用于本地测试的 NVIDIA 兼容
+# 模拟器）。默认关闭。环境变量覆盖：NVIDIA_ALLOW_LOCAL_BASE_URL。
 allow_local_base_url = false
 
-# 请求超时（秒）。设为 0 可禁用（流式建议设 0）。
-# 流式请求无视此超时。
-request_timeout_seconds = 60
+# 请求超时（秒）。设为 0 可禁用（流式建议设 0）。非流式请求端到端使用此时
+# 长；流式请求本身绕过它（长 token 生成可能 >60s）。为长上下文非流式补
+# 全，默认调高到 600。环境变量覆盖：NVIDIA_REQUEST_TIMEOUT_SECONDS。
+request_timeout_seconds = 600
 
-# 向流式 chat 请求注入 `stream_options.include_usage: true`，让 NVIDIA 在
-# 流结束时返回 token 用量（默认 true）。关闭则原样透传流式请求。
-# 环境变量覆盖：NVIDIA_INJECT_STREAM_USAGE。
+# 流式连接的单独超时（秒；connect + idle read）。>0 时流式路径改用它而非
+# request_timeout_seconds；0 = 流式也用 request_timeout_seconds。默认 0
+#（禁用）。环境变量覆盖：NVIDIA_REQUEST_TIMEOUT_STREAMING_SECONDS。
+# request_timeout_streaming_seconds = 0
+
+# ── max_tokens 校验上限 ──────────────────────────────────────────────────────
+# 任何 max_tokens > 此值的请求会让该字段被丢弃（改用模型默认值）。默认
+# 100000。环境变量覆盖：MAX_TOKENS_MAX。
+# max_tokens_max = 100000
+
+# ── 流式 usage 注入 / 空 choices 合成 ─────────────────────────────────────────
+# 向流式 chat 请求注入 `stream_options.include_usage: true`，让 NVIDIA 在流
+# 结束时返回 token 用量（默认 true）。NVIDIA/OpenAI 只在该 flag 置位时才发
+# usage，否则流式场景下代理的 token 指标恒为 0。关闭请设
+# NVIDIA_INJECT_STREAM_USAGE=false。
 inject_stream_usage = true
 
-# 当上游返回 2xx 非 SSE body 且 `choices` 数组为空（`choices: []`）时，
-# 合成一个占位 `choices` 项。默认 true;关闭请设 NVIDIA_SYNTHESIZE_EMPTY_CHOICES=false。
+# 当上游返回 2xx 非 SSE body 且 `choices` 数组为空（`choices: []`）时，合成
+# 一个占位 `choices` 项。cc-switch 的非流式转换器遇到空 `choices` 会硬报错
+#（向 Claude Code 返回 422），常见于 context compaction（stream:false）——模型
+# 未产生 token 但仍返回了 `usage`。默认 true。关闭请设
+# NVIDIA_SYNTHESIZE_EMPTY_CHOICES=false。
 synthesize_empty_choices = true
 
-# NVIDIA 的 "空壳" 软失败 —— 一个 200，body 为
-# `{"choices":[],"id":"","usage":null,...}`（没有真正跑推理；常见于 /compact 且
-# max_tokens 超出模型剩余上下文预算时）—— 出现时先把 max_tokens 钳到
-# `empty_shell_retry_max_tokens` 重试一次，仍失败再返回 502。否则 Claude Code 的
-# /compact 会打印误导性提示 "summarization produced empty response"。默认 true;
-# 关闭请设 NVIDIA_RETRY_ON_EMPTY_SHELL=false。
+# ── 空壳（empty-shell）软失败处理 ─────────────────────────────────────────────
+# NVIDIA 的 "空壳" 2xx —— body 形如 `{"choices":[],"id":"","usage":null,...}`
+#（没有真正跑推理；常见于 /compact 且 max_tokens 超出模型剩余上下文预算
+# 时）—— 出现时先把 max_tokens 钳到 `empty_shell_retry_max_tokens` 重试，
+# 仍失败再返回 502。否则 Claude Code 的 /compact 会打印误导性提示
+# "summarization produced empty response"。默认 true。关闭请设
+# NVIDIA_RETRY_ON_EMPTY_SHELL=false。
 retry_on_empty_shell = true
 
 # 重试空壳时使用的 max_tokens。第一次上游调用本身可能已被
-# `empty_shell_pre_clamp_max_tokens`（见下）预钳过，让预算刚好放得下，省掉一次
-# 注定空壳的往返。8192 在 build.integrate 上对 GLM 系模型保守可用。
+# `empty_shell_pre_clamp_max_tokens`（见下）预钳过，让预算刚好放得下，省掉
+# 一次注定空壳的往返。8192 在 build.integrate 上对 GLM 系模型是保守取值。
 # 环境变量覆盖：NVIDIA_EMPTY_SHELL_RETRY_MAX_TOKENS。
 empty_shell_retry_max_tokens = 8192
 
-# 在*首次*上游调用（含流式）时就钳到的 per-model max_tokens 上限。NVIDIA 的
-# GLM 系模型在 `prompt + max_tokens` 超出剩余上下文预算时会返回 200 空壳 body；
-# 入口就钳住预算，让推理真正跑起来。可选项，留空 = 不预钳。
-# 默认包含 z-ai/glm-5.2 → 8192。
-# 覆盖方式：NVIDIA_EMPTY_SHELL_PRE_CLAMP_MAX_TOKENS（JSON map）。
+# 空壳软失败的重试次数。1 = 原始 + 一次重试；0 = 不重试（回退为 502）。
+# 默认 2（原始 + 两次重试）。环境变量覆盖：NVIDIA_EMPTY_SHELL_RETRY_ATTEMPTS。
+# empty_shell_retry_attempts = 2
+
+# 重试空壳失败前，对 /v1/models 做一次轻量健康探测，避免向已退化的上游
+# 重试。默认 true。环境变量覆盖：NVIDIA_EMPTY_SHELL_PROBE_BEFORE_RETRY。
+# empty_shell_probe_before_retry = true
+
+# 空壳重试之间指数退避的基本延迟（毫秒）。默认 500。环境变量覆盖：
+# NVIDIA_EMPTY_SHELL_RETRY_BACKOFF_BASE_MS。
+# empty_shell_retry_backoff_base_ms = 500
+
+# 单次空壳重试退避睡眠的上限（毫秒）。默认 5000。环境变量覆盖：
+# NVIDIA_EMPTY_SHELL_RETRY_BACKOFF_MAX_MS。
+# empty_shell_retry_backoff_max_ms = 5000
+
+# 在*首次*上游调用（含流式）时就钳到的 per-model max_tokens 上限。NVIDIA
+# 的 GLM 系模型在 `prompt + max_tokens` 超出剩余上下文预算时会返回 200 空壳
+# body；入口就钳住预算，让推理真正跑起来。默认包含 z-ai/glm-5.2 → 8192。
+# 环境变量覆盖：NVIDIA_EMPTY_SHELL_PRE_CLAMP_MAX_TOKENS（JSON map）。
 # empty_shell_pre_clamp_max_tokens = { "z-ai/glm-5.2" = 8192 }
 
-# 估算 prompt token 的阈值：超过此阈值的空壳软失败不再用钳过的 max_tokens 重试；
-# 代理直接返回 502。failure.log 显示 prompt 107k+ 的钳住重试恢复率为 0%，再重试
-# 只会浪费一次往返和一个 key 槽位。0 = 关闭旁路（永远重试）。默认 90000。
-# 覆盖方式：NVIDIA_EMPTY_SHELL_NO_RETRY_PROMPT_TOKENS。
+# 估算 prompt token 的阈值：超过此阈值的空壳软失败不再用钳过的 max_tokens
+# 重试；代理直接返回 502。failure.log 显示 prompt 107k+ 的钳住重试恢复率为
+# 0%（49/49 重新空壳）：`prompt + 任意 max_tokens` 已超出模型上下文窗口，
+# 缩小输出预算无济于事，重试只浪费一次往返和一个 key 槽位。0 = 关闭旁路
+#（永远重试）。默认 90000（远低于 failure.log 中 107k 的空壳下限）。
+# 环境变量覆盖：NVIDIA_EMPTY_SHELL_NO_RETRY_PROMPT_TOKENS。
 # empty_shell_no_retry_prompt_tokens = 90000
 
+# ── prompt-token 硬上限（413）─────────────────────────────────────────────────
 # 估算 prompt token 的硬上限：达到/超过此值会在任何上游调用之前以 HTTP 413
-# 拒绝，要求 client 自行压缩上下文。请把它设成与软阈值
-# `empty_shell_no_retry_prompt_tokens` *相等*（两者都 90000）—— 之间不留任何灰带。
-# 两轮实测表明任何"打一发就过"的灰带只会产出注定空壳 + 一个让 client 反复重试
-# 分钟级的误导性 502：在 ~92k 估算值（按 chars/4 算，会低估真实 token 数）时，
-# `prompt + max_tokens` 已超出 glm-5.2 的 ~128k 窗口。所以 est >= 90000 → 立刻
-# 413，零上游往返。不会改写 client 的 messages。0 = 关闭。默认 90000。
-# 覆盖方式：NVIDIA_REQUEST_MAX_PROMPT_TOKENS。
+# 拒绝，要求 client 自行压缩上下文。代理拒绝而非改写 client 的 messages
+#（auto-compact 是 client 的职责）。请把它设成与软阈值
+# `empty_shell_no_retry_prompt_tokens` *相等*（两者默认都 90000）—— 之间不
+# 留任何灰带。两轮实测表明任何"打一发就过"的灰带只会产出注定空壳 + 一个让
+# client 反复重试分钟级的误导性 502：在 ~92k 估算值（按 chars/4 算，会低估
+# 真实 token 数）时，`prompt + max_tokens` 已超出 glm-5.2 的 ~128k 窗口。所以
+# est >= 90000 → 立刻 413，零上游往返、零客户端重试风暴。0 = 关闭硬上限。
+# 环境变量覆盖：NVIDIA_REQUEST_MAX_PROMPT_TOKENS。
 # request_max_prompt_tokens = 90000
 
 # ── 多模态 prompt-token 估算 ──────────────────────────────────────────────────
-# 代理原样转发 OpenAI 风格的多模态 content 数组（image_url / input_audio block）
-# 给 NVIDIA NIM。413 硬上限和 90k 空壳软限所用的 prompt-token 估算不能被它们
-# 误导：内联 base64 `data:…;base64,…` 图片有几万字符（用 chars/4 会把估算撑爆
-# 误 413 一个合法请求），而只有 URL 的图片只有几十字符（会低估、漏过所以）。
-# 因此每个非文本 content block 都用一个粗粒度的固定/token 化成本替换：
+# 代理原样转发 OpenAI 风格的多模态 content 数组（image_url / input_audio
+# block）给 NVIDIA NIM。413 硬上限和 90k 空壳软限所用的 prompt-token 估算
+# 不能被它们误导：内联 base64 `data:…;base64,…` 图片有几万字符（用 chars/4
+# 会把估算撑爆、误 413 一个合法请求），而只有 URL 的图片只有几十字符（会
+# 低估、漏过去）。因此每个非文本 content block 都用一个粗粒度的固定/可量
+# 化成本替换：
 #   {type:"text"}        → 还是 chars/4
 #   {type:"image_url"}   → est_image_token_cost（固定值，URL 与 base64 同价）
 #   {type:"input_audio"} → est_audio_token_per_kb × (base64 字符数/1024)，
 #                          封顶 est_audio_token_cap
 #   其它任意             → chars/4 但封顶 est_unknown_part_token_cap，
 #                          以免乱入的 base64 blob 把估算撑爆。
-# 默认值都是保守的；按环境自行覆盖即可。
-# 环境变量覆盖：NVIDIA_EST_IMAGE_TOKEN_COST、
-#                NVIDIA_EST_AUDIO_TOKEN_PER_KB、
-#                NVIDIA_EST_AUDIO_TOKEN_CAP、
-#                NVIDIA_EST_UNKNOWN_PART_TOKEN_CAP。
+# 默认值都偏保守；按环境自行覆盖即可。环境变量覆盖：
+#   NVIDIA_EST_IMAGE_TOKEN_COST、NVIDIA_EST_AUDIO_TOKEN_PER_KB、
+#   NVIDIA_EST_AUDIO_TOKEN_CAP、NVIDIA_EST_UNKNOWN_PART_TOKEN_CAP。
 # est_image_token_cost      = 1500
 # est_audio_token_per_kb    = 16
 # est_audio_token_cap       = 10000
 # est_unknown_part_token_cap = 2000
 
-# 是否对 500 Internal Server Error（GLM 偶发的 "Failed to generate completions"）
-# 在另一个 key 上带 backoff 重试。默认 true。
+# ── 熔断器（circuit breaker）──────────────────────────────────────────────────
+# 某 key/model 上连续 N 次空壳或 504 响应后，该 key 被冷却
+# cooldown.base_seconds。0 = 禁用。默认 3。
+# 环境变量覆盖：NVIDIA_CIRCUIT_BREAKER_THRESHOLD。
+# circuit_breaker_threshold = 3
+
+# 熔断器是否按 (key, model) 维度而非按 key 全局统计失败。默认 true。
+# 环境变量覆盖：NVIDIA_CIRCUIT_BREAKER_PER_MODEL。
+# circuit_breaker_per_model = true
+
+# ── 上游错误重试（500 / 503）─────────────────────────────────────────────────
+# 在 503 Service Unavailable（NVIDIA Worker 本地请求上限到达）时对另一个 key
+# 带指数退避重试（与 401 重试共用同一重试预算）。默认 true。
+# 环境变量覆盖：NVIDIA_RETRY_ON_503。
+# retry_on_503 = true
+
+# 重试 503 失败前，对 /v1/models 做一次轻量健康探测，避免向已退化的上游
+# 重试。默认 true。环境变量覆盖：NVIDIA_PROBE_BEFORE_503_RETRY。
+# probe_before_503_retry = true
+
+# 是否对 500 Internal Server Error（GLM 偶发的 "Failed to generate
+# completions"）在另一个 key 上带 backoff 重试。默认 true。
 # 环境变量覆盖：NVIDIA_RETRY_ON_500。
-# retry_on_500 = true
+retry_on_500 = true
+
+# ── 并发限制（Priority 2）─────────────────────────────────────────────────────
+# 每个模型的最大并发上游请求数。当某模型并发达到此上限时，新请求会被排队
+#（最长 `concurrency_queue_timeout_ms`）或以 503 拒绝。默认：空（无限制）。
+# 环境变量覆盖：NVIDIA_CONCURRENCY_LIMIT_PER_MODEL（JSON map）。
+# 例：
+#   concurrency_limit_per_model = { "nvidia/nemotron-3-ultra-550b-a55b" = 30 }
+# concurrency_limit_per_model = {}
+
+# 为拿到一个并发信号量槽位而等待的最长时间（毫秒）。若队列满这么久仍无
+# 槽位，则带 Retry-After 返回 503。默认 5000（5s）。
+# 环境变量覆盖：NVIDIA_CONCURRENCY_QUEUE_TIMEOUT_MS。
+# concurrency_queue_timeout_ms = 5000
+
+# ── 网络韧性 ───────────────────────────────────────────────────────────────────
+# 上游连接超时（秒）。默认 5。环境变量覆盖：
+# NVIDIA_UPSTREAM_CONNECT_TIMEOUT_SECONDS。
+# upstream_connect_timeout_secs = 5
+
+# 上游连接池空闲超时（秒）。默认 90。环境变量覆盖：
+# NVIDIA_UPSTREAM_POOL_IDLE_TIMEOUT_SECONDS。
+# upstream_pool_idle_timeout_secs = 90
+
+# 重试抖动（毫秒），叠加到指数退避之上。默认 100。环境变量覆盖：
+# NVIDIA_RETRY_JITTER_MS。
+# retry_jitter_ms = 100
 
 # API keys —— 也可通过 NVIDIA_KEYS 环境变量设置（逗号分隔）
 keys = [
@@ -89,33 +181,60 @@ keys = [
     "nvapi-xxxxxxxxxxxxxxxx3",
 ]
 
+# =============================================================================
+# 以下为子表（[section]）。TOML 规则：一旦进入某个 [section]，其后的裸 key
+# 都属于该表，直到下一个 [section] 或文件结束。
+# =============================================================================
+
 [rate_limiter]
 qps_per_key = 0.65
 burst       = 8
-# 等待 token 的最大毫秒数，超时则切换到另一个 key。
-# 0 = 关闭切换。默认 200。
+# 等待 token 的最大毫秒数，超时则切换到另一个 key。0 = 关闭切换。默认 200。
+# 环境变量覆盖：NVIDIA_TOKEN_WAIT_MS。
 token_wait_ms = 200
 
 [cooldown]
+# 冷却基础时长（秒）。熔断触发时按 base/exp(base,max) 之间退避。
 base_seconds = 60
+# 冷却上限时长（秒）。环境变量覆盖：NVIDIA_COOLDOWN_MAX_SECONDS。
 max_seconds  = 600
+# `cool_down_task` 扫描"冷却是否已到期"的独立周期（秒）。此前该任务复用
+# health_check.interval_seconds，最坏情况下把一次冷却的恢复延迟整整一个扫
+# 描间隔；把冷却扫描周期从健康检查周期解耦，让冷却恢复延迟可控。
+# 0 = 回退到旧行为（用 health_check.interval_seconds）。默认 5。
+# 环境变量覆盖：NVIDIA_COOLDOWN_SCAN_INTERVAL_SECONDS。
+# scan_interval_seconds = 5
 
 [health_check]
 interval_seconds = 30
 timeout_seconds  = 5
+# 一个 key 连续失败多少次后被标记为坏 key（移出主轮询、转后台恢复探测）。
 max_consecutive_failures = 3
 
 [observability]
 enable_metrics = true
 metrics_path   = "/metrics"
+# tracing 日志级别（RUST_LOG 风格）。env var `RUST_LOG` 会覆盖此项。
+#   "error" —— 仅不可恢复内部错误（5 条）
+#   "warn"  —— + 软失败/跳过/限流/冷却/惩罚等异常但可恢复事件（默认生产基线）
+#   "info"  —— + 生命周期事件：监听绑定、配置加载、启动健康检查、
+#              key add/remove、冷却恢复；默认值
+#   "debug" —— + 每请求分流细节：收到请求、代理请求至、上游尝试开始/上游响应、
+#              请求成功完成、模型别名重映射、预 clamp max_tokens、
+#              空壳重试响应，以及 key mark-good。调查误指/重试/限流时临时调 debug。
+# 最全的错误证据（含完整 body 节选、重试原因、上游 URL、脱敏 key）始终另外
+# 写入 failure.log（JSONL），供定期评审项目优化点；它独立于此处 log_level，
+# 永远全量记录失败。failure.log 路径/轮转/禁用由独立 env var 控制：
+#   FAILURE_LOG_PATH         —— 文件路径，默认 ./failure.log
+#   FAILURE_LOG_MAX_BYTES    —— 达到该大小则轮转（rename 加 .1 后缀）；0 = 无限
+#   FAILURE_LOG_DISABLE       —— 设了就完全跳过写入（测试/CI 用）
 log_level      = "info"
 
 [retry]
-# 上游（NVIDIA）认证重试策略。
-# 只有*不带* `Retry-After` 的 401 会触发向另一个健康 key 的指数 backoff 重试。
-# 429/403（以及带 `Retry-After` 的 401）不重试：它们是上游确定性决策，换 key
-# 重试只会烧光整个池子。带有 `Retry-After` 的值会把对应 key 冷却；否则把响应
-# 原样透传给 client。
+# 上游（NVIDIA）认证重试策略。只有*不带* `Retry-After` 的 401 会触发向另一
+# 个健康 key 的指数 backoff 重试。429/403（以及带 `Retry-After` 的 401）不重
+# 试：它们是上游确定性决策，换 key 重试只会烧光整个池子。带 `Retry-After`
+# 的值会把对应 key 冷却；否则把响应原样透传给 client。
 max_retries           = 3      # 每个 client 请求的重试次数（不含首次）
 backoff_base_ms       = 200    # 首次重试约睡 backoff_base_ms
 backoff_max_ms        = 2000   # 单次 backoff 上限
@@ -124,17 +243,26 @@ auth_fail_threshold   = 3      # 连续认证失败多少次就禁用 key
 # 与 `max_retries`（上游 401 的重试预算）解耦。默认等于 `max_retries`。
 max_key_switches       = 3
 
-# 代理本身的前置鉴权。池子背后承载的 NVIDIA 配额对任何能访问到
-# `listen_addr` 的人开放；开启后，client 在 /v1/* 请求上必须带
-# `Authorization: Bearer <bearer_token>`。默认关闭，以保留现有 client 依赖的
-# "任意 api_key 都能用" 行为。/health 始终豁免。
+# ── 代理自身的前置鉴权 ────────────────────────────────────────────────────────
+# 池子背后承载的 NVIDIA 配额对任何能访问到 `listen_addr` 的人开放；开启后，
+# client 在 /v1/* 请求上必须带 `Authorization: Bearer <bearer_token>`。默认
+# 关闭，以保留现有 client 依赖的 "任意 api_key 都能用" 行为。/health 始终
+# 豁免。环境变量覆盖：NVIDIA_AUTH_ENABLED。
 [auth]
 enabled       = false
-bearer_token  = ""      # client 的 bearer token；也用 NVIDIA_AUTH_BEARER_TOKEN
-admin_token   = ""      # 保护 /admin/*；也用 NVIDIA_AUTH_ADMIN_TOKEN
-                        # 留空时管理 API 完全禁用（404）
+# client 必须出示的 Bearer token；也用 NVIDIA_AUTH_BEARER_TOKEN 覆盖。
+bearer_token  = ""
+# 保护 /admin/*（key 增删 / 状态查看）；也用 NVIDIA_AUTH_ADMIN_TOKEN 覆盖。
+# 留空时整个管理 API 被藏起来（404），无法被探测；故意不用 not_found()。
+admin_token   = ""
 
+# ── 客户端可见模型名 → NVIDIA 适用模型 id 映射 ────────────────────────────────
+# 当 chat-completion 请求携带的 `model` 命中这里的某个 key 时，代理会在转
+# 发前把该字段改写为映射值；未命中的名字原样转发。默认为空。
+#
+# 用例：当你的 client（cc-switch, Cursor, OpenAI SDK, …）发出 NVIDIA NIM 上
+# 不存在的 OpenAI 风格模型名时，例如：
 [model_aliases]
-#   "z-ai/glm-5.2"        = "z-ai/glm-5.2"
-#   "gpt-4o"              = "meta/llama-3.1-405b-instruct"
-#   "gpt-4o-mini"         = "meta/llama-3.1-70b-instruct"
+# "claude-opus-4-8"        = "z-ai/glm-5.2"
+# "gpt-4o"              = "meta/llama-3.1-405b-instruct"
+# "gpt-4o-mini"         = "meta/llama-3.1-70b-instruct"

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::Config;
 use crate::metrics::Metrics;
@@ -113,6 +113,40 @@ impl KeyStateHandle {
         guard.fail_count += 1;
     }
 
+    /// 单次写锁内完成 `mark_failure` 的全部状态变更：递增失败计数、（若未到
+    /// 阈值且非 Disabled）权重减半、在达到阈值时转 `Disabled`。返回
+    /// `(new_fail_count, already_disabled, disabled_now)`，让调用方在锁外
+    /// 发布 notifier / 做日志，避免在热路径上串行 4 次 async 锁获取。
+    ///
+    /// `disable_after` 即 `Disabled { ready_at }` 的相对时长；由 `KeyPool`
+    /// 从 `config.cooldown.max_seconds` 传入，使本方法不依赖配置句柄。
+    pub async fn record_failure_and_maybe_disable(
+        &self,
+        threshold: u32,
+        disable_after: Duration,
+    ) -> (u32, bool, bool) {
+        let mut guard = self.inner.write().await;
+        guard.fail_count += 1;
+        let fail_count = guard.fail_count;
+        if matches!(guard.state, KeyState::Disabled { .. }) {
+            return (fail_count, true, false);
+        }
+        // 即便没到阈值也把权重减半，这样重试序列里下次 acquire 不太可能再
+        // 选中同一个坏 key。`w.max(1)/2` 保持与旧 `add_weight` 路径一致的
+        // 整数除法语义（w=1 时 delta=0，权重不下穿到 0）。
+        let w = guard.weight as i32;
+        let delta = -(w.max(1) / 2);
+        let nw = w + delta;
+        guard.weight = if nw > 0 { nw as u32 } else { 1 };
+        if fail_count >= threshold {
+            guard.state = KeyState::Disabled {
+                ready_at: Instant::now() + disable_after,
+            };
+            return (fail_count, false, true);
+        }
+        (fail_count, false, false)
+    }
+
     pub async fn reset_fail(&self) {
         let mut guard = self.inner.write().await;
         guard.fail_count = 0;
@@ -136,7 +170,7 @@ impl KeyStateHandle {
     /// 检查某 model 是否已超过熔断阈值。
     pub async fn check_circuit_breaker(&self, model: &str, threshold: u32) -> bool {
         let guard = self.inner.read().await;
-        guard.circuit_breaker_failures.get(model).map_or(false, |c| *c >= threshold)
+        guard.circuit_breaker_failures.get(model).is_some_and(|c| *c >= threshold)
     }
 
     /// 重置某 model 的熔断失败计数。
@@ -200,6 +234,23 @@ pub struct TokenBucket {
     refill_per_sec: f64,
     tokens: Mutex<f64>,
     last_refill: Mutex<Instant>,
+    /// 打分热路径用的"近似"可用令牌快照——以 `f64::to_bits()` 存进一个
+    /// `AtomicU64`。每次我们在 `tokens` Mutex 锁内观察/改动桶的真实令牌数
+    /// 之后，顺手 `store` 一次此值；`approx_available_tokens()` 只做一次
+    /// relaxed atomic load、**不取那两把 async 锁**。
+    ///
+    /// 动机：`acquire_excluding` 在每个上游请求都会对 N 个候选 key 各走一次
+    /// `available_tokens()`，后者内部要 `tokens.lock().await` +
+    /// `last_refill.lock().await` 两次 async 锁（每个都是一次 await 调度点）。
+    /// 在大池（admin 批量灌上千 key）下，每请求 N×2 把锁 + N 个跨线程 await
+    /// 是选择阶段的瓶颈。打分只需要"哪个 key 更满"的粗排，不需要到实时精度，
+    /// 因此给打分一条 relaxed-load 旁路。
+    ///
+    /// 近似值的陈旧性是有界的：它与真实值偏差最多"自上次某条 holder 改动桶
+    /// 起累积的 refill"，且恒夹在 `[0, capacity]`；单调反映"谁更满"，对打分
+    /// 足矣。`try_consume` / `consume_with_timeout` 仍走精确锁路径并原子地扣，
+    /// 限流正确性不依赖此近似值。
+    approx_tokens: std::sync::atomic::AtomicU64,
 }
 
 /// 非阻塞消费尝试的结果。
@@ -210,6 +261,22 @@ pub enum ConsumeError {
 }
 
 impl TokenBucket {
+    fn store_approx(&self, v: f64) {
+        // 夹到容量上限——refill 路径在锁内已夹过，但守住并发写下的数值边界，
+        // 也避免 NaN 的 bits（NaN 在 load 端会还原成 NaN，破坏排序）。
+        let clamped = if v.is_finite() { v.min(self.capacity).max(0.0) } else { self.capacity };
+        self.approx_tokens
+            .store(clamped.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 近似可用令牌数——纯 relaxed atomic load，不取任何 async 锁。供打分
+    /// 热路径使用。值为"最近一次某条持有者观察桶时所留下的快照"，故可能略微
+    /// 滞后于真实 refill 累积值，但恒在 `[0, capacity]`。详细说明见结构体注释。
+    pub fn approx_available_tokens(&self) -> f64 {
+        let bits = self.approx_tokens.load(std::sync::atomic::Ordering::Relaxed);
+        f64::from_bits(bits)
+    }
+
     pub fn new(capacity: u32, refill_per_sec: f64) -> Self {
         let cap = capacity as f64;
         Self {
@@ -217,6 +284,7 @@ impl TokenBucket {
             refill_per_sec,
             tokens: Mutex::new(cap), // 起始即满
             last_refill: Mutex::new(Instant::now()),
+            approx_tokens: std::sync::atomic::AtomicU64::new(cap.to_bits()),
         }
     }
 
@@ -239,6 +307,7 @@ impl TokenBucket {
         let mut toks = self.tokens.lock().await;
         let mut last = self.last_refill.lock().await;
         self.refill_locked(&mut toks, &mut last);
+        self.store_approx(*toks);
         *toks
     }
 
@@ -257,6 +326,7 @@ impl TokenBucket {
         self.refill_locked(&mut toks, &mut last);
         if *toks >= tokens {
             *toks -= tokens;
+            self.store_approx(*toks);
             return Ok(());
         }
         Err(ConsumeError::NotEnough)
@@ -284,6 +354,7 @@ impl TokenBucket {
                 self.refill_locked(&mut toks, &mut last);
                 if *toks >= tokens {
                     *toks -= tokens;
+                    self.store_approx(*toks);
                     return Ok(());
                 }
                 let need = tokens - *toks;
@@ -304,6 +375,7 @@ impl TokenBucket {
                     self.refill_locked(&mut toks, &mut last);
                     if *toks >= tokens {
                         *toks -= tokens;
+                        self.store_approx(*toks);
                         return Ok(());
                     }
                     return Err(ConsumeError::NotEnough);
@@ -334,9 +406,11 @@ impl TokenBucket {
             if added > 0.0 {
                 *toks = (*toks + added).min(self.capacity);
                 *last = now;
+                self.store_approx(*toks);
             }
             if *toks >= tokens {
                 *toks -= tokens;
+                self.store_approx(*toks);
                 return Ok(());
             }
             // 令牌不足；释放锁，睡到预计凑够的时刻。
@@ -448,18 +522,23 @@ impl KeyPool {
         for handle in handles {
             // 跳过调用方显式排除的 key（本请求已试过）。identity 是共享的
             // `inner` Arc 指针，在句柄克隆之间保持稳定。
-            if !exclude_hashes.is_empty() {
-                if exclude_hashes.contains(&handle.identity()) {
+            if !exclude_hashes.is_empty()
+                && exclude_hashes.contains(&handle.identity()) {
                     continue;
                 }
-            }
             let guard = handle.inner.read().await;
             let is_active = matches!(guard.state, KeyState::Active);
             if !is_active {
                 continue;
             }
             // 在读锁内计算打分，以尽量减少锁竞争。
-            let available = guard.bucket.available_tokens().await;
+            //
+            // 打分用近似的可用令牌（`approx_available_tokens`，一次 relaxed
+            // atomic load），**不**取 `TokenBucket` 内部那两把 async 锁。打分
+            // 只需要"哪个 key 更满"的粗排，近似快照足矣；精确令牌消费路径
+            //（`try_consume_token`）独立保证限流正确性。在大池下这把每请求的
+            // N×2 把锁降到 N 次 relaxed load。
+            let available = guard.bucket.approx_available_tokens();
             let capacity = guard.bucket.capacity;
             let in_flight = handle.in_flight.load(std::sync::atomic::Ordering::Relaxed) as f64;
             let w = guard.weight as f64;
@@ -548,46 +627,36 @@ impl KeyPool {
     /// 周期 —— 这是我们为不在每次错误响应上串行 N 次锁获取而做的有意权衡。
     /// `main.rs` 在启动时也会调用一次 `refresh_metrics()`。
     pub async fn mark_failure(&self, key_str: &str, threshold: u32) -> bool {
-        let read_guard = self.inner.read().await;
-        if let Some(handle) = read_guard.get(key_str) {
-            let handle = handle.clone();
-            drop(read_guard);
-            handle.increment_fail().await;
-            let fail_count = handle.fail_count().await;
-            let already_disabled = matches!(handle.state().await, KeyState::Disabled { .. });
-            if already_disabled {
-                // 已禁用；无需再做什么（权重已是 1）。
-                return true;
-            }
-            // 即便没到阈值也把权重减半，这样下一次加权随机的 `acquire()`
-            // 在一个重试序列内不太可能再选中同一个坏 key。修复"重试在同一个坏
-            // key 上浪费一次尝试"的问题。
-            {
-                let w = handle.weight().await as i32;
-                let delta = -(w.max(1) / 2);
-                handle.add_weight(delta).await;
-            }
-            if fail_count >= threshold {
-                let ready_at =
-                    Instant::now() + Duration::from_secs(self.config.cooldown.max_seconds);
-                handle.set_state(KeyState::Disabled { ready_at }).await;
-                warn!(
-                    key = %mask_key(key_str),
-                    fail_count,
-                    threshold,
-                    "连续 {} 次鉴权失败后禁用该 key；等待健康探测或过期恢复",
-                    fail_count
-                );
-                let _ = self.pub_notifier.send(handle);
-                return true;
-            }
+        let handle = {
+            let read_guard = self.inner.read().await;
+            read_guard.get(key_str).cloned()
+        };
+        let Some(handle) = handle else { return false };
+        // 单次写锁内完成 increment + halve-weight + 按 threshold 转 Disabled。
+        let disable_after = Duration::from_secs(self.config.cooldown.max_seconds);
+        let (fail_count, already_disabled, disabled_now) =
+            handle.record_failure_and_maybe_disable(threshold, disable_after).await;
+        if already_disabled {
+            // 已禁用；无需再做什么（权重已是 1）。
+            return true;
+        }
+        if disabled_now {
+            let _ = self.pub_notifier.send(handle);
             warn!(
                 key = %mask_key(key_str),
                 fail_count,
                 threshold,
-                "记录一次非限流鉴权失败（尚未禁用）",
+                "连续 {} 次鉴权失败后禁用该 key；等待健康探测或过期恢复",
+                fail_count
             );
+            return true;
         }
+        warn!(
+            key = %mask_key(key_str),
+            fail_count,
+            threshold,
+            "记录一次非限流鉴权失败（尚未禁用）",
+        );
         false
     }
 
@@ -651,7 +720,7 @@ impl KeyPool {
             handle.reset_weight().await;
             handle.reset_fail().await;
             handle.reset_all_circuit_breakers().await; // 成功时也重置熔断器
-            info!(key = %mask_key(key_str), "将 key 标记为正常（active）");
+            debug!(key = %mask_key(key_str), "将 key 标记为正常（active）");
             let _ = self.pub_notifier.send(handle);
         }
         // gauge 刷新推迟到 cool_down_task（参见 mark_failure 的说明）。
@@ -867,12 +936,17 @@ impl KeyPool {
     /// 把冷却中的 key 在到期时重新转回 active 的后台任务。`stop` 是一个
     /// 用于优雅停机信号的 Notify。
     ///
-    /// 本任务目前复用 `health_check.interval_seconds` 作为扫描周期。日后若
-    /// 两个周期需要分开，再加一个专用的 `cooldown.interval_seconds` 字段。
+    /// 扫描周期取 `cooldown.scan_interval_seconds`（默认 5s），使其与
+    /// `health_check.interval_seconds`（默认 30s）解耦——冷却的 ready_at 已过
+    /// 后最多多这一个扫描周期才被发现，独立于健康检查周期。该值为 0 时回退到
+    /// 旧行为：用 `health_check.interval_seconds` 作扫描周期。
     pub async fn cool_down_task(self: Arc<Self>, stop: Arc<tokio::sync::Notify>) {
-        let mut interval = tokio::time::interval(Duration::from_secs(
-            self.config.health_check.interval_seconds,
-        ));
+        let scan_secs = if self.config.cooldown.scan_interval_seconds > 0 {
+            self.config.cooldown.scan_interval_seconds
+        } else {
+            self.config.health_check.interval_seconds
+        };
+        let mut interval = tokio::time::interval(Duration::from_secs(scan_secs));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
@@ -960,6 +1034,7 @@ mod retry_state_machine_tests {
             cooldown: CooldownConfig {
                 base_seconds: 1,
                 max_seconds: 2,
+                scan_interval_seconds: 5,
             },
             health_check: HealthCheckConfig {
                 interval_seconds: 1,
@@ -1017,6 +1092,46 @@ mod retry_state_machine_tests {
         let handle = pool.inner.read().await.get("k1").cloned().unwrap();
         assert_eq!(handle.state().await, KeyState::Active);
         assert_eq!(handle.fail_count().await, 2);
+    }
+
+    #[tokio::test]
+    async fn record_failure_and_maybe_disable_halves_weight_floor_one() {
+        // P2：合并写锁路径下，weight 不会减穿到 0，且重复 mark_failure（高阈值）
+        // 反复减半最终稳定在 1。
+        let pool = build_pool(&["k1"]);
+        let handle = pool.inner.read().await.get("k1").cloned().unwrap();
+        // 先把权重抬到 8，模拟 acquire 加分路径的累积，便于观察减半。
+        handle.add_weight(7).await;
+        assert_eq!(handle.weight().await, 8);
+        // 5 次失败、阈值 100 → 永不禁用，仅减半：8→4→2→1→1→1。
+        for _ in 0..5 {
+            let _ = pool.mark_failure("k1", 100).await;
+        }
+        assert_eq!(
+            handle.weight().await,
+            1,
+            "weight must floor at 1 after repeated halving"
+        );
+        assert!(matches!(handle.state().await, KeyState::Active));
+        assert_eq!(handle.fail_count().await, 5);
+    }
+
+    #[tokio::test]
+    async fn record_failure_and_maybe_disable_already_disabled_is_idempotent() {
+        // 已 Disabled 的 key 再次 mark_failure：计数仍递增，但权重/状态不动，
+        // 且返回 true（语义 = “该次仍落在被禁用 key 上”）。
+        let pool = build_pool(&["k1", "k2"]);
+        for _ in 0..3 {
+            pool.mark_failure("k1", 3).await;
+        }
+        let handle = pool.inner.read().await.get("k1").cloned().unwrap();
+        assert!(matches!(handle.state().await, KeyState::Disabled { .. }));
+        assert_eq!(handle.fail_count().await, 3);
+        // 再来一次：返回 true、fail_count++、状态不变。
+        let again = pool.mark_failure("k1", 3).await;
+        assert!(again, "already-disabled key must report true");
+        assert_eq!(handle.fail_count().await, 4);
+        assert!(matches!(handle.state().await, KeyState::Disabled { .. }));
     }
 
     #[tokio::test]
@@ -1133,6 +1248,7 @@ mod score_selection_tests {
             cooldown: CooldownConfig {
                 base_seconds: 1,
                 max_seconds: 2,
+                scan_interval_seconds: 5,
             },
             health_check: HealthCheckConfig {
                 interval_seconds: 1,
@@ -1231,6 +1347,63 @@ mod score_selection_tests {
         // 第二次消费用很短的超时必须返回 false（无补充）。
         let got = handle.try_consume_token(10).await;
         assert!(!got, "must time out when bucket stays empty");
+        handle.dec_in_flight();
+    }
+
+    /// 近似可用令牌（`approx_available_tokens`）必须在每次成功消费后立刻下降，
+    /// 且不必取 `TokenBucket` 内部那两把 async 锁（一次 relaxed atomic load 即可）。
+    /// 这是 P1 给打分热路径开的旁路；此测试锁定其不变式：① 初始 == capacity（`new`
+    /// store 了 cap 的 bits）；② 消费两次后严格下降；③ 与精确 `available_tokens()`
+    /// 在同一读锁快照下一致（近似值正是每个精确路径在锁内 store 的那个值）。
+    /// 注意 `make_handle` 把 `qps_per_key=0` 强制成 `1.0`（桶永远会补充），
+    /// 故不做"恰好 == capacity-2"的精确断言——只断言单调下降 + 与精确值一致。
+    #[tokio::test]
+    async fn approx_tokens_track_consumption_without_async_locks() {
+        let pool = build_pool_with_keys(&["k1"], 0.0, 10);
+        let handle = pool.acquire().await.expect("key acquired");
+        let h_inner = pool.inner.read().await.get("k1").cloned().unwrap();
+        // 近似初始 == capacity（new 里 store 了 cap 的 bits）。
+        let approx0 = {
+            let g = h_inner.inner.read().await;
+            g.bucket.approx_available_tokens()
+        };
+        assert!((approx0 - 10.0).abs() < 1e-9, "approx starts at capacity: {}", approx0);
+
+        // 消费两个令牌（try_consume_token 硬编码消费 1.0；循环两次）。
+        assert!(handle.try_consume_token(0).await, "consume 1");
+        assert!(handle.try_consume_token(0).await, "consume 2");
+        let approx1 = {
+            let g = h_inner.inner.read().await;
+            g.bucket.approx_available_tokens()
+        };
+        assert!(
+            approx1 < approx0,
+            "approx must strictly decrease after consumption: {} -> {}",
+            approx0, approx1
+        );
+        // 近似值必须落在合理区间内：消费了 2 个令牌，桶 1/s 补充，耗时 < 0.1s 间
+        // 不会补超过 0.1，所以近似应 < 9（充分宽松，只锁单调性 + 数量级）。
+        assert!(
+            approx1 < 9.0 && approx1 > 6.0,
+            "approx should be ~8 after consuming 2 of 10: got {}",
+            approx1
+        );
+        // 精确 `available_tokens()`（会做同步补充 + store 近似）在本次读取后应与
+        // 重新 load 的近似一致。
+        let h_inner2 = pool.inner.read().await.get("k1").cloned().unwrap();
+        let exact = {
+            let g = h_inner2.inner.read().await;
+            g.bucket.available_tokens().await
+        };
+        let approx_after_exact = {
+            let g = h_inner2.inner.read().await;
+            g.bucket.approx_available_tokens()
+        };
+        assert!(
+            (exact - approx_after_exact).abs() < 1e-9,
+            "approx must equal last store(newest exact after available_tokens): exact={}, approx={}",
+            exact, approx_after_exact
+        );
         handle.dec_in_flight();
     }
 
@@ -1380,6 +1553,7 @@ mod runtime_key_tests {
             cooldown: CooldownConfig {
                 base_seconds: 1,
                 max_seconds: 2,
+                scan_interval_seconds: 5,
             },
             health_check: HealthCheckConfig {
                 interval_seconds: 1,

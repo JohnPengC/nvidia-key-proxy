@@ -68,10 +68,7 @@ fn ensure_open() {
             Ok(f) => {
                 // 把计数器起点设为当前文件大小（仅当开启轮转时），这样一个
                 // 本就很大的文件会在下一次写入就轮转，而不是忽略已有字节。
-                let written = match f.metadata().map(|m| m.len()) {
-                    Ok(len) => len,
-                    Err(_) => 0,
-                };
+                let written = f.metadata().map(|m| m.len()).unwrap_or_default();
                 *guard = Some(RotationState {
                     file: f,
                     written,

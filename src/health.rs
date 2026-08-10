@@ -1,4 +1,5 @@
 use reqwest::StatusCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, info, warn};
@@ -17,6 +18,11 @@ pub struct HealthChecker {
     /// 而不是永远等待冷却计时器。成功探测后重置为 0。
     probe_failures: std::sync::Mutex<std::collections::HashMap<String, usize>>,
     client: reqwest::Client,
+    /// 启动健康检查已完成的读门。`run_startup` 在退出前（无论成功与否）把它
+    /// 置 true；`/health` 路由在它为 false 时返回 503、为 true 后返回 204。这让
+    /// 负载均衡器/探针能在代理尚未对池做完一次初始清点时把它摘掉，而不是在
+    /// 启动期把流量打到尚未验证的 key 上。
+    ready: Arc<AtomicBool>,
 }
 
 impl HealthChecker {
@@ -26,6 +32,7 @@ impl HealthChecker {
         interval_seconds: u64,
         timeout_seconds: u64,
         max_consecutive_failures: usize,
+        ready: Arc<AtomicBool>,
     ) -> Self {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(timeout_seconds))
@@ -39,7 +46,13 @@ impl HealthChecker {
             max_failures: max_consecutive_failures,
             probe_failures: std::sync::Mutex::new(std::collections::HashMap::new()),
             client,
+            ready,
         }
+    }
+
+    /// `/health` 路由查询此值：启动健康检查完成前为 false。
+    pub fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::Relaxed)
     }
 
     /// 启动时跑一次，检查所有 key。
@@ -48,6 +61,10 @@ impl HealthChecker {
         if let Err(e) = self.check_all_keys().await {
             error!("启动健康检查失败：{}", e);
         }
+        // 无论本轮成功还是出错，启动清点都已结束 —— 让 `/health` 放行。出错时
+        // 不阻塞就绪：`check_all_keys` 自己的错误已记日志、每个 key 的状态保持
+        // 不变（见其分支），池子仍可正常服务，只是没拿到启动期的探测信号。
+        self.ready.store(true, Ordering::Relaxed);
     }
 
     /// 周期性地只检查坏（冷却中）的 key，看它们是否已恢复。
@@ -125,6 +142,12 @@ impl HealthChecker {
     /// * 成功 → 恢复 key（`mark_good` / `recover_disabled`）并重置其连续探测错误计数。
     /// * 非 2xx → 不算定性（NVIDIA 的 `/v1/models` 对一个完全有效的 key 也可能
     ///   403/401），交给冷却计时器；错误计数不动。
+    ///   **注**：一个因 429（不带 Retry-After）被短冷却的 key 也走这条路径
+    ///   （见 `Proxy::process_upstream_attempt` 的不重试分支）：探测期若上游仍在
+    ///   限流，`/v1/models` 也回 429 → 非 2xx → 不重置也不递增。但它不依赖探测
+    ///   回来——`cool_down_task` 会在其 `ready_at`（`cooldown.base_seconds`）到期
+    ///   后无探测 `reactivate_after_cooldown` 把它转回 active。探测一旦成功则提前
+    ///   `mark_good`。两条自愈路径都不会卡死。
     /// * 探测*出错*（网络/超时）→ 递增连续错误计数。一旦达到 `max_failures`
     ///   就强制禁用 key，避免一个长期不可达的 key 永远在冷却里循环。
     ///   `max_failures` 为 0 关闭此行为。
