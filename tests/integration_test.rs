@@ -1,15 +1,15 @@
 use nvidia_key_proxy::*;
 use warp::test::request;
 
-// Ensure integration tests never write to the on-disk failure.log used for
-// production diagnosis. `std::env::set_var` is process-global and safe here
-// because tests run in one process; the Once guard avoids redundant writes.
+// 确保集成测试绝不写入用于生产诊断的 on-disk failure.log。
+// `std::env::set_var` 是进程全局的、这里安全，因为测试跑在单进程里；
+// Once guard 避免重复写入。
 static DISABLE_FAILURE_LOG: std::sync::Once = std::sync::Once::new();
 
 fn test_config() -> Config {
     DISABLE_FAILURE_LOG.call_once(|| {
-        // SAFETY: tests run in one process; the env var is process-global
-        // and only guards failure-log writes.
+        // SAFETY：测试跑在单进程里；该环境变量是进程全局的，且只守护
+        // failure-log 写入。
         unsafe {
             std::env::set_var("FAILURE_LOG_DISABLE", "1");
         }
@@ -131,8 +131,7 @@ async fn unknown_path_returns_404() {
 
 #[tokio::test]
 async fn non_v1_path_returns_404_not_forwarded() {
-    // Paths outside the /v1/ namespace must be rejected by the route guard
-    // and never forwarded upstream.
+    // /v1/ 命名空间之外的路径必须被路由 guard 拒绝，绝不透传到上游。
     let state = AppState::new(test_config());
     let filter = build_routes(&state);
     let resp = request()
@@ -169,9 +168,8 @@ async fn v1_path_is_forwarded_to_upstream() {
 
 fn test_config_with_auth(enabled: bool, bearer: &str, admin: &str) -> Config {
     let mut cfg = test_config();
-    // Point at a refused local port so the forwarded attempt fails fast
-    // instead of hanging on a real DNS lookup. `allow_local_base_url`
-    // bypasses the localhost validation for this test only.
+    // 指向一个被拒的本地端口，让转发尝试快速失败，而不是卡在真实 DNS 查询
+    // 上。`allow_local_base_url` 仅在本测试里绕过 localhost 校验。
     cfg.allow_local_base_url = true;
     cfg.base_url = "http://127.0.0.1:1".to_string();
     cfg.auth.enabled = enabled;
@@ -182,7 +180,7 @@ fn test_config_with_auth(enabled: bool, bearer: &str, admin: &str) -> Config {
 
 #[tokio::test]
 async fn admin_api_hidden_when_token_unset() {
-    // Default test_config has no admin_token → admin surface must 404.
+    // 默认 test_config 没有 admin_token → 管理面必须 404。
     let state = AppState::new(test_config());
     let filter = build_routes(&state);
     let resp = request()
@@ -200,7 +198,7 @@ async fn admin_keys_list_and_add_and_remove() {
     let state = AppState::new(cfg);
     let filter = build_routes(&state);
 
-    // List (initially one key from test_config: "dummy_key").
+    // 列出（初始有一个来自 test_config 的 key："dummy_key"）。
     let resp = request()
         .method("GET")
         .path("/admin/keys")
@@ -211,7 +209,7 @@ async fn admin_keys_list_and_add_and_remove() {
     let list: serde_json::Value = serde_json::from_slice(resp.body()).unwrap();
     assert!(list.as_array().unwrap().len() >= 1);
 
-    // Add a new key.
+    // 加一个新 key。
     let resp = request()
         .method("POST")
         .path("/admin/keys")
@@ -223,7 +221,7 @@ async fn admin_keys_list_and_add_and_remove() {
     let body: serde_json::Value = serde_json::from_slice(resp.body()).unwrap();
     assert_eq!(body["added"].as_array().unwrap().len(), 1);
 
-    // Remove it.
+    // 删掉它。
     let resp = request()
         .method("DELETE")
         .path("/admin/keys/nvapi-newkey-12345678")
@@ -234,7 +232,7 @@ async fn admin_keys_list_and_add_and_remove() {
     let v: serde_json::Value = serde_json::from_slice(resp.body()).unwrap();
     assert_eq!(v["removed"].as_bool(), Some(true));
 
-    // Admin auth required: missing token → 401.
+    // 需要 admin 鉴权：缺 token → 401。
     let resp = request()
         .method("GET")
         .path("/admin/keys")
@@ -243,11 +241,11 @@ async fn admin_keys_list_and_add_and_remove() {
     assert_eq!(resp.status(), 401);
 }
 
-/// Regression: admin POST /admin/keys must reject an oversized body with 413.
-/// `warp::body::json()` has no default size limit, so without the explicit
-/// `content_length_limit(1 MiB)` on the route an authenticated caller pasting a
-/// huge key file could OOM the process or drive pathological lock churn in
-/// `add_keys_batch`. With the cap, a 4 MiB body never reaches json() at all.
+/// 回归：管理 POST /admin/keys 必须以 413 拒绝超大的 body。
+/// `warp::body::json()` 默认无大小限制，所以路由上若没有显式
+/// `content_length_limit(1 MiB)`，一个粘了巨型 key 文件的已认证调用方就能
+/// 把进程 OOM、或在 `add_keys_batch` 里制造病态锁抖动。有了上限，4 MiB 的
+/// body 根本到不了 json()。
 #[tokio::test]
 async fn admin_keys_add_rejects_oversized_body() {
     let mut cfg = test_config();
@@ -255,9 +253,9 @@ async fn admin_keys_add_rejects_oversized_body() {
     let state = AppState::new(cfg);
     let filter = build_routes(&state);
 
-    // A 4 MiB body: one JSON string of ~4 MiB valid JSON chars (each key
-    // short enough to pass add_keys_batch's length check — but we never get
-    // there; content_length_limit rejects first).
+    // 一个 4 MiB body：单个约 4 MiB 合法 JSON 字符的 JSON 串（每个 key 短到能
+    // 过 add_keys_batch 的长度校验——但我们到不了那；content_length_limit 先
+    // 拒）。
     let huge = "x".repeat(4 * 1024 * 1024);
     let body = format!(r#"["{}"]"#, huge);
     let resp = request()
@@ -284,7 +282,7 @@ async fn front_door_auth_enforced() {
     let state = AppState::new(cfg);
     let filter = build_routes(&state);
 
-    // No token → 401.
+    // 无 token → 401。
     let resp = request()
         .method("POST")
         .path("/v1/chat/completions")
@@ -294,7 +292,7 @@ async fn front_door_auth_enforced() {
         .await;
     assert_eq!(resp.status(), 401);
 
-    // Wrong token → 401.
+    // 错 token → 401。
     let resp = request()
         .method("POST")
         .path("/v1/chat/completions")
@@ -305,8 +303,8 @@ async fn front_door_auth_enforced() {
         .await;
     assert_eq!(resp.status(), 401);
 
-    // Correct token → passes through the auth gate (then 404 from upstream
-    // since there is no mock; the point is the proxy gate accepted it).
+    // 正确 token → 过鉴权门（之后因无 mock 会从上游拿 404；重点是代理门
+    // 放行了它）。
     let resp = request()
         .method("POST")
         .path("/v1/chat/completions")

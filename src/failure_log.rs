@@ -1,27 +1,23 @@
-//! Structured failure logging — mirrors non-2xx upstream outcomes and
-//! internal proxy errors to a dedicated JSONL file (`failure.log` next to
-//! the binary's CWD by default, overridable via `FAILURE_LOG_PATH` env var).
+//! 结构化失败日志——把非 2xx 上游结果与代理内部错误镜像到一份专门的
+//! JSONL 文件（默认在二进制 CWD 旁的 `failure.log`，可用 `FAILURE_LOG_PATH`
+//! 环境变量覆盖）。
 //!
-//! Each line is one JSON object. Designed for `jq` group-by queries so the
-//! user can quickly answer "how many 404 / 403 hit which models on which
-//! keys in the last hour". The main tracing log stream stays unchanged;
-//! this is a separate, failure-only channel.
+//! 每行一个 JSON 对象。设计上配合 `jq` 做 group-by 查询，让人能快速回答
+//! "过去一小时里有多少 404 / 403 落到哪些 key 的哪些 model 上"。主 tracing
+//! 日志流保持不变；这是一条独立的、只记失败的旁路。
 //!
-//! Fields kept stable across versions:
+//! 跨版本保持稳定的字段：
 //!   ts, req_id, client_req_id, endpoint, method, model, key, status,
 //!   category, detail, body_excerpt, body_summary, upstream_url,
 //!   retry_attempt, retry_reason, error_kind
 //!
-//! Rotation: the file grows unbounded unless `FAILURE_LOG_MAX_BYTES` is set
-//! (a byte ceiling on the *current* file). When a written line would push
-//! the current file past the limit, the existing file is rolled to
-//! `<path>.<unix-secs>` and a fresh file is opened before the line is
-//! written. 0/disabled (the default) keeps the append-only behavior the
-//! tuning history in README assumes. For a no-restart rotation policy,
-//! pair `FAILURE_LOG_MAX_BYTES` with an external `logrotate` using
-//! `copytruncate` (the in-process handle flushes per line and survives
-//! truncation), or rely on the built-in roll above. Archived files are
-//! not compressed or pruned by this process — manage retention externally.
+//! 轮转：文件默认无限增长，除非设了 `FAILURE_LOG_MAX_BYTES`（对*当前*
+//! 文件的字节上限）。当某行写入会让当前文件超过上限时，先把现有文件 rollover
+//! 到 `<path>.<unix-secs>`，再开新文件写入该行。0/不设（默认）则保持
+//! README 里调优历史所依赖的 append-only 旧行为。要做不停机轮转策略，
+//! 把 `FAILURE_LOG_MAX_BYTES` 配合外部 `logrotate` 用 `copytruncate`
+//!（进程内 handle 每行 flush、能扛截断），或靠上面的内置 roll。归档文件
+//! 本进程不压缩、不清理——保留期限请外部管理。
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -32,16 +28,15 @@ use serde_json::{json, Value};
 
 use crate::key_pool::mask_key;
 
-/// One global file handle guarded by a Mutex, plus a byte counter for the
-/// current file so we can rotate at `FAILURE_LOG_MAX_BYTES`. Writes are short
-/// (single JSON line) so contention is negligible; we never hold the lock
-/// across await.
+/// 一个由 Mutex 守护的全局文件 handle，外加当前文件的字节计数，用于在
+/// `FAILURE_LOG_MAX_BYTES` 处轮转。写入很短（单行 JSON），竞争可忽略；
+/// 从不跨 await 持锁。
 struct RotationState {
     file: File,
-    /// Bytes written to the *current* open file. Reset on rotation.
+    /// 写到*当前*打开文件的字节数。轮转时重置。
     written: u64,
-    /// Parsed `FAILURE_LOG_MAX_BYTES`. Captured at ensure_open time so a
-    /// mid-process env change doesn't take effect (config snapshot).
+    /// 解析后的 `FAILURE_LOG_MAX_BYTES`。在 ensure_open 时抓取快照，避免进
+    /// 程中途改环境变量生效（配置快照）。
     max_bytes: u64,
 }
 static FAILURE_FILE: Mutex<Option<RotationState>> = Mutex::new(None);
@@ -50,8 +45,8 @@ fn log_path() -> String {
     std::env::var("FAILURE_LOG_PATH").unwrap_or_else(|_| "failure.log".to_string())
 }
 
-/// `FAILURE_LOG_MAX_BYTES` ceiling on the current file. 0 = disabled
-/// (append unbounded — legacy behavior). Read once at open time.
+/// `FAILURE_LOG_MAX_BYTES` 对当前文件的上限。0 = 关闭（无限 append——旧行
+/// 为）。打开时读取一次。
 fn max_bytes_setting() -> u64 {
     std::env::var("FAILURE_LOG_MAX_BYTES")
         .ok()
@@ -60,11 +55,10 @@ fn max_bytes_setting() -> u64 {
 }
 
 fn ensure_open() {
-    // `unwrap_or_else(|p| p.into_inner())` survives a poisoned mutex — if a
-    // prior write panicked (it never should on this path, but a panic during
-    // `writeln!`/`flush` from a broken fd would do it), we still want the
-    // failure-log channel to keep writing rather than cascade-panic every
-    // subsequent failure record.
+    // `unwrap_or_else(|p| p.into_inner())` 能扛中毒的 mutex——如果之前某次
+    // 写入 panic（这条路径本不该 panic，但 `writeln!`/`flush` 在 fd 损坏时
+    // 确实可能 panic），我们仍希望失败日志通道继续写，而不是把之后每条
+    // 失败记录都级联 panic 掉。
     let mut guard = FAILURE_FILE
         .lock()
         .unwrap_or_else(|p| p.into_inner());
@@ -72,9 +66,8 @@ fn ensure_open() {
         let path = log_path();
         match OpenOptions::new().create(true).append(true).open(&path) {
             Ok(f) => {
-                // Start the counter at the current file size (only when
-                // rotation is enabled) so an already-large file rotates on the
-                // very next write rather than ignoring existing bytes.
+                // 把计数器起点设为当前文件大小（仅当开启轮转时），这样一个
+                // 本就很大的文件会在下一次写入就轮转，而不是忽略已有字节。
                 let written = match f.metadata().map(|m| m.len()) {
                     Ok(len) => len,
                     Err(_) => 0,
@@ -86,26 +79,25 @@ fn ensure_open() {
                 });
             }
             Err(e) => {
-                eprintln!("failure_log: cannot open {}: {}", path, e);
-                // Leave None — write_failure becomes a no-op.
+                eprintln!("failure_log: 无法打开 {}：{}", path, e);
+                // 留 None——write_failure 变成 no-op。
             }
         }
     }
 }
 
-/// Generate a short, monotonic-ish request id: unix seconds + a per-process
-/// counter. Not globally unique, but unique enough to correlate retries
-/// belonging to the same client request within one proxy lifetime.
+/// 生成一个短的、近单调的请求 id：unix 秒数 + per-process 计数。不是全局
+/// 唯一，但在一个代理生命周期内足以把同一 client 请求的重试关联起来。
 fn gen_req_id(counter: u64) -> String {
     let secs = Local::now().timestamp();
     format!("r{:x}_{:x}", secs, counter)
 }
 
-/// Internal entry point. `category` is a short string tag the caller picks
-/// from the set below; everything else is derived from the call site.
+/// 内部入口。`category` 是个短字符串 tag，由调用方从下面那组里挑；其余字段
+/// 都从调用点派生。
 ///
-/// Kept as positional arguments on purpose: each call site already has all
-/// fields in scope and a struct would just move the parameter list elsewhere.
+/// 故意保留位置参数：每个调用点都已经把所有字段放在作用域里，套个 struct
+/// 只是把参数列表挪个地方。
 #[allow(clippy::too_many_arguments)]
 pub fn write_failure(
     method: &str,
@@ -124,9 +116,8 @@ pub fn write_failure(
     client_req_id: &str,
     error_kind: Option<&str>,
 ) {
-    // Test/CI opt-out: when `FAILURE_LOG_DISABLE` is set (any value), writes
-    // are skipped so integration tests don't pollute the on-disk failure.log
-    // used for production diagnosis. Production leaves this unset.
+    // 测试/CI 退出开关：设了 `FAILURE_LOG_DISABLE`（任意值）就跳过写入，
+    // 避免集成测试污染用于生产诊断的 on-disk failure.log。生产环境保持不设。
     if std::env::var("FAILURE_LOG_DISABLE").is_ok() {
         return;
     }
@@ -171,25 +162,23 @@ pub fn write_failure(
         entry["error_kind"] = Value::String(k.to_string());
     }
 
-    // Serialize then append a newline. serde_json::to_string never panics
-    // on our Value shape, but we guard with a terse stderr on the (impossible)
-    // failure path.
+    // 序列化后追加换行。serde_json::to_string 在我们这个 Value 形态下不会
+    // panic，但失败路径（不可能发生）上用一句简短 stderr 兜底。
     match serde_json::to_string(&entry) {
         Ok(line) => {
-            // Rotate before writing this line if it would push the current
-            // file past the ceiling. `max_bytes == 0` disables rotation.
+            // 若这行会让当前文件超过上限，则在写之前先轮转。`max_bytes == 0`
+            // 关闭轮转。
             if rot.max_bytes > 0 && rot.written + (line.len() as u64) + 1 > rot.max_bytes {
                 let path = log_path();
-                // Flush + close the current file, roll it to a timestamped
-                // name, and open a fresh one. All best-effort: a failed roll
-                // falls back to continuing on the same handle so we never
-                // drop the failure record.
+                // flush + 关闭当前文件，roll 到带时间戳的名字，再开新文件。
+                // 全程尽力而为：roll 失败就回退到继续用同一 handle，绝不丢
+                // 失败记录。
                 let _ = rot.file.flush();
                 let stamp = now.timestamp();
                 if let Err(e) = std::fs::rename(&path, format!("{}.{}", path, stamp)) {
-                    eprintln!("failure_log: rename for rotation failed ({}): {}", path, e);
-                    // Could not roll; keep appending to the same handle and
-                    // update `written` so we don't re-attempt every line.
+                    eprintln!("failure_log: 轮转 rename 失败（{}）：{}", path, e);
+                    // 没能 roll；继续往同一 handle append，并更新 `written`，
+                    // 避免每行都重试。
                 } else {
                     match OpenOptions::new().create(true).append(true).open(&path) {
                         Ok(new) => {
@@ -197,10 +186,9 @@ pub fn write_failure(
                             rot.written = 0;
                         }
                         Err(e) => {
-                            eprintln!("failure_log: reopen after rotation failed ({}): {}", path, e);
-                            // `rot.file` still holds the old handle; rename
-                            // of an open file on Unix leaves the fd writing to
-                            // the moved inode, so data is preserved.
+                            eprintln!("failure_log: 轮转后 reopen 失败（{}）：{}", path, e);
+                            // `rot.file` 仍持有旧 handle；Unix 上对已打开文件
+                            // rename 会让 fd 继续写到被移走的 inode，数据不丢。
                         }
                     }
                 }
@@ -210,15 +198,14 @@ pub fn write_failure(
             rot.written += (line.len() as u64) + 1;
         }
         Err(e) => {
-            eprintln!("failure_log: serialize failed: {}", e);
+            eprintln!("failure_log: 序列化失败：{}", e);
         }
     }
 }
 
-/// Extract the `Function '<uuid>': Not found for account '<acct>'` pattern
-/// from an upstream error body. Returns (function_id, account_id) when found,
-/// both empty strings otherwise. We avoid regex to keep this crate-free;
-/// simple substring matching is enough for the known NVIDIA error shape.
+/// 从上游错误 body 里抽 `Function '<uuid>': Not found for account '<acct>'`
+/// 模式。命中则返回 (function_id, account_id)，否则都返回空串。为保持 crate
+/// 依赖零额外，不用 regex；对 NVIDIA 已知的错误形态，简单子串匹配就够。
 pub fn extract_nvidia_function_detail(body: &str) -> (String, String) {
     let mut function_id = String::new();
     let mut account_id = String::new();
