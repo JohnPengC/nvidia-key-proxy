@@ -10,15 +10,18 @@ Client（如 OpenAI 兼容 SDK）用惯常的 `base_url`、`api_key`、`model` �
 
 * **负载均衡**：跨多个 key 分发，规避单 key 限流。
 * **自动限流检测** —— 429/403 触发对应 key 的冷却。
-* **健康检查** —— 后台探测让池子感知坏 key。
-* **可观测性** —— Prometheus 指标 + 结构化 tracing。
+* **健康检查** —— 后台探测让池子感知坏 key；启动健康检查完成前 `/health` 回 503 让 LB 摘除本实例。
+* **可观测性** —— Prometheus 指标 + 结构化 tracing（4 级分流、`log_level` 可配）+ 同步 `failure.log` JSONL 失败证据库。
+* **异步主 tracing 流** —— 经 `tracing_appender::non_blocking` 写出，业务协程非阻塞；`WorkerGuard` 绑在 `async fn main` 栈上活到进程末（Rust 不 drop 进程级 static，放进 static 会吞尾部日志）。`failure.log` 刻意保持同步（不可丢）。
 * **透明使用** —— 下游 client 无需改代码。
 * **安全** —— 真实 key 不出进程；日志脱敏。
 * **并发限制** —— per-model 信号量给并发上游请求数封顶（避免 503 "Worker local total request limit reached"）；排队超时返回 503 带 `Retry-After`。
-* **空壳检测与重试** —— 检测 NVIDIA 带着静默 200 + `usage:null` 的软失败；用钳住的 `max_tokens` + 指数 backoff + 可选上游健康探测重试；per-model 断路器。
+* **空壳检测与重试** —— 检测 NVIDIA 带着静默 200 + `usage:null` 的软失败；用钳住的 `max_tokens` + 指数 backoff + 可选上游健康探测重试；per-(key,model) 断路器（已实现并在 `proxy_circuit_breaker_triggered_total` 计数）。
 * **网络韧性** —— 可配置连接池（idle 超时 90s、connect 超时 5s）、重试抖动（默认 100ms）；网络错误进指标。
 * **流式超时** —— 独立的 `request_timeout_streaming_seconds` 应对长 generation。
 * **max_tokens 校验** —— 在打到 NVIDIA 之前丢掉非法 `max_tokens`（≤0、>100k、非数字、负数字符串）。
+* **413 prompt-token 硬上限**（`request_max_prompt_tokens`，默认 90000）—— estimated prompt ≥ 此值直接 413 拒绝，与空壳不重试软限（`empty_shell_no_retry_prompt_tokens`，同样默认 90000）相等、不留灰带。
+* **管理 API** —— `admin_token` 保护的 `/admin/keys`（GET 列状态 / POST 增 / DELETE 删）。
 
 ## 架构
 
@@ -49,12 +52,14 @@ Client（如 OpenAI 兼容 SDK）用惯常的 `base_url`、`api_key`、`model` �
 | 模块 | 职责 | 技术 |
 |--------|----------------|------|
 | **Config** | 加载 `config.toml` / 环境变量 / CLI。自定义 `Debug` 把 API key 在日志里脱敏。 | `serde` + `toml` + `dotenvy` |
-| **KeyPool** | 维护 `KeyState`（active、cooling、disabled）。提供 `acquire()`、`mark_good()`、`mark_bad()`。Per-model 断路器计数。 | `DashMap`<br>`DashMap<KeyId, KeyState>` |
-| **TokenBucket** | Per-key 限流器（QPS + burst）。 | `async-tokenbucket` 或用 `tokio::time::Interval` 自实现 |
-| **Proxy Handler** | 接 HTTP 请求 → 拿 key → 等 token → 转发 → 更新 key 状态 → 返回响应（流式 SSE 透传）。空壳检测、预钳、带 backoff 重试、per-model 断路器。 | 服务端 `warp`，client 端 `reqwest` |
-| **HealthChecker** | 启动探测 + 周期性坏 key 恢复。更新状态。 | `tokio::task::spawn` 循环 |
-| **Observability** | Prometheus endpoint 在 `metrics_path`（默认 `/metrics`）；tracing 用 `tracing`+`tracing-subscriber`。 | `prometheus`、`tracing` |
-| **Graceful Shutdown** | 监听 SIGINT/SIGTERM，停收新连接、排空在途请求。 | `tokio::signal`、warp 的 graceful shutdown |
+| **KeyPool** | 维护 `KeyState`（active、cooling、disabled）。提供 `acquire()`、`mark_good()`、`mark_bad()`。Per-(key,model) 断路器计数。 | `RwLock<HashMap<KeyId, KeyStateHandle>>` + 每 key 的 `RwLock<InnerKeyState>` + `AtomicU32` in-flight |
+| **TokenBucket** | Per-key 限流器（QPS + burst）。可用桶的近似值用原子快照走快路径，避免 hot loop 取 async 锁。 | 手写：`Mutex<f64>` 真实桶 + `AtomicU64 approx_tokens`（`f64::to_bits`） |
+| **Proxy Handler** | 接 HTTP 请求 → 拿 key → 等 token → 转发 → 更新 key 状态 → 返回响应（流式 SSE 透传）。空壳检测、预钳、带 backoff 重试、per-(key,model) 断路器、413 prompt-token 硬上限、per-model 并发信号量。 | 服务端 `warp`，client 端 `reqwest` |
+| **HealthChecker** | 启动探测 + 周期性坏 key 恢复。更新状态；启动检查完成前把 `/health` 标为 503。 | `tokio::task::spawn` + `AtomicBool health_ready` |
+| **Observability** | Prometheus endpoint 在 `metrics_path`（默认 `/metrics`）；tracing 4 级分流（`observability.log_level`），主流经 `tracing_appender::non_blocking` 异步写出。 | `prometheus`、`tracing`、`tracing-subscriber`、`tracing-appender` |
+| **FailureLog** | 结构化 JSONL 失败日志（`failure.log`），**同步写入**（不向异步 channel 投递）、永远全量记录，独立于 `log_level`。诊治事实库，供定期评审。Env：`FAILURE_LOG_PATH` / `FAILURE_LOG_MAX_BYTES` / `FAILURE_LOG_DISABLE`。 | `std::sync::Mutex` + `writeln!` + `flush` |
+| **Graceful Shutdown** | 监听 SIGINT/SIGTERM，停收新连接、排空在途请求；后台 worker 用 `Notify` 通知停。 | `tokio::signal`、warp 的 graceful shutdown |
+| **Admin API** | `admin_token` 保护的 `/admin/keys`（GET 列状态 / POST 增 / DELETE 删）；未设 token 时整体藏起来返回 404。 | `warp` filter |
 
 ### Key 选取算法
 
@@ -75,9 +80,11 @@ Client（如 OpenAI 兼容 SDK）用惯常的 `base_url`、`api_key`、`model` �
 * 429/403 带 `Retry-After`：冷却该 key `min(Retry-After, cooldown.max_seconds)`。
   403 "Authorization failed"：无视该头、立即冷却。
 * 网络/超时错误：标记 key 为坏（冷却 `cooldown.base_seconds`），换一个 key 重试一次。
-* 健康检查器每 `health_interval` 秒跑一轮：
+* 健康检查器每 `health_check.interval_seconds` 秒跑一轮：
   * 用 `/v1/models` 探测每个 key；成功 → `Active`、失败计数清零。
   * 连续探测失败达 `max_consecutive_failures` → 强制 `Disabled`，直到下次探测成功或冷却到期。
+* **启动健康检查**（`run_startup`）一次性清点池子，完成前置 `GET /health` 回 503（让 LB/探针摘除本实例），就绪后回 204。`cool_down_task` 用独立的 `cooldown.scan_interval_seconds`（默认 5）扫"冷却是否到期"，与 health_check 周期解耦，避免把恢复延迟整整一个扫描间隔。
+* **冷却 × 断路器交叉**：冷却 reactivation 必须清空该 key 的 per-(key,model) 断路器计数（否则 Cool↔空壳振荡）；`mark_bad` 不得缩短一个并发更长的 `ready_at`（保留更长的既有冷却）。
 
 ### 断路器（per key & model）
 
@@ -90,9 +97,11 @@ Client（如 OpenAI 兼容 SDK）用惯常的 `base_url`、`api_key`、`model` �
 1. **配置校验**（`Config::validate`，在 `Config::load` 应用环境变量覆盖后调用）：
    * 拒绝占位 `base_url`（`example.com`、`localhost`、`127.0.0.1`）与无 scheme 的 URL。
    * 拒绝明显是假/太短的 API key（含 `fake`、`dummy`、`test`、`example`、`placeholder`，或短于 8 字符）。
-   * `request_timeout_seconds` 低于 5 秒时告警，因为过激的值在正常 LLM 延迟下会误超时。
+   * `request_timeout_seconds` 或 `request_timeout_streaming_seconds`（>0 时）低于 5 秒告警。
+   * `request_max_prompt_tokens` 严格大于 `empty_shell_no_retry_prompt_tokens`（硬上限 > 软不重试阈值、其间留灰带）告警——灰带会复活"打一发就过但注定空壳 + 误导 502"（默认二者相等 90000）。不阻断启动。
 
-2. 在代理 handler 里、消费 key 之前的**请求体规范化**：
+2. 在代理 handler 里、消费 key 之前还有一层 **413 prompt-token 硬上限**与**请求体规范化**：
+   * estimated prompt ≥ `request_max_prompt_tokens`（默认 90000）→ 立即 413，不拿 key、不打 NVIDIA（要求 client 自行压缩上下文）。
    * `max_tokens`：bool/null/字符串/≤0/>100k → 丢弃；数字字符串强转为 int。上下文窗口算术产生的负值（如 `-14758`）被拦下。
    * `reasoning_effort`：`true`→"high"，`false`/null/非法→丢弃。
    * `model` 若在 `model_aliases` 里则重映射。
@@ -101,10 +110,28 @@ Client（如 OpenAI 兼容 SDK）用惯常的 `base_url`、`api_key`、`model` �
 
 ### 指标（Prometheus）
 
-* `proxy_requests_total{status="success|error|throttled"}`
-* `proxy_key_state_total{state="active|cooling|disabled"}`
-* `proxy_key_cooling_seconds_remaining{key_id="..."} (gauge)`
-* `proxy_request_latency_seconds` (histogram)
+`observability.enable_metrics` 为 `true` 时，所有指标暴露在 `observability.metrics_path`（默认 `/metrics`）：
+
+| 指标 | 类型 | 说明 |
+|---|---|---|
+| `proxy_requests_total{status="success\|error\|throttled"}` | counter | HTTP 请求总数 |
+| `proxy_requests_success_total` | counter | 2xx 请求数 |
+| `proxy_requests_errors_total` | counter | 非 2xx 请求数（含 413 拒绝） |
+| `proxy_request_duration_seconds` | histogram | 延迟直方图 |
+| `proxy_tokens_input_total` | counter | 累计 prompt tokens |
+| `proxy_tokens_output_total` | counter | 累计 completion tokens |
+| `proxy_tokens_total` | counter | 累计总 tokens（真实 `usage` 对象统计） |
+| `proxy_retry_attempt_failures_total` | counter | 经内部重试的 per-attempt 上游失败数 |
+| `proxy_key_active` / `proxy_key_cooldown` / `proxy_key_disabled` | gauge | 各状态 key 数量 |
+| `proxy_key_switch_token_starvation_total` | counter | token 桶饿空后切另一个 key 的总次数 |
+| `proxy_key_403_auth_cooldown_total` | counter | 403 `Authorization failed` 触发冷却总次数 |
+| `proxy_circuit_breaker_triggered_total` | counter | per-(key,model) 断路器触发次数 |
+| `proxy_empty_shell_total` | counter | 上游侧空壳软失败总数 |
+| `proxy_empty_shell_retry_attempts_total` | counter | 空壳重试尝试总次数 |
+| `proxy_prompt_rejected_total` | counter | 代理侧 prompt 拒绝数（413 超硬上限） |
+| `proxy_concurrency_current{model="..."}` | gauge | 当前每模型在途并发数 |
+| `proxy_concurrency_acquire_total{model="..."}` | counter | 每模型并发槽位获取总次数 |
+| `proxy_network_errors_total` | counter | 网络层错误总次数 |
 
 ### 配置示例（config.toml）
 
@@ -178,9 +205,9 @@ empty_shell_retry_backoff_max_ms = 5000
 # 前就把它钳住——对每个请求（含流式）生效。NVIDIA 的 GLM 系模型在
 # `prompt + max_tokens` 超出剩余上下文预算时返回一个 HTTP-200 空壳 body
 #（choices:[]、usage:null）；入口就钳住预算，让推理真正跑起来，而不是烧一次
-# 注定空壳的往返。默认含 z-ai/glm-5.2 → 32000。
+# 注定空壳的往返。默认含 z-ai/glm-5.2 → 8192（经两轮实测调低，更稳地放得下）。
 # 覆盖方式：NVIDIA_EMPTY_SHELL_PRE_CLAMP_MAX_TOKENS（JSON map）。
-empty_shell_pre_clamp_max_tokens = { "z-ai/glm-5.2" = 32000 }
+empty_shell_pre_clamp_max_tokens = { "z-ai/glm-5.2" = 8192 }
 
 # 是否对 500 Internal Server Error 重试。GLM 系模型偶发性返回
 # {"message":"Failed to generate completions","type":"Internal Server Error","code":500}
@@ -254,14 +281,14 @@ ENTRYPOINT ["/usr/local/bin/nvidia-key-proxy"]
 
 | 类别 | 计数 | 根因 | 修复 |
 |---|---|---|---|
-| `empty_choices_shell_first` | ~30% | NVIDIA 返回 200 带 `choices:[]`、`usage:null`、`id:""` —— 没跑推理。 | **在第一次上游调用时预钳 `max_tokens`**（per-model，`empty_shell_pre_clamp_max_tokens`，默认 GLM‑5.2 → 32000；含流式），让 `prompt + max_tokens` 预算放得下。仍返回空壳时**用 `max_tokens` 钳到 `empty_shell_retry_max_tokens`**（默认 8192）重试——次数可配（`empty_shell_retry_attempts`，默认 2）、指数 backoff（`empty_shell_retry_backoff_base_ms` / `..._max_ms`）、重试前可选上游健康探测（`empty_shell_probe_before_retry`）。Per-model 断路器（`circuit_breaker_per_model`，默认 true）。最终用一个可操作的 502 替代误导性的 "summarization produced empty response"。 |
+| `empty_choices_shell_first` | ~30% | NVIDIA 返回 200 带 `choices:[]`、`usage:null`、`id:""` —— 没跑推理。 | **在第一次上游调用时预钳 `max_tokens`**（per-model，`empty_shell_pre_clamp_max_tokens`，默认 GLM‑5.2 → 8192；含流式），让 `prompt + max_tokens` 预算放得下。仍返回空壳时**用 `max_tokens` 钳到 `empty_shell_retry_max_tokens`**（默认 8192）重试——次数可配（`empty_shell_retry_attempts`，默认 2）、指数 backoff（`empty_shell_retry_backoff_base_ms` / `..._max_ms`）、重试前可选上游健康探测（`empty_shell_probe_before_retry`）。Per-(key,model) 断路器（`circuit_breaker_per_model`，默认 true）。最终用一个可操作的 502 替代误导性的 "summarization produced empty response"。**另设 413 prompt-token 硬上限** `request_max_prompt_tokens`（默认 90000），与软不重试阈值 `empty_shell_no_retry_prompt_tokens` 相等、不留灰带，让 est ≥ 90000 直接 413、零上游往返。 |
 | `timeout` | ~15% | 300s 硬超时对长上下文非流式太短。 | **`request_timeout_seconds` 默认上调到 600s**。流式请求完全绕过。新增 `request_timeout_streaming_seconds` 给流式单独的超时。告警阈值上调到 30s。 |
 | `upstream_5xx`（504/503/500） | ~10% | 网关超时 / 资源耗尽 / 瞬时 `{"message":"Failed to generate completions"}` 500。 | client `connect_timeout`（5s）不变；per-request 超时只作用于非流式。流式默认不设上限。**503** 换另一个 key 带 backoff 重试（`retry_on_503`，默认 true，可选 `probe_before_503_retry`）。**500** 用同一 backoff/重试预算换另一个 key 重试（`retry_on_500`，默认 true）—— GLM 的 500 是瞬时 per-request 失败，不是确定性封禁。 |
 | `upstream_4xx`（400 `max_tokens < 1`） | ~2% | client 算出的 `max_tokens` 下溢（大上下文 + 预留 token）。 | **代理丢弃非法 `max_tokens`**（≤0、>100k、非数字）。上限可配 `max_tokens_max`（默认 100_000）或 `MAX_TOKENS_MAX` 环境变量。 |
 
 ### 未来增强
 
-* 经一个受保护的管理端点动态增删 key。
+* ~~经一个受保护的管理端点动态增删 key。~~ **已实现**（`/admin/keys` GET/POST/DELETE，受 `admin_token` 保护）。
 * Per-model 加权或成本感知调度。
 * 支持多个上游 base（区域故障转移）。
 * 若 NVIDIA 开放 gRPC/WebSocket 接口则转发之。
