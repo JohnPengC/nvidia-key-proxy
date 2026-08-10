@@ -1622,30 +1622,27 @@ impl Proxy {
         // 的 JSON 字节标成 form-urlencoded/text 转发，NVIDIA 网关会拒/误解析——即使
         // body 内容合法也是协议错配。当 body 原样转发（解析失败）时，我们保留客户端
         // 的原始 Content-Type，使非 JSON 透传保持字节/标签忠实。
+        // 把 Accept 与 stream 同步强制。这是"客户端是否要 SSE"的唯一真值源，
+        // 且与 cc-switch /  Nvswitch / OpenAI SDK 直连 NVIDIA 时所做一致。
+        //
+        // H1（header 白名单）：此前这里是黑名单——逐跳/鉴权 header 被剥，但
+        // 其它**任意**客户端 header 原样转发上游。NVIDIA 网关（及许多
+        // OpenAI 兼容端）也认 `X-Api-Key` / `api-key` / `X-Goog-Api-Key` /
+        // `OpenAI-Organization` / `Cookie` 等：一个不可信客户端能注入这些，用
+        // 自己的上游凭证/组织覆盖代理注入的 `Bearer`，把代理变成打别人配额的
+        // 开放 relay，或改变上游计费路由。改成**显式白名单**：只转发 W3C trace
+        // 传播头与 request-id 系列；其余一概剥。`content-type` 在 body 未重序列
+        // 化为 JSON 时按原值保留（非 JSON 透传的忠实性），由下方的强制设置覆盖
+        // JSON 情形。`authorization`/`accept`/`user-agent` 由代理自己设，不转发。
         let strip_content_type = body_is_json;
         for (hkey, hvalue) in headers.iter() {
             let key_name = hkey.as_str();
-            match key_name {
-                "connection"
-                | "keep-alive"
-                | "proxy-authenticate"
-                | "proxy-authorization"
-                | "te"
-                | "trailers"
-                | "transfer-encoding"
-                | "upgrade"
-                | "content-length"
-                | "host"
-                // `accept` 在此处丢弃并显式替换，使代理控制 NVIDIA 选哪个响应形态。
-                | "accept"
-                | "authorization" => continue,
-                // `content-type` 仅在我们把 body 重序列化为规范 JSON 时丢弃
-                //（这样下面强制 `application/json` 是 NVIDIA 看到的唯一 Content-Type）；
-                // 否则保留（非 JSON 透传保持字节/标签忠实）。拆到独立分支——`|` 分支
-                // + guard 会把该分支中*每个*模式都 gate 上该 guard，会在
-                // `strip_content_type` 为 false 时让逐跳 header 透过来。
-                "content-type" if strip_content_type => continue,
-                _ => {}
+            let allow = matches!(
+                key_name,
+                "x-request-id" | "request-id" | "traceparent" | "tracestate"
+            ) || (key_name == "content-type" && !strip_content_type);
+            if !allow {
+                continue;
             }
             if let Ok(req_val) = ReqHeaderValue::from_bytes(hvalue.as_bytes()) {
                 req_builder = req_builder.header(key_name, req_val);
@@ -5502,6 +5499,72 @@ use crate::config::default_request_max_prompt_tokens;
         // 不变：choices 仍为空——合成是关闭的。
         assert!(body["choices"].as_array().map(|a| a.is_empty()).unwrap_or(false));
         assert_eq!(body["id"].as_str(), Some("cc-1"));
+    }
+
+    /// H1 回归：客户端发来的危险 header（`x-api-key`/`api-key`/`x-goog-api-key`/
+    /// `openai-organization`/`cookie`/`x-forwarded-for`）必须被白名单剥掉，
+    /// 不得透传到 NVIDIA 上游——否则一个不可信调用方能用自家上游凭证把代理
+    /// 变成开放 relay、或改变上游计费路由。同时断言白名单内的 `traceparent`
+    /// 仍被转发（W3C trace 传播）。
+    #[tokio::test]
+    async fn h1_dangerous_client_headers_not_forwarded_to_upstream() {
+        let mock_server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&mock_server)
+            .await;
+
+        let addr = start_proxy(test_config(&mock_server.uri(), 0, 5)).await;
+        let client = reqwest::Client::new();
+        let _resp = client
+            .post(format!("http://{}/v1/chat/completions", addr))
+            .header("content-type", "application/json")
+            .header("x-api-key", "attacker-upstream-key")
+            .header("api-key", "attacker-upstream-key-2")
+            .header("x-goog-api-key", "attacker-gcp-key")
+            .header("openai-organization", "attacker-org")
+            .header("cookie", "session=attacker-session")
+            .header("x-forwarded-for", "1.2.3.4")
+            .header("traceparent", "00-0af7651916cd43dd8448123456789abcdef-0123456789abcdef-01")
+            .body(r#"{"model":"m","messages":[]}"#)
+            .send()
+            .await
+            .unwrap();
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert!(!requests.is_empty());
+        let upstream_headers = &requests[0].headers;
+        // wiremock 的 Request.headers 是 HashMap<HeaderName, HeaderValues>；按
+        // HeaderName.as_str() 收一把小写键，避免在两个 `http` 版本的 HeaderName
+        // 之间做不安全的跨类型转换。
+        let keys: std::collections::HashSet<&str> =
+            upstream_headers.keys().map(|k| k.as_str()).collect();
+        for banned in [
+            "x-api-key",
+            "api-key",
+            "x-goog-api-key",
+            "openai-organization",
+            "cookie",
+            "x-forwarded-for",
+        ] {
+            assert!(
+                !keys.contains(banned),
+                "危险 header {banned} 不应被转发到上游，但上游收到了"
+            );
+        }
+        // 代理注入的鉴权头必须由代理掌控，而非来自客户端。
+        let auth = upstream_headers
+            .iter()
+            .find(|(k, _)| k.as_str() == "authorization")
+            .map(|(_, v)| v.iter().next().map(|h| h.as_str()).unwrap_or(""))
+            .unwrap();
+        assert_eq!(auth, "Bearer fake-key");
+        // 白名单内的 W3C trace 头仍应转发。
+        assert!(
+            keys.contains("traceparent"),
+            "traceparent 应被转发（白名单），但未出现在上游请求中"
+        );
     }
 }
 
