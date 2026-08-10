@@ -862,7 +862,28 @@ impl Config {
             );
         }
 
+        // 前门鉴权开启却没配 bearer_token：见 `validate_auth` 的完整说明。
+        // 一并入 `validate` 让 `Config::load` 自动 fail-fast。
+        self.validate_auth()?;
+
         info!("配置校验通过");
+        Ok(())
+    }
+
+    /// 专门针对鉴权配置的校验，可独立于其它校验单独调用。当前唯一不变式：
+    /// 开启前门鉴权（`auth.enabled = true`）时必须配 `bearer_token`，否则任何
+    /// 发出 `Authorization: Bearer `（空）或根本没有该头的请求都通过——把一个
+    /// 应被锁的代理变成开放。空密钥而鉴权开启是 footgun 不是 feature，故
+    /// 阻断启动。`Config::validate` 也会调用它，故 `Config::load` 自动覆盖。
+    pub fn validate_auth(&self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.auth.enabled && self.auth.bearer_token.trim().is_empty() {
+            return Err(
+                "auth.enabled = true 但 bearer_token 为空。开启前门鉴权必须设置 \
+                 auth.bearer_token（或 NVIDIA_AUTH_BEARER_TOKEN）；空 token 会让 \
+                 \"Authorization: Bearer \"（空）通过校验，等于把代理开放。"
+                    .into(),
+            );
+        }
         Ok(())
     }
 

@@ -468,6 +468,10 @@ pub struct KeyPool {
     metrics: Arc<Metrics>,
     /// 用于广播状态变化（可选）。
     pub_notifier: tokio::sync::broadcast::Sender<KeyStateHandle>,
+    /// `/health` 用来判断"池子是否还有活跃 key"的同步缓存。由
+    /// `refresh_metrics` 每个扫描周期写入（S6）。`None` 表示未挂载（如
+    /// 单元测试构造的 KeyPool），`/health` 路径不会查它。
+    active_keys_cached: Option<std::sync::Arc<std::sync::atomic::AtomicI64>>,
 }
 
 impl KeyPool {
@@ -484,7 +488,14 @@ impl KeyPool {
             config: config.clone(),
             metrics,
             pub_notifier: tx,
+            active_keys_cached: None,
         }
+    }
+
+    /// 挂载 `/health` 用的活跃 key 计数缓存。`refresh_metrics` 会在每个扫描
+    /// 周期把它刷成最新 active 计数。AppState 在构造后立即调用一次。
+    pub fn set_active_keys_cache(&mut self, cache: std::sync::Arc<std::sync::atomic::AtomicI64>) {
+        self.active_keys_cached = Some(cache);
     }
 
     /// 通过打分选择获取最佳 key。获取后，调用方在请求完成时（无论成功还是
@@ -708,6 +719,11 @@ impl KeyPool {
     pub async fn refresh_metrics(&self) {
         let (a, c, d) = self.count_states().await;
         self.metrics.set_key_counts(a, c, d);
+        // S6：同步刷新 `/health` 用的活跃 key 缓存，使 0-Active 时 `/health`
+        // 回 503、LB 摘流。未挂载（单测）则跳过。
+        if let Some(cache) = &self.active_keys_cached {
+            cache.store(a, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// 将 key 标记为正常（请求成功）。

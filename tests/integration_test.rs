@@ -124,6 +124,74 @@ async fn metrics_enabled_returns_200() {
     assert!(body.contains("proxy_requests_total"));
 }
 
+/// S1 回归：`auth.enabled = true` 时 `/metrics` 必须过前门 bearer 校验——
+/// 此前 metrics 路由排在 `.or()` 链的 proxy auth 块之前，绕过了前门。
+/// 无 bearer 应被 401，带正确 bearer 应放行 200。
+#[tokio::test]
+async fn metrics_denied_by_front_door_auth_when_enabled() {
+    let cfg = test_config_with_auth(true, "secret-bearer", "");
+    let state = AppState::new(cfg);
+    let filter = build_routes(&state);
+
+    // 无 bearer → 401
+    let resp = request()
+        .method("GET")
+        .path("/metrics")
+        .reply(&filter)
+        .await;
+    assert_eq!(
+        resp.status(),
+        401,
+        "auth.enabled 时 /metrics 无 bearer 必须被拒"
+    );
+
+    // 带正确 bearer → 200
+    let resp = request()
+        .method("GET")
+        .path("/metrics")
+        .header("authorization", "Bearer secret-bearer")
+        .reply(&filter)
+        .await;
+    assert_eq!(resp.status(), 200);
+
+    // 带错误 bearer → 401
+    let resp = request()
+        .method("GET")
+        .path("/metrics")
+        .header("authorization", "Bearer wrong-token")
+        .reply(&filter)
+        .await;
+    assert_eq!(resp.status(), 401);
+}
+
+/// S1：`auth.enabled = false`（默认）时 `/metrics` 仍无需 bearer——不破坏
+/// 开放部署的现状。
+#[tokio::test]
+async fn metrics_open_when_front_door_auth_disabled() {
+    let cfg = test_config_with_auth(false, "secret-bearer", "");
+    let state = AppState::new(cfg);
+    let filter = build_routes(&state);
+    let resp = request().method("GET").path("/metrics").reply(&filter).await;
+    assert_eq!(resp.status(), 200);
+}
+
+/// S2 回归：开启前门鉴权却没配 bearer_token，`Config::validate` 必须
+/// fail-fast，而不是放任"Bearer "（空）通过校验把代理开放。
+#[tokio::test]
+async fn validate_rejects_auth_enabled_with_empty_bearer_token() {
+    let mut cfg = test_config_with_auth(true, "", "");
+    // 给一个看起来合法的 key，避免被前置的 fake/placeholder key 校验先行拒下，
+    // 从而让本测试确实是在断言 *auth* 校验分支。
+    cfg.keys = vec!["nvapi-validkey-1234".to_string()];
+    let err = cfg.validate().expect_err("空 bearer + auth.enabled 必须被校验拒绝");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("bearer_token"),
+        "错误信息应指明 bearer_token 缺失，实际：{}",
+        msg
+    );
+}
+
 #[tokio::test]
 async fn metrics_disabled_returns_404() {
     let mut cfg = test_config();

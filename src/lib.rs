@@ -45,6 +45,11 @@ pub struct AppState {
     pub config: Config,
     /// 启动健康检查完成标志；`/health` 在其为 false 时回 503。
     pub health_ready: Arc<std::sync::atomic::AtomicBool>,
+    /// 最近一次 `count_states` 的活跃 key 计数缓存，供 `/health` 同步读以判断
+    /// 池子是否仍有可用 key（S6：0 个活跃 key → 503，让 LB 摘流）。由
+    /// `KeyPool::refresh_metrics` 在每个扫描周期刷新。至多落后一个
+    /// `cool_down_task`/健康扫描周期。
+    pub active_keys_cached: Arc<std::sync::atomic::AtomicI64>,
 }
 
 impl AppState {
@@ -66,7 +71,14 @@ impl AppState {
         }
 
         let metrics = Arc::new(Metrics::new());
-        let key_pool = Arc::new(KeyPool::new(&config, metrics.clone()));        let request_timeout = config.request_timeout_seconds;
+        let active_keys_cached = Arc::new(std::sync::atomic::AtomicI64::new(
+            config.keys.len() as i64,
+        ));
+        let mut key_pool_unwrapped = KeyPool::new(&config, metrics.clone());
+        // S6：挂 `/health` 活跃计数缓存（在包 Arc 之前 mutate，绕开 Arc 不可变借用）。
+        key_pool_unwrapped.set_active_keys_cache(active_keys_cached.clone());
+        let key_pool = Arc::new(key_pool_unwrapped);
+            let request_timeout = config.request_timeout_seconds;
         let request_timeout_streaming = config.request_timeout_streaming_seconds;
         let retry_config = config.retry.clone();
         let model_aliases = config.model_aliases.clone();
@@ -127,6 +139,7 @@ impl AppState {
             stop_signal,
             config,
             health_ready,
+            active_keys_cached,
         }
     }
 }
@@ -210,17 +223,27 @@ pub fn build_routes(
         .untuple_one();
 
     let health_ready = state.health_ready.clone();
+    let active_keys_cached = state.active_keys_cached.clone();
     let health_route = warp::path!("health")
         .and(warp::get())
         .map(move || {
             // S5：启动健康检查（`HealthChecker::run_startup`）完成前回 503，使
             // 负载均衡器/探针在此期间摘掉本实例，避免把流量打到尚未对池做完一次
             // 初始清点的代理上。`run_startup` 在退出前把 `health_ready` 置 true。
-            if health_ready.load(std::sync::atomic::Ordering::Relaxed) {
-                warp::http::Response::builder().status(204).body("")
-            } else {
-                warp::http::Response::builder().status(503).body("")
+            //
+            // S6：启动就绪**之后**仍要反映池子活性——若所有 key 都漂到
+            // Cooling/Disabled（凭证轮换全失效、或冷却/禁用 bug 叠加），回 204
+            // 会让 LB 继续打流量、全 503。这里读一个由 `cool_down_task`/健康 task
+            // 周期刷新的 `AtomicI64` 缓存（同步读，无需 async——`count_states` 是
+            // async 不能在 `map` 里 await）。缓存至多落后一个扫描周期，对探针
+            // 频率而言可接受。始终豁免前门鉴权。
+            if !health_ready.load(std::sync::atomic::Ordering::Relaxed) {
+                return warp::http::Response::builder().status(503).body("");
             }
+            if active_keys_cached.load(std::sync::atomic::Ordering::Relaxed) <= 0 {
+                return warp::http::Response::builder().status(503).body("");
+            }
+            warp::http::Response::builder().status(204).body("")
         });
 
     let proxy_route = warp::path::full()
@@ -266,6 +289,12 @@ pub fn build_routes(
     let metrics_path = state.config.observability.metrics_path.clone();
     let enable_metrics = state.config.observability.enable_metrics;
     let metrics = state.metrics.clone();
+    // `auth.enabled` 时 `/metrics` 也必须过前门 bearer 校验——它暴露 per-model
+    // 流量、token 数、key 池基数与断路器触发，是可信运维面，不该对任意 client
+    // 开放。`/admin/*` 有它自己的 `admin_token` 独立门（见 `check_admin_token`），
+    // 故不叠加前门。`/health` 始终豁免（见下）。此前 metrics 路由排在 `.or()`
+    // 链中 proxy 的 auth 块之前，绕过了前门——这是 S1 的根因。
+    let front_door_auth = state.config.auth.clone();
     let metrics_route = warp::path::full()
         .and_then(move |p: warp::path::FullPath| {
             let metrics_path = metrics_path.clone();
@@ -279,9 +308,21 @@ pub fn build_routes(
         })
         .untuple_one()
         .and(warp::get())
-        .and_then(move || {
+        .and(warp::header::headers_cloned())
+        .and_then(move |headers: warp::http::HeaderMap| {
             let metrics = metrics.clone();
+            let front_door_auth = front_door_auth.clone();
             async move {
+                // 复用前门 bearer 校验：开启时要求 `Authorization: Bearer <token>`。
+                if front_door_auth.enabled {
+                    let expected = format!("Bearer {}", front_door_auth.bearer_token);
+                    match headers.get("authorization").and_then(|v| v.to_str().ok()) {
+                        Some(v) if constant_time_eq(v.as_bytes(), expected.as_bytes()) => {}
+                        _ => {
+                            return Err::<_, Rejection>(warp::reject::custom(Unauthorized));
+                        }
+                    }
+                }
                 if !enable_metrics {
                     return Err::<_, Rejection>(warp::reject::not_found());
                 }
