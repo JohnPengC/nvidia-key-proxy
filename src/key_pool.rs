@@ -1606,12 +1606,16 @@ mod score_selection_tests {
         handle.dec_in_flight();
     }
 
-    /// 打分选择：桶更满的 key 必须优先于已被抽干的 key 被选中。我们通过先
-    /// 抽干 k2，然后反复调用 `acquire` 并断言选中 k1 来验证。
+    /// token 越多的桶打分越高：先抽干 k2，再 `acquire` 应选中 k1。
+    ///
+    /// 用有限 qps（10/s，burst=10）构桶，这样消费是真正扣 token 的——抽干
+    /// k2 后它的 `token_ratio` 严格低于 k1，打分胜负来自真实 token 差，而非
+    /// qps=0 无限桶（`{u32::MAX, f64::INFINITY}`）下「cap 与 cap-10」那种
+    /// ~1e-9 的浮点尾差。
     #[tokio::test]
     async fn acquire_prefers_key_with_more_tokens() {
-        let pool = build_pool_with_keys(&["k1", "k2"], 0.0, 10);
-        // 把 k2 抽干到 0，使其打分严格低于 k1。
+        let pool = build_pool_with_keys(&["k1", "k2"], 10.0, 10);
+        // 把 k2 抽干到 0，使其 `token_ratio` 严格低于 k1（k1 桶满）。
         let h2 = pool
             .inner
             .read()
@@ -1624,7 +1628,7 @@ mod score_selection_tests {
             let got = h2.try_consume_token(0).await;
             assert!(got, "drain k2");
         }
-        // 现在 k2 有 0 个令牌，k1 有 10 个。acquire 必须选 k1。
+        // 现在 k2 桶空、k1 桶满（10 个）。acquire 必须选 k1。
         let h = pool.acquire().await.expect("active key exists");
         let k = h.key().await;
         assert_eq!(
@@ -1752,7 +1756,7 @@ mod score_selection_tests {
         let h = pool.inner.read().await.get("k1").cloned().unwrap();
         let g = h.inner.read().await;
         assert!(
-            g.circuit_breaker_failures.get("z-ai/glm-5.2").is_none(),
+            !g.circuit_breaker_failures.contains_key("z-ai/glm-5.2"),
             "glm cb must be cleared; got {:?}",
             g.circuit_breaker_failures
         );
