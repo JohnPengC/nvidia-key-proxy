@@ -1,6 +1,5 @@
-//! Library façade: re-exports all modules and hosts the application state
-//! and route builder so that integration tests can exercise them without
-//! reaching into the binary crate (`src/main.rs`).
+//! 库门面：重新导出所有模块，并承载应用状态与路由构造器，以便集成测试
+//! 可以在不深入二进制 crate（`src/main.rs`）的情况下跑全栈。
 
 pub mod config;
 pub mod failure_log;
@@ -34,8 +33,8 @@ impl tracing_subscriber::fmt::time::FormatTime for LocalTimer {
     }
 }
 
-/// Bundles all runtime‑shared state. `Clone` so route builders can each hold
-/// their own handle to the shared `Arc` fields without fighting borrow rules.
+/// 把所有运行时共享状态打包到一起。`Clone` 让各路由构造器各自持有一份
+/// 共享 `Arc` 字段的 handle，互不争夺借用规则。
 #[derive(Clone)]
 pub struct AppState {
     pub metrics: Arc<Metrics>,
@@ -48,9 +47,9 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(config: Config) -> Self {
-        // Tracing must be initialized before we emit any logs.
+        // tracing 必须在任何日志发出前初始化。
         init_tracing(&config);
-        tracing::info!("Loaded configuration: {:?}", config);
+        tracing::info!("已加载配置：{:?}", config);
         eprintln!(
             "[config-load] request_timeout_seconds={}",
             config.request_timeout_seconds
@@ -128,33 +127,30 @@ impl AppState {
     }
 }
 
-/// Initialise tracing based on env vars **and** the config file.
+/// 基于环境变量**和**配置文件初始化 tracing。
 ///
-/// Idempotent: subsequent calls (e.g. when multiple `AppState`s are built in
-/// tests) are silently ignored once a global default subscriber is installed.
+/// 幂等：一旦装好全局默认 subscriber，后续调用（例如测试里建多个
+/// `AppState` 时）静默忽略。
 pub fn init_tracing(config: &Config) {
     let filter = EnvFilter::try_from_default_env()
         .or_else(|_| EnvFilter::try_new(&config.observability.log_level))
         .unwrap_or_else(|_| EnvFilter::new("info"));
-    // `try_init` returns Err when a global default subscriber already exists;
-    // in that case there is nothing to do.
+    // `try_init` 在全局默认 subscriber 已存在时返回 Err；那种情况无事可做。
     let _ = tracing_subscriber::fmt()
         .with_timer(LocalTimer)
         .with_env_filter(filter)
         .try_init();
 }
 
-/// Build all warp routes using the shared `AppState`.
+/// 用共享 `AppState` 构造所有 warp 路由。
 pub fn build_routes(
     state: &AppState,
 ) -> impl Filter<Extract = impl Reply, Error = Rejection> + Clone {
-    // Outermost request logger — fires *before* any path matching or guard,
-    // so every connection warp processes shows up in stdout. This is the
-    // ground-truth "did the client reach us at all?" signal, useful for
-    // diagnosing cc-switch / Cursor / IDE configurations that mis-target
-    // the proxy. Without this, guard rejections (404) and handler rejections
-    // (503) land before the existing `Proxying request to ...` log line and
-    // are invisible.
+    // 最外层请求日志——在*任何*路径匹配或 guard 之前触发，所以 warp 处理的
+    // 每条连接都会出现在 stdout。这是"client 到底有没有够到我们"的基准信号，
+    // 用来诊断误指代理的 cc-switch / Cursor / IDE 配置。没有它，guard 拒绝
+    //（404）和 handler 拒绝（503）落在既有 `Proxying request to ...` 日志行
+    // 之前，就看不见了。
     let entry_log = warp::path::full()
         .and(warp::method())
         .and(warp::header::headers_cloned())
@@ -175,7 +171,7 @@ pub fn build_routes(
                 path = %path.as_str(),
                 host = %host,
                 user_agent = %ua,
-                "incoming request"
+                "收到请求"
             );
             ()
         })
@@ -207,12 +203,12 @@ pub fn build_routes(
                 let proxy = proxy.clone();
                 let auth = auth.clone();
                 async move {
-                    // Front-door auth: when enabled, require a matching
-                    // `Authorization: Bearer <bearer_token>` before forwarding.
+                    // 前置鉴权：开启后，转发前要求带匹配的
+                    // `Authorization: Bearer <bearer_token>`。
                     if auth.enabled {
                         let expected = format!("Bearer {}", auth.bearer_token);
                         match headers.get("authorization").and_then(|v| v.to_str().ok()) {
-                            Some(v) if v == expected => {}
+                            Some(v) if constant_time_eq(v.as_bytes(), expected.as_bytes()) => {}
                             _ => {
                                 return Err::<_, Rejection>(warp::reject::custom(Unauthorized));
                             }
@@ -280,10 +276,15 @@ pub async fn handle_rejection(err: Rejection) -> Result<impl Reply, Rejection> {
         ));
     }
     if err.find::<warp::reject::InvalidQuery>().is_some() {
-        error!("Invalid query");
+        error!("非法 query");
         Ok(warp::reply::with_status(
             "Invalid query".to_string(),
             StatusCode::BAD_REQUEST,
+        ))
+    } else if err.find::<warp::reject::PayloadTooLarge>().is_some() {
+        Ok(warp::reply::with_status(
+            "Payload too large".to_string(),
+            StatusCode::PAYLOAD_TOO_LARGE,
         ))
     } else if err.find::<warp::reject::MethodNotAllowed>().is_some() {
         Ok(warp::reply::with_status(
@@ -296,7 +297,7 @@ pub async fn handle_rejection(err: Rejection) -> Result<impl Reply, Rejection> {
             StatusCode::NOT_FOUND,
         ))
     } else {
-        error!("Unhandled rejection: {:?}", err);
+        error!("未处理的 rejection：{:?}", err);
         Ok(warp::reply::with_status(
             "Internal server error".to_string(),
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -304,26 +305,42 @@ pub async fn handle_rejection(err: Rejection) -> Result<impl Reply, Rejection> {
     }
 }
 
-// ── Front-door auth & admin API ───────────────────────────────────────────
+// ── 前置鉴权与管理 API ────────────────────────────────────────────────────
 
-/// Rejection returned when the proxy's own front-door auth (or the admin API
-/// auth) fails. Surfaced to the client as 401.
+/// 代理自身前置鉴权（或管理 API 鉴权）失败时返回的 rejection。对 client
+/// 表现为 401。
 #[derive(Debug, Clone)]
 struct Unauthorized;
 impl warp::reject::Reject for Unauthorized {}
 
-/// Rejection returned when the admin API is queried but `auth.admin_token`
-/// is unset. Surfaced as 404 so the admin surface can't be probed. Deliberately
-/// NOT `not_found()` — warp's `.or()` falls through on `not_found`, which would
-/// let a `/admin/keys` GET fall through to the POST/DELETE routes and report
-/// 405 instead of 404.
+/// 查询管理 API 但 `auth.admin_token` 未设时返回的 rejection。表现为 404，
+/// 让管理面无法被探测。故意**不**用 `not_found()`——warp 的 `.or()` 会对
+/// `not_found` 落空，那样一个 `/admin/keys` 的 GET 会落空到 POST/DELETE
+/// 路由、报 405 而不是 404。
 #[derive(Debug, Clone)]
 struct AdminDisabled;
 impl warp::reject::Reject for AdminDisabled {}
 
-/// Check the admin bearer token from the request headers. When `admin_token`
-/// is empty the whole admin surface is hidden (404), so it can't be probed;
-/// otherwise the caller must present `Authorization: Bearer <admin_token>`.
+/// 常数时间字节比较，用于 bearer-token 校验，避免远端调用者通过测量 `==`
+/// 的耗时还原 token（或其长度）。仅长度不一致就直接返回 false（与
+/// `subtle::ConstantTimeCompare`/Go 的 `crypto/subtle.ConstantTimeCompare`
+/// 一致；显然的长度侧信道被接受，因为格式良好的
+/// `Authorization: Bearer <token>` 头几乎总带固定 `Bearer ` 前缀）。逐字节
+/// 循环总是扫完整个公共长度、把差异累计进一个累加器，不短路。
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// 从请求头里校验管理 bearer token。`admin_token` 为空时整个管理面被藏
+/// 起来（404）、无法被探测；否则调用方必须提供
+/// `Authorization: Bearer <admin_token>`。
 fn check_admin_token(
     admin_token: &str,
     headers: &warp::http::HeaderMap,
@@ -333,12 +350,12 @@ fn check_admin_token(
     }
     let expected = format!("Bearer {}", admin_token);
     match headers.get("authorization").and_then(|v| v.to_str().ok()) {
-        Some(v) if v == expected => Ok(()),
+        Some(v) if constant_time_eq(v.as_bytes(), expected.as_bytes()) => Ok(()),
         _ => Err(warp::reject::custom(Unauthorized)),
     }
 }
 
-/// Serialize `val` into a JSON `Response` with the given status.
+/// 把 `val` 序列化成给定状态码的 JSON `Response`。
 fn json_reply<T: serde::Serialize>(status: u16, val: &T) -> warp::reply::Response {
     let body = serde_json::to_vec(val).unwrap_or_default();
     warp::http::Response::builder()
@@ -353,8 +370,8 @@ fn json_reply<T: serde::Serialize>(status: u16, val: &T) -> warp::reply::Respons
         })
 }
 
-/// Extract key strings from an admin add-keys JSON body. Accepts a bare array
-/// of strings, a single string, or an object `{ "keys": [...] }`.
+/// 从管理「加 key」的 JSON body 里抽 key 字符串。接受裸字符串数组、单个
+/// 字符串，或对象 `{ "keys": [...] }`。
 fn extract_keys(body: &serde_json::Value) -> Vec<String> {
     let mut out = Vec::new();
     if let Some(arr) = body.as_array() {
@@ -375,9 +392,9 @@ fn extract_keys(body: &serde_json::Value) -> Vec<String> {
     out
 }
 
-/// Admin management API mounted under `/admin`. Each handler authenticates
-/// the caller against `auth.admin_token` (via `check_admin_token`); when that
-/// token is unset the route 404s so the surface can't be probed.
+/// 挂在 `/admin` 下的管理 API。每个 handler 都用 `auth.admin_token` 校验
+/// 调用方（经 `check_admin_token`）；该 token 未设时路由返回 404，使管理面
+/// 无法被探测。
 fn admin_api(state: AppState) -> impl Filter<Extract = impl Reply, Error = Rejection> + Clone {
     let list = warp::path!("admin" / "keys")
         .and(warp::get())
@@ -394,8 +411,15 @@ fn admin_api(state: AppState) -> impl Filter<Extract = impl Reply, Error = Rejec
             }
         });
 
+    // 给管理「加 key」body 设上限。`warp::body::json()` 默认无大小限制，会在
+    // `extract_keys` 跑起来之前就把整个 body 全缓冲进内存——一个粘了巨型 key
+    // 文件的已认证调用方（或持 admin token 的恶意一方）能把进程 OOM，或在
+    // `add_keys_batch` 里制造病态锁抖动。1 MiB 对任何现实的 add-keys 负载都
+    // 富余（一千个 80 字节 key + JSON 框架约 100 KiB），并以 413 直接挡掉 OOM
+    // 这一类。
     let add = warp::path!("admin" / "keys")
         .and(warp::post())
+        .and(warp::body::content_length_limit(1024 * 1024))
         .and(warp::body::json())
         .and(warp::header::headers_cloned())
         .and_then({
@@ -405,20 +429,8 @@ fn admin_api(state: AppState) -> impl Filter<Extract = impl Reply, Error = Rejec
                 async move {
                     check_admin_token(&s.config.auth.admin_token, &headers)?;
                     let keys = extract_keys(&body);
-                    let mut added = Vec::new();
-                    let mut already_present = Vec::new();
-                    let mut invalid = Vec::new();
-                    for k in keys {
-                        if k.len() < 8 {
-                            invalid.push(k);
-                            continue;
-                        }
-                        if s.key_pool.add_key(k.clone()).await {
-                            added.push(k);
-                        } else {
-                            already_present.push(k);
-                        }
-                    }
+                    let (added, already_present, invalid) =
+                        s.key_pool.add_keys_batch(keys).await;
                     Ok::<_, Rejection>(json_reply(
                         200,
                         &serde_json::json!({

@@ -7,7 +7,7 @@ fn request_count() -> &'static Counter {
     REQUEST_COUNT.get_or_init(|| {
         register_counter!(
             "proxy_requests_total",
-            "Total number of HTTP requests processed"
+            "处理过的 HTTP 请求总数"
         )
         .unwrap()
     })
@@ -18,7 +18,7 @@ fn request_success() -> &'static Counter {
     REQUEST_SUCCESS.get_or_init(|| {
         register_counter!(
             "proxy_requests_success_total",
-            "Number of successful requests (status 2xx)"
+            "成功请求数（状态 2xx）"
         )
         .unwrap()
     })
@@ -29,7 +29,7 @@ fn request_error() -> &'static Counter {
     REQUEST_ERROR.get_or_init(|| {
         register_counter!(
             "proxy_requests_errors_total",
-            "Number of requests that result in error (non-2xx)"
+            "结果为错误的请求数（非 2xx）"
         )
         .unwrap()
     })
@@ -69,7 +69,7 @@ fn request_latency() -> &'static Histogram {
     REQUEST_LATENCY.get_or_init(|| {
         register_histogram!(
             "proxy_request_duration_seconds",
-            "HTTP request latency in seconds",
+            "HTTP 请求延迟（秒）",
             prometheus::exponential_buckets(0.005, 2.0, 12).unwrap()
         )
         .unwrap()
@@ -81,7 +81,7 @@ fn retry_attempt_failure() -> &'static Counter {
     RETRY_ATTEMPT_FAILURE.get_or_init(|| {
         register_counter!(
             "proxy_retry_attempt_failures_total",
-            "Per-attempt upstream failures retried internally (not visible to client). Distinct from proxy_requests_errors_total which counts client-visible failures."
+            "经内部重试的 per-attempt 上游失败数（对 client 不可见）。与 proxy_requests_errors_total（计 client 可见失败）不同。"
         )
         .unwrap()
     })
@@ -92,7 +92,7 @@ fn key_active() -> &'static Gauge {
     KEY_ACTIVE.get_or_init(|| {
         register_gauge!(
             "proxy_key_active",
-            "Number of API keys currently in active state"
+            "当前处于 active 状态的 API key 数量"
         )
         .unwrap()
     })
@@ -103,7 +103,7 @@ fn key_cooldown() -> &'static Gauge {
     KEY_COOLDOWN.get_or_init(|| {
         register_gauge!(
             "proxy_key_cooldown",
-            "Number of API keys currently in cooldown"
+            "当前处于冷却中的 API key 数量"
         )
         .unwrap()
     })
@@ -114,20 +114,20 @@ fn key_disabled() -> &'static Gauge {
     KEY_DISABLED.get_or_init(|| {
         register_gauge!(
             "proxy_key_disabled",
-            "Number of API keys currently disabled"
+            "当前被禁用的 API key 数量"
         )
         .unwrap()
     })
 }
 
-// ── New metrics for token-starvation switch and 403 immediate cooldown ──
+// ── token 饥饿切换与 403 即时冷却的新指标 ──
 
 pub fn key_switch_token_starvation() -> &'static Counter {
     static KSW: OnceLock<Counter> = OnceLock::new();
     KSW.get_or_init(|| {
         register_counter!(
             "proxy_key_switch_token_starvation_total",
-            "Number of times a request switched to another key because the first key's token bucket was empty"
+            "因首个 key 的 token 桶已空而把请求切到另一个 key 的次数"
         )
         .unwrap()
     })
@@ -138,7 +138,7 @@ pub fn key_403_auth_cooldown() -> &'static Counter {
     K403.get_or_init(|| {
         register_counter!(
             "proxy_key_403_auth_cooldown_total",
-            "Number of times a 403 Authorization failed triggered immediate key cooldown"
+            "403 Authorization failed 触发即时 key 冷却的次数"
         )
         .unwrap()
     })
@@ -149,92 +149,90 @@ pub fn circuit_breaker_triggered() -> &'static Counter {
     CBT.get_or_init(|| {
         register_counter!(
             "proxy_circuit_breaker_triggered_total",
-            "Number of times circuit breaker triggered due to consecutive empty-shell/504 responses"
+            "因连续空壳/504 响应触发断路器的次数"
         )
         .unwrap()
     })
 }
 
-/// Total empty-shell soft failures detected, by model and outcome.
+/// 空壳软失败检测总数，按 model 和 outcome 分。
 pub fn empty_shell_total() -> &'static CounterVec {
     static EST: OnceLock<CounterVec> = OnceLock::new();
     EST.get_or_init(|| {
         register_counter_vec!(
             "proxy_empty_shell_total",
-            "Total empty-shell soft failures detected, by model and outcome",
+            "检测到的空壳软失败总数，按 model 和 outcome 分",
             &["model", "outcome"]
         )
         .unwrap()
     })
 }
 
-/// Total requests rejected up front by the hard prompt-token ceiling (HTTP 413,
-/// `prompt_tokens_exceeds_ceiling`), by model and outcome. Symmetric to
-/// `proxy_empty_shell_total` (which counts the upstream-side soft failure):
-/// this counts the **proxy-side** pre-rejection. outcome is currently always
-/// `"413"`; kept as a label so a future finer breakdown (e.g. distinguishing
-/// the hard ceiling from other in-front-door rejections) can slot in without a
-/// metric rename. Without it, 413 rejections are indistinguishable from other
-/// non-2xx in `proxy_requests_errors_total`, so an operator has no way to tell
-/// whether the ceiling is firing on real traffic or sitting idle.
+/// 被硬 prompt-token 上限（HTTP 413，`prompt_tokens_exceeds_ceiling`）在
+/// 入口处直接拒绝的请求总数，按 model 和 outcome 分。与
+/// `proxy_empty_shell_total`（计上游侧软失败）对称：这里计 **代理侧** 的
+/// 前置拒绝。outcome 目前恒为 `"413"`；保留为 label，这样日后更细的拆分
+///（例如区分硬上限与其他前门拒绝）可以无缝接入而无需改 metric 名。没有
+/// 它，413 拒绝在 `proxy_requests_errors_total` 里和其它非 2xx 混在一起，
+/// 运维无法判断上限是真在拦截流量还是闲置。
 pub fn prompt_rejected_total() -> &'static CounterVec {
     static PRT: OnceLock<CounterVec> = OnceLock::new();
     PRT.get_or_init(|| {
         register_counter_vec!(
             "proxy_prompt_rejected_total",
-            "Total requests rejected by the hard prompt-token ceiling (413), by model and outcome",
+            "被硬 prompt-token 上限（413）拒绝的请求总数，按 model 和 outcome 分",
             &["model", "outcome"]
         )
         .unwrap()
     })
 }
 
-/// Total empty-shell retry attempts, by model.
+/// 空壳重试尝试总数，按 model 分。
 pub fn empty_shell_retry_attempts_total() -> &'static CounterVec {
     static ESR: OnceLock<CounterVec> = OnceLock::new();
     ESR.get_or_init(|| {
         register_counter_vec!(
             "proxy_empty_shell_retry_attempts_total",
-            "Total empty-shell retry attempts made, by model",
+            "空壳重试尝试总数，按 model 分",
             &["model"]
         )
         .unwrap()
     })
 }
 
-/// Current concurrency for a model (active requests).
+/// 某 model 当前并发数（在途请求）。
 pub fn concurrency_current() -> &'static GaugeVec {
     static CC: OnceLock<GaugeVec> = OnceLock::new();
     CC.get_or_init(|| {
         register_gauge_vec!(
             "proxy_concurrency_current",
-            "Current number of concurrent upstream requests per model",
+            "每个 model 当前并发的上游请求数",
             &["model"]
         )
         .unwrap()
     })
 }
 
-/// Total concurrency acquire attempts, by model and result.
+/// 并发获取尝试总数，按 model 和 result 分。
 pub fn concurrency_acquire_total() -> &'static CounterVec {
     static CA: OnceLock<CounterVec> = OnceLock::new();
     CA.get_or_init(|| {
         register_counter_vec!(
             "proxy_concurrency_acquire_total",
-            "Total concurrency semaphore acquire attempts, by model and result",
+            "并发信号量获取尝试总数，按 model 和 result 分",
             &["model", "result"]
         )
         .unwrap()
     })
 }
 
-/// Total network errors, by model and error type.
+/// 网络错误总数，按 model 和 error type 分。
 pub fn network_errors_total() -> &'static CounterVec {
     static NET: OnceLock<CounterVec> = OnceLock::new();
     NET.get_or_init(|| {
         register_counter_vec!(
             "proxy_network_errors_total",
-            "Total network errors, by model and error type",
+            "网络错误总数，按 model 和 error type 分",
             &["model", "error_type"]
         )
         .unwrap()
@@ -293,7 +291,7 @@ impl Metrics {
         empty_shell_total().with_label_values(&[model, outcome]).inc();
     }
 
-    /// Increment the hard-ceiling 413 rejection counter. See `prompt_rejected_total`.
+    /// 递增硬上限 413 拒绝计数。见 `prompt_rejected_total`。
     pub fn inc_prompt_rejected_total(&self, model: &str, outcome: &str) {
         prompt_rejected_total().with_label_values(&[model, outcome]).inc();
     }
@@ -314,10 +312,9 @@ impl Metrics {
         network_errors_total().with_label_values(&[model, error_type]).inc();
     }
 
-    /// Record token usage extracted from an upstream response. Called once per
-    /// request (after a non-streaming body is read, or when a stream ends) with
-    /// the `usage` object's prompt/completion/total counts. Any `None`/`0`
-    /// component is simply skipped so partial usage objects don't under-count.
+    /// 记录从上游响应抽出的 token 用量。每个请求调一次（非流式 body 读完后，
+    /// 或流结束时），传入 `usage` 对象的 prompt/completion/total 计数。任意
+    /// `None`/`0` 分量直接跳过，避免部分 usage 对象少计数。
     pub fn record_usage(&self, prompt: Option<u64>, completion: Option<u64>, total: Option<u64>) {
         if let Some(p) = prompt {
             token_input().inc_by(p as f64);
@@ -330,7 +327,7 @@ impl Metrics {
         }
     }
 
-    /// Expose metrics in Prometheus text format.
+    /// 以 Prometheus 文本格式导出指标。
     pub fn render(&self) -> String {
         use prometheus::Encoder;
         let encoder = prometheus::TextEncoder::new();
@@ -340,8 +337,7 @@ impl Metrics {
         String::from_utf8(buffer).unwrap()
     }
 
-    /// Update key-state gauges. Called by `KeyPool::refresh_metrics` after
-    /// every state transition.
+    /// 更新 key 状态 gauge。每次状态转换后由 `KeyPool::refresh_metrics` 调用。
     pub fn set_key_counts(&self, active: i64, cooldown: i64, disabled: i64) {
         key_active().set(active as f64);
         key_cooldown().set(cooldown as f64);

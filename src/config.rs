@@ -7,6 +7,45 @@ use tracing::{info, warn};
 
 use crate::key_pool::mask_key;
 
+/// 从 `scheme://[userinfo@]host[:port]/...` URL 中提取 host 部分，
+/// 无需引入 URL crate。若字符串没有可识别的 scheme://authority 则返回 `None`。
+/// 能处理带方括号的 IPv6 字面量（如 `[::1]`）。供 `Config::validate` 使用，
+/// 使开发主机检查比较的是真实 host，而不是整个 URL 的某个子串。
+fn host_of_url(url: &str) -> Option<String> {
+    let idx = url.find("://")?;
+    let after = &url[idx + 3..];
+    // authority 部分到第一个 '/'、'?' 或 '#' 为止。
+    let end = after
+        .find(|c| c == '/' || c == '?' || c == '#')
+        .unwrap_or(after.len());
+    let authority = &after[..end];
+    // 若存在 `userinfo@` 则剥掉它。
+    let authority = match authority.rfind('@') {
+        Some(at) => &authority[at + 1..],
+        None => authority,
+    };
+    // 带方括号的 IPv6 字面量：`[::1]` 或 `[::1]:port`。
+    if let Some(rest) = authority.strip_prefix('[') {
+        let close = rest.find(']')?;
+        return Some(format!("[{}]", &rest[..close]));
+    }
+    // 普通 host —— 剥掉末尾的 `:port`。
+    let host = match authority.rfind(':') {
+        Some(colon) => {
+            // 确保 `colon` 不在 IPv6 之类的东西里；对普通 host 而言
+            // 最后一个 ':' 之后的部分必须全是数字。
+            let port_part = &authority[colon + 1..];
+            if port_part.chars().all(|c| c.is_ascii_digit()) && !port_part.is_empty() {
+                &authority[..colon]
+            } else {
+                authority
+            }
+        }
+        None => authority,
+    };
+    Some(host.to_string())
+}
+
 #[derive(Deserialize, Clone)]
 pub struct Config {
     pub listen_addr: String,
@@ -16,283 +55,257 @@ pub struct Config {
     pub cooldown: CooldownConfig,
     pub health_check: HealthCheckConfig,
     pub observability: ObservabilityConfig,
-    /// Optional request timeout in seconds. 0 disables the timeout entirely
-    /// (recommended when proxying long-running streaming requests).
+    /// 可选的请求超时（秒）。0 表示完全禁用超时
+    ///（代理长时间运行的流式请求时推荐此设置）。
     #[serde(default = "default_request_timeout_seconds")]
     pub request_timeout_seconds: u64,
-    /// Retry/upstream-error policy (exponential backoff, key-disable threshold).
+    /// 重试/上游错误策略（指数退避、禁用 key 的阈值）。
     #[serde(default)]
     pub retry: RetryConfig,
-    /// Client-facing model name → NVIDIA-ready model id. Empty by default.
-    /// When a chat-completion request carries `model` matching a key here,
-    /// the proxy rewrites the field to the mapped value before forwarding.
-    /// Unmatched names are forwarded unchanged.
+    /// 客户端可见的模型名 → NVIDIA 适用的模型 id。默认为空。
+    /// 当 chat-completion 请求携带的 `model` 命中这里的某个 key 时，
+    /// 代理会在转发前把该字段改写为映射值；未命中的名字原样转发。
     #[serde(default)]
     pub model_aliases: std::collections::HashMap<String, String>,
-    /// Allow `base_url` to point at a loopback / localhost address. Off by
-    /// default because production should never target example.com/localhost,
-    /// but turning it on is handy for pointing the proxy at a local
-    /// NVIDIA-compatible mock during development / integration testing.
+    /// 允许 `base_url` 指向 loopback / localhost 地址。默认关闭，
+    /// 因为生产环境绝不应以 example.com/localhost 为目标；但开启它
+    /// 在开发 / 集成测试时把代理指向本地 NVIDIA 兼容 mock 很方便。
     #[serde(default)]
     pub allow_local_base_url: bool,
-    /// Front-door authentication for the proxy itself. The pool's NVIDIA
-    /// quota is exposed to anyone who can reach `listen_addr`; enabling this
-    /// requires clients to present `Authorization: Bearer <bearer_token>` on
-    /// `/v1/*` requests. Disabled by default to preserve the "any api_key
-    /// works" behaviour existing clients rely on. `/health` is always exempt.
+    /// 代理自身的前门鉴权。池里的 NVIDIA 配额对任何能访问
+    /// `listen_addr` 的人都开放；启用此项后，客户端必须在 `/v1/*`
+    /// 请求上出示 `Authorization: Bearer <bearer_token>`。默认关闭以
+    /// 保留现有客户端依赖的“任意 api_key 都能用”的行为。`/health` 始终豁免。
     #[serde(default)]
     pub auth: AuthConfig,
-    /// Inject `stream_options.include_usage: true` into streaming chat
-    /// requests so upstream returns token usage at stream end. NVIDIA/OpenAI
-    /// only emit usage when this flag is set; without it the proxy's token
-    /// metrics are zero for the (common) streaming case. Defaults to true;
-    /// disable via `inject_stream_usage = false` or `NVIDIA_INJECT_STREAM_USAGE=false`.
+    /// 向流式 chat 请求注入 `stream_options.include_usage: true`，
+    /// 使上游在流结束时返回 token 用量。NVIDIA/OpenAI 仅在该 flag 置位时
+    /// 才发送 usage；否则在（常见的）流式场景下代理的 token 指标恒为 0。
+    /// 默认 true；通过 `inject_stream_usage = false` 或
+    /// `NVIDIA_INJECT_STREAM_USAGE=false` 关闭。
     #[serde(default = "default_inject_stream_usage")]
     pub inject_stream_usage: bool,
-    /// Synthesize a placeholder `choices` entry when upstream returns a 2xx
-    /// non-SSE body whose `choices` array is empty (`choices: []`). cc-switch's
-    /// non-streaming converter `openai_to_anthropic` hard-errors on an empty
-    /// `choices` ("格式转换错误: Empty choices array" → 422 to Claude Code);
-    /// this commonly happens on context compaction (`stream:false`) where the
-    /// model produced no tokens but still returned `usage`. Instead of relying
-    /// on cc-switch being patched, the proxy rewrites that body in-place to a
-    /// legal single-choice response (empty assistant message, `finish_reason:
-    /// stop`, preserving `id`/`model`/`usage`) so cc-switch succeeds.
+    /// 当上游返回 2xx 非 SSE 响应体且其 `choices` 数组为空（`choices: []`）时，
+    /// 合成一个占位的 `choices` 条目。cc-switch 的非流式转换器
+    /// `openai_to_anthropic` 遇到空 `choices` 会硬报错（"格式转换错误:
+    /// Empty choices array" → 向 Claude Code 返回 422）；这种情况常见于
+    /// context compaction（`stream:false`）——模型未产生 token 但仍返回了
+    /// `usage`。与其依赖 cc-switch 打补丁，代理直接把该响应体原地改写为
+    /// 合法的单选择响应（空 assistant message、`finish_reason: stop`，
+    /// 保留 `id`/`model`/`usage`），从而让 cc-switch 成功。
     ///
-    /// Only the non-streaming, non-SSE success branch is affected — and there
-    /// only a bounded ≤64 KiB prefix is buffered to decide, so large streaming
-    /// completions keep their zero-copy passthrough. Defaults to true; disable
-    /// via `synthesize_empty_choices = false` or
-    /// `NVIDIA_SYNTHESIZE_EMPTY_CHOICES=false`.
+    /// 仅影响非流式、非 SSE 的成功分支——而且在判定时只缓冲有界的前
+    /// ≤64 KiB 前缀，因此大型流式补全仍保持零拷贝透传。默认 true；通过
+    /// `synthesize_empty_choices = false` 或
+    /// `NVIDIA_SYNTHESIZE_EMPTY_CHOICES=false` 关闭。
     #[serde(default = "default_synthesize_empty_choices")]
     pub synthesize_empty_choices: bool,
-    /// Retry a query once with a reduced `max_tokens` when NVIDIA returns a
-    /// "shell" 2xx — a body shaped `{"choices":[], "id":"", "usage":null, ...}`
-    /// where every field is null/empty. This is NVIDIA's silent soft-failure for
-    /// GLM-class models on build.integrate (no real inference ran — hence
-    /// `usage:null`, vs. the legitimate compaction empty-choices body which
-    /// DOES carry `usage`). A 198-message `/compact` with `max_tokens=64000`
-    /// commonly trips this: NVIDIA drops the whole request into an empty shell
-    /// rather than truncating `max_tokens`. The retry re-sends the same body
-    /// with `max_tokens` clamped to `empty_shell_retry_max_tokens` (8192 by
-    /// default), which usually lets the inference actually run. Defaults to
-    /// true; disable via `retry_on_empty_shell = false` or
-    /// `NVIDIA_RETRY_ON_EMPTY_SHELL=false`.
+    /// 当 NVIDIA 返回一个“空壳” 2xx —— 形如
+    /// `{"choices":[], "id":"", "usage":null, ...}`、每个字段都为
+    /// null/空的响应体——时，用一个降低后的 `max_tokens` 重试一次。
+    /// 这是 build.integrate 上 GLM 类模型的静默软失败（没有真正跑过
+    /// 推理——所以是 `usage:null`，而合法的 compaction 空 choices 响应体
+    /// 的 `usage` 仍会存在）。一条 198 条消息的 `/compact` 带
+    /// `max_tokens=64000` 常常踩中：NVIDIA 把整条请求丢进一个空壳，
+    /// 而不是截断 `max_tokens`。重试时把同一请求体的 `max_tokens` 钳到
+    /// `empty_shell_retry_max_tokens`（默认 8192），通常能让推理真正跑起来。
+    /// 默认 true；通过 `retry_on_empty_shell = false` 或
+    /// `NVIDIA_RETRY_ON_EMPTY_SHELL=false` 关闭。
     #[serde(default = "default_retry_on_empty_shell")]
     pub retry_on_empty_shell: bool,
-    /// `max_tokens` value used when retried after an empty-shell soft failure.
-    /// Only affects the single retry attempt; the original request is forwarded
-    /// unchanged first. 8192 is conservative across GLM-family models on
-    /// build.integrate. Override via the `empty_shell_retry_max_tokens` config
-    /// key or `NVIDIA_EMPTY_SHELL_RETRY_MAX_TOKENS` env var.
+    /// 在空壳软失败后重试时使用的 `max_tokens` 值。
+    /// 只影响那一次重试；原始请求会先原样转发。8192 对 build.integrate 上的
+    /// GLM 系模型是保守取值。可通过 `empty_shell_retry_max_tokens` 配置项
+    /// 或 `NVIDIA_EMPTY_SHELL_RETRY_MAX_TOKENS` 环境变量覆盖。
     #[serde(default = "default_empty_shell_retry_max_tokens")]
     pub empty_shell_retry_max_tokens: u64,
-    /// Before retrying an empty-shell failure, do a lightweight health probe
-    /// against /v1/models to avoid retrying into a degraded upstream.
-    /// Default true. Override via `NVIDIA_EMPTY_SHELL_PROBE_BEFORE_RETRY`.
+    /// 在重试空壳失败前，对 /v1/models 做一次轻量健康探测，
+    /// 避免向已退化的上游重试。默认 true。可通过
+    /// `NVIDIA_EMPTY_SHELL_PROBE_BEFORE_RETRY` 覆盖。
     #[serde(default = "default_empty_shell_probe_before_retry")]
     pub empty_shell_probe_before_retry: bool,
-    /// Circuit breaker threshold. After N consecutive empty-shell or 504
-    /// responses on a given key/model, the key is cooled for
-    /// cooldown.base_seconds. 0 = disabled. Default 3. Override via
-    /// `NVIDIA_CIRCUIT_BREAKER_THRESHOLD`.
+    /// 熔断阈值。某个 key/model 上连续 N 次空壳或 504 响应后，
+    /// 该 key 被冷却 cooldown.base_seconds。0 = 禁用。默认 3。
+    /// 可通过 `NVIDIA_CIRCUIT_BREAKER_THRESHOLD` 覆盖。
     #[serde(default = "default_circuit_breaker_threshold")]
     pub circuit_breaker_threshold: u32,
 
-    /// Whether circuit breaker tracks failures per (key, model) pair
-    /// instead of globally per key. Default true. Override via
-    /// `NVIDIA_CIRCUIT_BREAKER_PER_MODEL`.
+    /// 熔断器是否按 (key, model) 维度而非按 key 全局统计失败。
+    /// 默认 true。可通过 `NVIDIA_CIRCUIT_BREAKER_PER_MODEL` 覆盖。
     #[serde(default = "default_circuit_breaker_per_model")]
     pub circuit_breaker_per_model: bool,
 
-    /// Retry on 503 Service Unavailable (NVIDIA Worker local request limit reached).
-    /// When enabled, 503 responses trigger a retry against another key with
-    /// exponential backoff (uses same retry budget as 401 retries).
-    /// Default true. Override via `NVIDIA_RETRY_ON_503`.
+    /// 在 503 Service Unavailable（NVIDIA Worker 本地请求上限到达）时重试。
+    /// 启用后，503 响应会触发一次指数退避地重试另一个 key
+    ///（使用与 401 重试相同的重试预算）。默认 true。
+    /// 可通过 `NVIDIA_RETRY_ON_503` 覆盖。
     #[serde(default = "default_retry_on_503")]
     pub retry_on_503: bool,
 
-    /// Before retrying a 503 failure, do a lightweight health probe
-    /// against /v1/models to avoid retrying into a degraded upstream.
-    /// Default true. Override via `NVIDIA_PROBE_BEFORE_503_RETRY`.
+    /// 在重试 503 失败前，对 /v1/models 做一次轻量健康探测，
+    /// 避免向已退化的上游重试。默认 true。
+    /// 可通过 `NVIDIA_PROBE_BEFORE_503_RETRY` 覆盖。
     #[serde(default = "default_probe_before_503_retry")]
     pub probe_before_503_retry: bool,
 
-    /// Retry on 500 Internal Server Error. NVIDIA/GLM-class models
-    /// intermittently return `{"message":"Failed to generate
-    /// completions","type":"Internal Server Error","code":500}` — a
-    /// transient per-request worker failure (same prompt succeeds on the
-    /// next key seconds later). When enabled, 500 responses trigger a
-    /// retry against another key using the same retry budget as 401/503.
-    /// Default true. Override via `NVIDIA_RETRY_ON_500`.
+    /// 在 500 Internal Server Error 时重试。NVIDIA/GLM 类模型会间歇性
+    /// 返回 `{"message":"Failed to generate
+    /// completions","type":"Internal Server Error","code":500}` —— 一次
+    /// 瞬态的单请求 worker 失败（同样的 prompt 几秒后换个 key 就能成功）。
+    /// 启用后，500 响应会触发一次重试另一个 key，使用与 401/503 相同的
+    /// 重试预算。默认 true。可通过 `NVIDIA_RETRY_ON_500` 覆盖。
     #[serde(default = "default_retry_on_500")]
     pub retry_on_500: bool,
 
-    /// Number of retry attempts for empty-shell soft failures.
-    /// 2 = original + two retries. 0 = no retry (falls back to 502).
-    /// Default 2. Override via `NVIDIA_EMPTY_SHELL_RETRY_ATTEMPTS`.
+    /// 空壳软失败的重试次数。2 = 原始 + 两次重试。
+    /// 0 = 不重试（回退为 502）。默认 2。
+    /// 可通过 `NVIDIA_EMPTY_SHELL_RETRY_ATTEMPTS` 覆盖。
     #[serde(default = "default_empty_shell_retry_attempts")]
     pub empty_shell_retry_attempts: u32,
 
-    /// Base delay for exponential backoff between empty-shell retries (ms).
-    /// Default 500. Override via `NVIDIA_EMPTY_SHELL_RETRY_BACKOFF_BASE_MS`.
+    /// 空壳重试之间指数退避的基本延迟（毫秒）。默认 500。
+    /// 可通过 `NVIDIA_EMPTY_SHELL_RETRY_BACKOFF_BASE_MS` 覆盖。
     #[serde(default = "default_empty_shell_retry_backoff_base_ms")]
     pub empty_shell_retry_backoff_base_ms: u64,
 
-    /// Cap for a single empty-shell retry backoff sleep (ms).
-    /// Default 5000. Override via `NVIDIA_EMPTY_SHELL_RETRY_BACKOFF_MAX_MS`.
+    /// 单次空壳重试退避睡眠的上限（毫秒）。默认 5000。
+    /// 可通过 `NVIDIA_EMPTY_SHELL_RETRY_BACKOFF_MAX_MS` 覆盖。
     #[serde(default = "default_empty_shell_retry_backoff_max_ms")]
     pub empty_shell_retry_backoff_max_ms: u64,
 
-    /// Per-model max_tokens ceiling for pre-clamping on first attempt.
-    /// When a request targets a model in this map and max_tokens is at or above
-    /// the ceiling, the proxy clamps it before the first upstream call.
-    /// Reduces empty-shell occurrences for known problematic models.
-    /// Default includes z-ai/glm-5.2 → 8192.
-    /// Override via `NVIDIA_EMPTY_SHELL_PRE_CLAMP_MAX_TOKENS` (JSON map).
+    /// 按模型在首次尝试前进行 max_tokens 预钳制的上限。
+    /// 当请求命中的模型在此 map 中且 max_tokens 大于等于该上限时，
+    /// 代理会在第一次上游调用前就把它钳下去，从而降低已知问题模型的
+    /// 空壳出现率。默认包含 z-ai/glm-5.2 → 8192。
+    /// 可通过 `NVIDIA_EMPTY_SHELL_PRE_CLAMP_MAX_TOKENS`（JSON map）覆盖。
     #[serde(default = "default_empty_shell_pre_clamp_max_tokens")]
     pub empty_shell_pre_clamp_max_tokens: std::collections::HashMap<String, u64>,
 
-    /// Prompt-token threshold above which an empty-shell soft failure is NOT
-    /// retried with a clamped max_tokens. failure.log showed clamp-retry on
-    /// very long contexts (est_prompt_tokens 107k+) recovered 0% (49/49
-    /// re-shelled): the shell there isn't caused by an oversized output budget
-    /// but by `prompt + any max_tokens` exceeding the model's context window, so
-    /// shrinking max_tokens can't help. Above this threshold the proxy skips
-    /// the retry round-trip and surfaces 502 immediately with reason
-    /// `empty_shell_no_retry_prompt_too_large`, avoiding wasted upstream calls.
-    /// 0 disables this bypass (always retry per the existing policy).
-    /// Default 90000 (well below the 107k failure-log floor for shells).
-    /// Override via `NVIDIA_EMPTY_SHELL_NO_RETRY_PROMPT_TOKENS`.
+    /// 当 estimated prompt 超过此阈值时，空壳软失败不再用钳后的
+    /// max_tokens 重试。failure.log 显示超长上下文（est_prompt_tokens
+    /// 107k+）上的钳制重试恢复率为 0%（49/49 重新空壳）：那里的空壳
+    /// 并非由输出预算过大引起，而是 `prompt + 任意 max_tokens` 超过了模型
+    /// 的上下文窗口，因此缩小 max_tokens 无济于事。超过此阈值时代理跳过
+    /// 重试往返，直接以 `empty_shell_no_retry_prompt_too_large` 为原因
+    /// 返回 502，避免浪费上游调用。0 禁用此旁路（始终按既有策略重试）。
+    /// 默认 90000（远低于 failure.log 中 107k 的空壳下限）。
+    /// 可通过 `NVIDIA_EMPTY_SHELL_NO_RETRY_PROMPT_TOKENS` 覆盖。
     #[serde(default = "default_empty_shell_no_retry_prompt_tokens")]
     pub empty_shell_no_retry_prompt_tokens: u64,
 
-    /// Hard ceiling on a request's estimated prompt tokens: a non-streaming or
-    /// streaming chat-completions request whose estimated prompt size is at or
-    /// above this limit is rejected up front with HTTP 413 (no upstream call),
-    /// asking the client to compress its context itself. The proxy refuses
-    /// rather than burn an upstream round-trip and a key slot on a request that
-    /// cannot succeed. Auto-compact is the client's job (Claude Code owns its
-    /// conversation history); we surface a clear 413 instead of silently
-    /// rewriting the client's messages.
+    /// 对请求 estimated prompt tokens 的硬上限：非流式或流式
+    /// chat-completions 请求，若其估算 prompt 大小大于等于此上限，则
+    /// 在最前面就被 HTTP 413 拒绝（不发起上游调用），要求客户端自行压缩
+    /// 其上下文。代理拒绝，而不是浪费一次上游往返和一个 key slot 在一个
+    /// 注定不可能成功的请求上。Auto-compact 是客户端的职责（Claude Code
+    /// 自己持有它的对话历史）；我们给出清晰的 413，而不是悄悄改写客户端的
+    /// messages。
     ///
-    /// **Set EQUAL to `empty_shell_no_retry_prompt_tokens` (both default 90000)
-    /// — there is deliberately no grey band between the soft and hard limits.**
-    /// Requests at/above the hard limit are refused outright (413); requests
-    /// below the soft limit run the normal retry path. The two rounds of
-    /// measurement that collapsed the band are in the `default_*` rationale
-    /// below. 0 disables the hard limit (always let the first call go out).
+    /// **设定为等于 `empty_shell_no_retry_prompt_tokens`（两者默认都 90000）
+    /// ——软限制和硬限制之间刻意没有灰色地带。** 大于等于硬限制的请求直接
+    /// 拒绝（413）；低于软限制的请求走正常重试路径。消除了该灰带的两轮实测
+    /// 见下方 `default_*` 部分的说明。0 禁用硬限制（始终放行第一次调用）。
     ///
-    /// Default 90000. Tuned in two rounds from the actual shell distribution in
-    /// failure.log:
-    /// (1) With the ceiling at 120000, every one of 77 observed shells carried
-    ///     est_prompt_tokens in [98288, 109231] — none ever reached 120k, so the
-    ///     413 guard never fired and every doomed /compact surfaced as a 502
-    ///     "empty chat completion" the client retried for ~10 minutes instead of
-    ///     an honest 413. (The `chars/4` estimate understates real tokens, so a
-    ///     ~109k estimate already overflows a ~128k model window once max_tokens
-    ///     is added in.) Dropped to 95000.
-    /// (2) With the ceiling at 95000 (a [90k, 95k) "one-shot" grey band still
-    ///     allowed one attempt), all 32 of the next-day's shells carried est in
-    ///     [92488, 93445] — every one fell inside that band and all 32 shelled
-    ///     (0% success). The band gave Claude Code a 502 it retried for ~10
-    ///     minutes (the same failure mode as round 1) instead of a clear 413 it
-    ///     would have honored at once. The measured shell floor had also dropped
-    ///     from 98288 to 92488 as the session grew.
-    /// So 90000 collapses the band: sits below both measured floors, and any
-    /// est >= 90000 → 413 immediately, zero upstream round-trip, zero client
-    /// retry storm. If `chars/4` is later replaced by a more accurate estimator,
-    /// revisit whether a small grey band can be re-introduced.
-    /// Override via `NVIDIA_REQUEST_MAX_PROMPT_TOKENS`.
+    /// 默认 90000。从 failure.log 中真实的空壳分布出发，分两轮调出：
+    ///(1) 当上限为 120000 时，观察到的 77 个空壳里 est_prompt_tokens 全在
+    ///     [98288, 109231] 之间——没有一个到达 120k，所以 413 守卫从不触发，
+    ///     每一个注定失败的 /compact 都表现为 502 "empty chat completion"
+    ///     被客户端重试约 10 分钟，而不是一个诚实的 413。（`chars/4` 估算
+    ///     会低估真实 tokens，所以一旦加上 max_tokens，一个 ~109k 的估算
+    ///     实际上就已经让 ~128k 模型窗口溢出。）下调到 95000。
+    ///(2) 当上限为 95000 时（仍允许一次尝试的 [90k, 95k) "一次性" 灰带），
+    ///     第二天全部 32 个空壳的 est 落在 [92488, 93445]——每一个都落在该
+    ///     灰带内，32 个全部空壳（0% 成功）。这条灰带给 Claude Code 一个 502，
+    ///     它又重试约 10 分钟（与第一轮同样的失败模式），而不是一条它能
+    ///     立刻接受的清晰 413。随着会话增长，实测的空壳下限也从 98288 降到
+    ///     了 92488。
+    /// 因此 90000 折叠了该灰带：落在两个实测下限之下，任何 est >= 90000
+    /// → 立即 413，零上游往返、零客户端重试风暴。若日后用更准确的估算器
+    /// 取代 `chars/4`，可重新评估能否重新引入一小段灰带。
+    /// 可通过 `NVIDIA_REQUEST_MAX_PROMPT_TOKENS` 覆盖。
     #[serde(default = "default_request_max_prompt_tokens")]
     pub request_max_prompt_tokens: u64,
 
-    // ==================== Multimodal prompt-token estimation ====================
-    /// Coarse per-part token cost assigned to each `{type:"image_url",…}` block
-    /// when estimating a multimodal request's prompt size, regardless of whether
-    /// the URL is a remote `https://` reference or an inline `data:…;base64,`
-    /// payload. The proxy forwards multimodal bodies untouched, but its prompt
-    /// guards (413 hard ceiling, empty-shell no-retry soft limit) must not be
-    /// fooled: counting a base64 image as `chars/4` balloons the estimate by
-    /// orders of magnitude and rejects a legal request with 413, while a
-    /// URL-only image undercounts and lets an over-long prompt slip past.
-    /// Default 1500. 0 falls back to the unknown-part cost. Override via
-    /// `NVIDIA_EST_IMAGE_TOKEN_COST`.
+    // ==================== 多模态 prompt-token 估算 ====================
+    /// 在估算多模态请求的 prompt 大小时，给每个 `{type:"image_url",…}` 块
+    /// 赋予的粗略单 part token 成本，无论该 URL 是远程 `https://` 引用
+    /// 还是内联 `data:…;base64,` 载荷。代理原样透传多模态响应体，但其
+    /// prompt 守卫（413 硬上限、空壳不重试软限制）不能被糊弄：把一张 base64
+    /// 图片按 `chars/4` 计数会把估算放大好几个数量级，从而用 413 拒掉一个
+    /// 合法请求；而只算 URL 又会低估，让过长的 prompt 漏过去。
+    /// 默认 1500。0 回退到 unknown-part 成本。
+    /// 可通过 `NVIDIA_EST_IMAGE_TOKEN_COST` 覆盖。
     #[serde(default = "default_est_image_token_cost")]
     pub est_image_token_cost: u64,
-    /// Token cost per *KiB* of base64 audio payload in an
-    /// `{type:"input_audio",…}` block, capped at `est_audio_token_cap`.
-    /// Default 16. 0 falls back to the unknown-part cost. Override via
-    /// `NVIDIA_EST_AUDIO_TOKEN_PER_KB`.
+    /// `{type:"input_audio",…}` 块中每 *KiB* base64 音频载荷的 token 成本，
+    /// 上限为 `est_audio_token_cap`。默认 16。0 回退到 unknown-part 成本。
+    /// 可通过 `NVIDIA_EST_AUDIO_TOKEN_PER_KB` 覆盖。
     #[serde(default = "default_est_audio_token_per_kb")]
     pub est_audio_token_per_kb: u64,
-    /// Hard cap on the per-block audio estimate, so one huge clip can't blow
-    /// the estimate up. Default 10000. Override via
-    /// `NVIDIA_EST_AUDIO_TOKEN_CAP`.
+    /// 对单个块 audio 估算的硬上限，免得一个超大 clip 把估算撑爆。
+    /// 默认 10000。可通过 `NVIDIA_EST_AUDIO_TOKEN_CAP` 覆盖。
     #[serde(default = "default_est_audio_token_cap")]
     pub est_audio_token_cap: u64,
-    /// Cap applied to any content part of an unrecognized shape (unknown
-    /// `type`, or a known type whose dedicated cost is 0): its serialized
-    /// `chars/4` is counted but clamped here, so a stray base64 blob in an
-    /// unexpected field can't balloon the estimate while still counting
-    /// *something*. Default 2000. 0 ignores unknown parts entirely. Override
-    /// via `NVIDIA_EST_UNKNOWN_PART_TOKEN_CAP`.
+    /// 对任何无法识别形状的 content part（未知 `type`，或其专属成本为 0 的
+    /// 已知 type）施加的上限：会按其序列化的 `chars/4` 计数但被钳到此，
+    /// 这样某个意外字段里的一团 base64 blob 不会把估算撑爆，但仍然算进去
+    /// *一点东西*。默认 2000。0 表示完全忽略 unknown parts。
+    /// 可通过 `NVIDIA_EST_UNKNOWN_PART_TOKEN_CAP` 覆盖。
     #[serde(default = "default_est_unknown_part_token_cap")]
     pub est_unknown_part_token_cap: u64,
 
-    /// Optional ceiling for max_tokens validation. Any request with max_tokens
-    /// > this value will have the field dropped (model default used). Default
-    /// 100000. Override via `MAX_TOKENS_MAX` env var.
+    /// 用于 max_tokens 校验的可选上限。任何 max_tokens > 此值的请求会让该
+    /// 字段被丢弃（改用模型默认值）。默认 100000。
+    /// 可通过 `MAX_TOKENS_MAX` 环境变量覆盖。
     #[serde(default = "default_max_tokens_max")]
     pub max_tokens_max: u64,
 
-    // ==================== Concurrency limiting (Priority 2) ====================
-    /// Per-model maximum concurrent upstream requests.
-    /// When a model's concurrency reaches this limit, new requests are queued
-    /// (up to `concurrency_queue_timeout_ms`) or rejected with 503.
-    /// Default: empty (no limit). Override via `NVIDIA_CONCURRENCY_LIMIT_PER_MODEL` (JSON map).
+    // ==================== 并发限制（Priority 2）====================
+    /// 每个模型的最大并发上游请求数。当某模型并发达到上限时，新请求会被
+    /// 排队（最长 `concurrency_queue_timeout_ms`）或以 503 拒绝。
+    /// 默认：空（无限制）。可通过
+    /// `NVIDIA_CONCURRENCY_LIMIT_PER_MODEL`（JSON map）覆盖。
     #[serde(default)]
     pub concurrency_limit_per_model: std::collections::HashMap<String, u32>,
 
-    /// Maximum time (ms) to wait for a concurrency semaphore slot.
-    /// If the queue is full for this long, return 503 with Retry-After.
-    /// Default 5000 (5s). Override via `NVIDIA_CONCURRENCY_QUEUE_TIMEOUT_MS`.
+    /// 为拿到一个并发信号量槽位而等待的最长时间（毫秒）。
+    /// 若队列满这么久仍无槽位，则带 Retry-After 返回 503。
+    /// 默认 5000（5s）。可通过 `NVIDIA_CONCURRENCY_QUEUE_TIMEOUT_MS` 覆盖。
     #[serde(default = "default_concurrency_queue_timeout_ms")]
     pub concurrency_queue_timeout_ms: u64,
 
-    // ==================== Timeout tuning (Priority 3) ====================
-    /// Request timeout for streaming connections (Priority 3).
-    /// When set > 0, used instead of request_timeout_seconds for streaming calls.
-    /// 0 = use request_timeout_seconds. Default 0 (disabled).
-    /// Override via NVIDIA_REQUEST_TIMEOUT_STREAMING_SECONDS.
+    // ==================== 超时调优（Priority 3）====================
+    /// 流式连接的请求超时（Priority 3）。当 > 0 时，流式调用将使用它
+    /// 而非 request_timeout_seconds。0 = 用 request_timeout_seconds。
+    /// 默认 0（禁用）。可通过 NVIDIA_REQUEST_TIMEOUT_STREAMING_SECONDS
+    /// 覆盖。
     #[serde(default)]
     pub request_timeout_streaming_seconds: u64,
 
-    // ==================== Network resilience (Priority 4) ====================
-    /// Upstream connection timeout (seconds). Default 5.
-    /// Override via NVIDIA_UPSTREAM_CONNECT_TIMEOUT_SECONDS.
+    // ==================== 网络韧性（Priority 4）====================
+    /// 上游连接超时（秒）。默认 5。
+    /// 可通过 NVIDIA_UPSTREAM_CONNECT_TIMEOUT_SECONDS 覆盖。
     #[serde(default = "default_upstream_connect_timeout_secs")]
     pub upstream_connect_timeout_secs: u64,
 
-    /// Upstream connection pool idle timeout (seconds). Default 90.
-    /// Override via NVIDIA_UPSTREAM_POOL_IDLE_TIMEOUT_SECONDS.
+    /// 上游连接池空闲超时（秒）。默认 90。
+    /// 可通过 NVIDIA_UPSTREAM_POOL_IDLE_TIMEOUT_SECONDS 覆盖。
     #[serde(default = "default_upstream_pool_idle_timeout_secs")]
     pub upstream_pool_idle_timeout_secs: u64,
 
-    /// Retry jitter (ms). Added to exponential backoff. Default 100.
-    /// Override via NVIDIA_RETRY_JITTER_MS.
+    /// 重试抖动（毫秒）。叠加到指数退避之上。默认 100。
+    /// 可通过 NVIDIA_RETRY_JITTER_MS 覆盖。
     #[serde(default = "default_retry_jitter_ms")]
     pub retry_jitter_ms: u64,
 }
 
-/// Public wrapper to get the default pre-clamp map (used in tests).
+/// 用于取得默认 pre-clamp map 的公开封装（供测试使用）。
 pub fn default_empty_shell_pre_clamp_max_tokens() -> std::collections::HashMap<String, u64> {
     let mut m = std::collections::HashMap::new();
-    // 8192, not 32000: GLM-class models (~128k context) return an HTTP-200
-    // empty shell when `prompt + max_tokens` exceeds their remaining budget.
-    // failure.log showed all 216 first-attempt shells carried max_tokens=32000
-    // (the empty output budget once a ~107k+ prompt was counted in). Clamping
-    // to 8192 leaves room for output on prompts up to ~120k.
+    // 8192，不是 32000：GLM 类模型（~128k 上下文）在 `prompt + max_tokens`
+    // 超过其剩余预算时会返回一个 HTTP-200 空壳。failure.log 显示全部 216 个
+    // 首次尝试空壳的 max_tokens 都带 32000（一旦把 ~107k+ 的 prompt 算进去
+    // 后就是那个空输出预算）。钳到 8192 可为最多 ~120k 的 prompt 留出输出空间。
     m.insert("z-ai/glm-5.2".to_string(), 8192);
     m
 }
@@ -341,10 +354,10 @@ fn default_empty_shell_no_retry_prompt_tokens() -> u64 {
     90000
 }
 
-/// Public wrapper for the hard prompt-token ceiling default. Used by test
-/// scaffolds in `proxy.rs` / `key_pool.rs` / `integration_test.rs` so their
-/// hand-built `Config` follows the production default without restating the
-/// literal (mirrors `default_empty_shell_pre_clamp_max_tokens`).
+/// 硬 prompt-token 上限默认值的公开封装。供 `proxy.rs` / `key_pool.rs` /
+/// `integration_test.rs` 中的测试脚手架使用，使其手工构造的 `Config` 遵循
+/// 生产默认值而无需重述该字面量（与 `default_empty_shell_pre_clamp_max_tokens`
+/// 镜像对应）。
 pub fn default_request_max_prompt_tokens() -> u64 {
     90000
 }
@@ -405,20 +418,20 @@ fn default_max_tokens_max() -> u64 {
     100_000
 }
 
-/// Front-door auth config. See `Config::auth` for the rationale.
+/// 前门鉴权配置。理由见 `Config::auth`。
 #[derive(Debug, Deserialize, Clone)]
 pub struct AuthConfig {
-    /// Require clients to authenticate before the proxy forwards their
-    /// request. When false, requests are forwarded without checking a token.
+    /// 要求客户端在代理转发其请求前完成鉴权。为 false 时，请求会被转发
+    /// 且不校验 token。
     #[serde(default)]
     pub enabled: bool,
-    /// Bearer token clients must present. Also overridable via
-    /// `NVIDIA_AUTH_BEARER_TOKEN`. Empty when not set.
+    /// 客户端必须出示的 Bearer token。也可通过
+    /// `NVIDIA_AUTH_BEARER_TOKEN` 覆盖。未设置时为空。
     #[serde(default)]
     pub bearer_token: String,
-    /// Bearer token required by the `/admin/*` management API (key add/remove
-    /// / status). When empty (and `NVIDIA_AUTH_ADMIN_TOKEN` unset), the admin
-    /// API is disabled entirely. Also overridable via `NVIDIA_AUTH_ADMIN_TOKEN`.
+    /// `/admin/*` 管理 API（key 增删 / 状态）所要求的 Bearer token。
+    /// 为空（且未设 `NVIDIA_AUTH_ADMIN_TOKEN`）时，admin API 被完全禁用。
+    /// 也可通过 `NVIDIA_AUTH_ADMIN_TOKEN` 覆盖。
     #[serde(default)]
     pub admin_token: String,
 }
@@ -540,9 +553,8 @@ impl fmt::Debug for Config {
 pub struct RateLimiterConfig {
     pub qps_per_key: f64,
     pub burst: u64,
-    /// Maximum milliseconds to wait on a single key's token bucket before
-    /// switching to another key (default 200). 0 disables switching — the
-    /// existing unbounded-wait behaviour is preserved.
+    /// 在切换到另一个 key 前，对单个 key 的 token bucket 等待的最长毫秒数
+    ///（默认 200）。0 表示禁用切换——保留现有的无界等待行为。
     #[serde(default = "default_token_wait_ms")]
     pub token_wait_ms: u64,
 }
@@ -557,39 +569,35 @@ pub struct CooldownConfig {
     pub max_seconds: u64,
 }
 
-/// Retry/upstream-error policy for proxy → NVIDIA.
+/// 代理 → NVIDIA 的重试/上游错误策略。
 ///
-/// Only a 401 *without* `Retry-After` triggers a retry against another healthy
-/// key with exponential backoff. Each such attempt that fails increments the
-/// offending key's `fail_count`; once `auth_fail_threshold` is reached, the key
-/// is moved to `KeyState::Disabled` and is no longer acquired. A background
-/// health probe must see a success before the key is reactivated.
+/// 只有 *不带* `Retry-After` 的 401 才会触发对另一个健康 key 的、带指数
+/// 退避的重试。每一次这样的失败尝试都会累加该 key 的 `fail_count`；
+/// 一旦达到 `auth_fail_threshold`，该 key 被移入 `KeyState::Disabled` 且不再
+/// 被获取。必须有一轮后台健康探测看到成功，该 key 才会被重新激活。
 ///
-/// 401 with `Retry-After`, and 429/403 regardless of `Retry-After`, are NOT
-/// retried: they are deterministic upstream decisions (per-key throttle /
-/// region / account gating) and retrying on another key would only burn the
-/// whole pool. A `Retry-After` value cools the offending key; otherwise the
-/// response is surfaced to the client unchanged.
+/// 带 `Retry-After` 的 401，以及不论是否带 `Retry-After` 的 429/403，都
+/// *不*重试：它们是确定性的上游决策（按 key 限流 / 地区 / 账号门控），
+/// 换个 key 重试只会把整池都烧光。`Retry-After` 值会冷却涉事 key；否则
+/// 响应原样返回给客户端不做改动。
 #[derive(Debug, Deserialize, Clone)]
 pub struct RetryConfig {
-    /// Maximum retry attempts per client request (excluding the initial
-    /// attempt). Default 3.
+    /// 每个客户端请求的最大重试次数（不含首次尝试）。默认 3。
     #[serde(default = "default_max_retries")]
     pub max_retries: u32,
-    /// Base delay for exponential backoff in milliseconds. Default 200.
+    /// 指数退避的基本延迟（毫秒）。默认 200。
     #[serde(default = "default_backoff_base_ms")]
     pub backoff_base_ms: u64,
-    /// Cap for a single backoff sleep. Default 2000.
+    /// 单次退避睡眠的上限。默认 2000。
     #[serde(default = "default_backoff_max_ms")]
     pub backoff_max_ms: u64,
-    /// Per-key consecutive upstream auth/forbidden failures after which the
-    /// key is Disabled (until a health probe recovers it). Default 3.
+    /// 连续多少次该 key 的上游 auth/forbidden 失败后，该 key 被禁用
+    ///（直到一次健康探测恢复它）。默认 3。
     #[serde(default = "default_auth_fail_threshold")]
     pub auth_fail_threshold: u32,
-    /// Max times a single client request may switch to another key because
-    /// the current key's token bucket was starved. Decoupled from
-    /// `max_retries` (the upstream 401 retry budget) so key-switching and
-    /// retry-on-auth-failure are tuned independently. Defaults to `max_retries`.
+    /// 单个客户端请求因当前 key 的 token bucket 被饿死而切换到另一个
+    /// key 的最大次数。与 `max_retries`（上游 401 重试预算）解耦，使
+    /// key 切换与按 auth 失败重试可独立调参。默认与 `max_retries` 相同。
     #[serde(default = "default_max_key_switches")]
     pub max_key_switches: u32,
 }
@@ -638,10 +646,10 @@ pub struct ObservabilityConfig {
 
 impl Config {
     pub fn load() -> Result<Self, Box<dyn std::error::Error>> {
-        // Load .env file if present
+        // 若存在则加载 .env 文件
         let _ = dotenv();
 
-        // Default configuration. base_url aligns with README / example value.
+        // 默认配置。base_url 与 README / 示例值保持一致。
         let mut config = Config {
             listen_addr: "0.0.0.0:8080".to_string(),
             base_url: "https://integrate.api.nvidia.com".to_string(),
@@ -699,7 +707,7 @@ impl Config {
             retry_jitter_ms: default_retry_jitter_ms(),
         };
 
-        // Prefer NVIDIA_CONFIG_PATH, fall back to ./config.toml
+        // 优先用 NVIDIA_CONFIG_PATH，回退到 ./config.toml
         let config_path =
             std::env::var("NVIDIA_CONFIG_PATH").unwrap_or_else(|_| "config.toml".to_string());
 
@@ -718,15 +726,15 @@ impl Config {
             config.retry = toml_config.retry;
             config.allow_local_base_url = toml_config.allow_local_base_url;
             config.auth = toml_config.auth;
-            // Merge model_aliases: TOML-defined aliases take precedence, but
-            // we *add* (don't replace) the default set so callers can extend
-            // rather than override in the common case.
+            // 合并 model_aliases：TOML 中定义的别名优先，但我们对
+            // 默认集合是 *新增*（而非替换），这样调用方在常见情况下
+            // 是扩展而非覆盖。
             for (k, v) in toml_config.model_aliases.into_iter() {
                 config.model_aliases.insert(k, v);
             }
         }
 
-        // Override from environment variables (NVIDIA_*)
+        // 从环境变量覆盖（NVIDIA_*）
         Self::apply_env_overrides(&mut config);
 
         config.validate()?;
@@ -740,29 +748,16 @@ impl Config {
         Ok(config)
     }
 
-    /// Validate configuration values after all overrides have been applied.
-    /// Catches placeholder/fake values that would otherwise manifest as 401/404
-    /// failures at runtime.
+    /// 在所有 override 都应用之后校验配置值。拦截那些否则会在运行时
+    /// 表现为 401/404 失败的 placeholder/fake 值。
     pub fn validate(&self) -> Result<(), Box<dyn std::error::Error>> {
-        // base_url must be a real endpoint, not the default example domain or
-        // a loopback address. Using example.com/localhost in production means
-        // every upstream request will 404/401 and burn retry budget.
+        // base_url 必须是真实端点，而不是默认的 example 域名或某个
+        // loopback 地址。在生产里用 example.com/localhost 意味着每个
+        // 上游请求都会 404/401，把重试预算白白烧掉。
         if self.base_url.is_empty() {
             return Err("base_url must not be empty".into());
         }
         let base_lower = self.base_url.to_ascii_lowercase();
-        if !self.allow_local_base_url
-            && (base_lower.contains("example.com")
-                || base_lower.contains("localhost")
-                || base_lower.contains("127.0.0.1"))
-        {
-            return Err(format!(
-                "base_url '{}' looks like a placeholder/development endpoint; \
-                 set a real NVIDIA API base URL",
-                self.base_url
-            )
-            .into());
-        }
         if !base_lower.starts_with("http://") && !base_lower.starts_with("https://") {
             return Err(format!(
                 "base_url '{}' must start with http:// or https://",
@@ -770,10 +765,31 @@ impl Config {
             )
             .into());
         }
+        if !self.allow_local_base_url {
+            // 按 *authority host* 拒绝开发/占位主机，而不是按子串——
+            // 子串匹配会误拒那些只是恰好包含 "example.com" 或 "localhost"
+            // 的合法域名（如 `https://api.example-cloud.nvidia.com`）。
+            // 我们自己解析出 host 部分，以免引入 URL crate。
+            if let Some(host) = host_of_url(&self.base_url) {
+                let host_lower = host.to_ascii_lowercase();
+                if host_lower == "localhost"
+                    || host_lower == "example.com"
+                    || host_lower == "127.0.0.1"
+                    || host_lower == "::1"
+                {
+                    return Err(format!(
+                        "base_url '{}' points at a placeholder/development host ({}); \
+                         set a real NVIDIA API base URL",
+                        self.base_url, host_lower
+                    )
+                    .into());
+                }
+            }
+        }
 
-        // Reject obviously fake/test keys before startup. The log showed
-        // fake***-key / dumm***_key / cursor-dummy-key causing 401s; failing
-        // fast here prevents silent operation on a broken key pool.
+        // 启动前拒绝明显的 fake/test key。日志里出现过 fake***-key /
+        // dumm***_key / cursor-dummy-key 导致 401；在这里快速失败可避免
+        // 在一个坏掉的 key pool 上静默运行。
         if self.keys.is_empty() {
             return Err(
                 "No API keys configured. Set `keys` in config.toml or NVIDIA_KEYS env var.".into(),
@@ -803,25 +819,60 @@ impl Config {
             }
         }
 
-        // Warn if the per-request timeout is so short that it will trip on
-        // normal LLM response latency. The failure.log showed timeout=1s on
-        // chat completions, which is almost certainly a misconfiguration.
+        // 若单请求超时短到会撞上 LLM 正常响应延迟，则告警。
+        // failure.log 里出现过 chat completions 上 timeout=1s，几乎可肯定是
+        // 误配置。
         if self.request_timeout_seconds > 0 && self.request_timeout_seconds < 5 {
             warn!(
-                "request_timeout_seconds={} is very short; consider 30+ seconds for non-streaming requests",
+                "request_timeout_seconds={} 过短；非流式请求建议 30 秒以上",
                 self.request_timeout_seconds
             );
         }
-        // Warn if streaming timeout is configured but very short
+        // 若配置了流式超时但过短，则告警
         if self.request_timeout_streaming_seconds > 0 && self.request_timeout_streaming_seconds < 5 {
             warn!(
-                "request_timeout_streaming_seconds={} is very short; consider 60+ seconds for streaming",
+                "request_timeout_streaming_seconds={} 过短；流式建议 60 秒以上",
                 self.request_timeout_streaming_seconds
             );
         }
 
-        info!("Configuration validation passed");
+        info!("配置校验通过");
         Ok(())
+    }
+
+    /// 把一个 NVIDIA_* 环境变量 override 解析进目标字段，失败时告警，
+    /// 而非静默丢弃。把坏值留在日志里，可让运维发现一个原本很难察觉的
+    /// 手误（如 `NVIDIA_REQUEST_MAX_PROMPT_TOKENS=90kk`）——否则
+    /// override 会被忽略，默认/已配置值静默保留，此前这让该操作看起来像
+    /// 一次没有任何诊断的无操作。
+    fn env_parse_into<T: std::str::FromStr>(key: &str, value: &str, target: &mut T)
+    where
+        <T as std::str::FromStr>::Err: std::fmt::Debug,
+    {
+        match value.parse::<T>() {
+            Ok(v) => *target = v,
+            Err(e) => warn!(
+                env = key,
+                raw = value,
+                error = ?e,
+                "忽略格式错误的 NVIDIA_* override；使用已配置/默认值",
+            ),
+        }
+    }
+
+    /// 与 `env_parse_into` 相同，但用于可 serde 反序列化的 override
+    ///（两个 `*_per_model` JSON-map 字段）。解析错误的告警用 `Display`，
+    /// 因为 serde_json 的错误在 Debug-friendly 上并不一致。
+    fn env_json_into<T: serde::de::DeserializeOwned>(key: &str, value: &str, target: &mut T) {
+        match serde_json::from_str::<T>(value) {
+            Ok(v) => *target = v,
+            Err(e) => warn!(
+                env = key,
+                raw = value,
+                error = %e,
+                "忽略格式错误的 NVIDIA_* JSON override；使用已配置/默认值",
+            ),
+        }
     }
 
     fn apply_env_overrides(config: &mut Config) {
@@ -833,12 +884,21 @@ impl Config {
             let key_lower = key.to_ascii_lowercase();
             match key_lower.as_str() {
                 "listen_addr" => {
-                    if let Ok(addr) = value.parse::<SocketAddr>() {
-                        config.listen_addr = addr.to_string();
+                    // SocketAddr 不是直接存在结构体里（存的是 String），
+                    // 所以先 parse 再 stringify；格式错误时告警，让
+                    // NVIDIA_LISTEN_ADDR 里的手误足够显眼，而不是一次无操作。
+                    match value.parse::<SocketAddr>() {
+                        Ok(addr) => config.listen_addr = addr.to_string(),
+                        Err(e) => warn!(
+                            env = key,
+                            raw = value,
+                            error = ?e,
+                            "忽略格式错误的 NVIDIA_* override；使用已配置/默认值",
+                        ),
                     }
                 }
                 "base_url" => config.base_url = value,
-                // keys: comma-separated list
+                // keys：逗号分隔的列表
                 "keys" => {
                     config.keys = value
                         .split(',')
@@ -846,240 +906,62 @@ impl Config {
                         .filter(|s| !s.is_empty())
                         .collect();
                 }
-                "rate_limiter_qps_per_key" => {
-                    if let Ok(v) = value.parse::<f64>() {
-                        config.rate_limiter.qps_per_key = v;
-                    }
-                }
-                "rate_limiter_burst" => {
-                    if let Ok(v) = value.parse::<u64>() {
-                        config.rate_limiter.burst = v;
-                    }
-                }
-                "rate_limiter_token_wait_ms" => {
-                    if let Ok(v) = value.parse::<u64>() {
-                        config.rate_limiter.token_wait_ms = v;
-                    }
-                }
-                "cooldown_base_seconds" => {
-                    if let Ok(v) = value.parse::<u64>() {
-                        config.cooldown.base_seconds = v;
-                    }
-                }
-                "cooldown_max_seconds" => {
-                    if let Ok(v) = value.parse::<u64>() {
-                        config.cooldown.max_seconds = v;
-                    }
-                }
-                "health_check_interval_seconds" => {
-                    if let Ok(v) = value.parse::<u64>() {
-                        config.health_check.interval_seconds = v;
-                    }
-                }
-                "health_check_timeout_seconds" => {
-                    if let Ok(v) = value.parse::<u64>() {
-                        config.health_check.timeout_seconds = v;
-                    }
-                }
-                "health_check_max_consecutive_failures" => {
-                    if let Ok(v) = value.parse::<usize>() {
-                        config.health_check.max_consecutive_failures = v;
-                    }
-                }
-                "observability_enable_metrics" => {
-                    if let Ok(v) = value.parse::<bool>() {
-                        config.observability.enable_metrics = v;
-                    }
-                }
+                "rate_limiter_qps_per_key" => Self::env_parse_into(&key, &value, &mut config.rate_limiter.qps_per_key),
+                "rate_limiter_burst" => Self::env_parse_into(&key, &value, &mut config.rate_limiter.burst),
+                "rate_limiter_token_wait_ms" => Self::env_parse_into(&key, &value, &mut config.rate_limiter.token_wait_ms),
+                "cooldown_base_seconds" => Self::env_parse_into(&key, &value, &mut config.cooldown.base_seconds),
+                "cooldown_max_seconds" => Self::env_parse_into(&key, &value, &mut config.cooldown.max_seconds),
+                "health_check_interval_seconds" => Self::env_parse_into(&key, &value, &mut config.health_check.interval_seconds),
+                "health_check_timeout_seconds" => Self::env_parse_into(&key, &value, &mut config.health_check.timeout_seconds),
+                "health_check_max_consecutive_failures" => Self::env_parse_into(&key, &value, &mut config.health_check.max_consecutive_failures),
+                "observability_enable_metrics" => Self::env_parse_into(&key, &value, &mut config.observability.enable_metrics),
                 "observability_metrics_path" => {
                     config.observability.metrics_path = value;
                 }
                 "observability_log_level" => {
                     config.observability.log_level = value;
                 }
-                "request_timeout_seconds" => {
-                    if let Ok(v) = value.parse::<u64>() {
-                        config.request_timeout_seconds = v;
-                    }
-                }
-                "retry_max_retries" => {
-                    if let Ok(v) = value.parse::<u32>() {
-                        config.retry.max_retries = v;
-                    }
-                }
-                "retry_backoff_base_ms" => {
-                    if let Ok(v) = value.parse::<u64>() {
-                        config.retry.backoff_base_ms = v;
-                    }
-                }
-                "retry_backoff_max_ms" => {
-                    if let Ok(v) = value.parse::<u64>() {
-                        config.retry.backoff_max_ms = v;
-                    }
-                }
-                "retry_auth_fail_threshold" => {
-                    if let Ok(v) = value.parse::<u32>() {
-                        config.retry.auth_fail_threshold = v;
-                    }
-                }
-                "retry_max_key_switches" => {
-                    if let Ok(v) = value.parse::<u32>() {
-                        config.retry.max_key_switches = v;
-                    }
-                }
-                "allow_local_base_url" => {
-                    if let Ok(v) = value.parse::<bool>() {
-                        config.allow_local_base_url = v;
-                    }
-                }
-                "auth_enabled" => {
-                    if let Ok(v) = value.parse::<bool>() {
-                        config.auth.enabled = v;
-                    }
-                }
+                "request_timeout_seconds" => Self::env_parse_into(&key, &value, &mut config.request_timeout_seconds),
+                "retry_max_retries" => Self::env_parse_into(&key, &value, &mut config.retry.max_retries),
+                "retry_backoff_base_ms" => Self::env_parse_into(&key, &value, &mut config.retry.backoff_base_ms),
+                "retry_backoff_max_ms" => Self::env_parse_into(&key, &value, &mut config.retry.backoff_max_ms),
+                "retry_auth_fail_threshold" => Self::env_parse_into(&key, &value, &mut config.retry.auth_fail_threshold),
+                "retry_max_key_switches" => Self::env_parse_into(&key, &value, &mut config.retry.max_key_switches),
+                "allow_local_base_url" => Self::env_parse_into(&key, &value, &mut config.allow_local_base_url),
+                "auth_enabled" => Self::env_parse_into(&key, &value, &mut config.auth.enabled),
                 "auth_bearer_token" => {
                     config.auth.bearer_token = value;
                 }
                 "auth_admin_token" => {
                     config.auth.admin_token = value;
                 }
-                "inject_stream_usage" => {
-                    if let Ok(v) = value.parse::<bool>() {
-                        config.inject_stream_usage = v;
-                    }
-                }
-                "synthesize_empty_choices" => {
-                    if let Ok(v) = value.parse::<bool>() {
-                        config.synthesize_empty_choices = v;
-                    }
-                }
-                "retry_on_empty_shell" => {
-                    if let Ok(v) = value.parse::<bool>() {
-                        config.retry_on_empty_shell = v;
-                    }
-                }
-                "empty_shell_retry_max_tokens" => {
-                    if let Ok(v) = value.parse::<u64>() {
-                        config.empty_shell_retry_max_tokens = v;
-                    }
-                }
-                "empty_shell_retry_attempts" => {
-                    if let Ok(v) = value.parse::<u32>() {
-                        config.empty_shell_retry_attempts = v;
-                    }
-                }
-                "empty_shell_probe_before_retry" => {
-                    if let Ok(v) = value.parse::<bool>() {
-                        config.empty_shell_probe_before_retry = v;
-                    }
-                }
-                "circuit_breaker_threshold" => {
-                    if let Ok(v) = value.parse::<u32>() {
-                        config.circuit_breaker_threshold = v;
-                    }
-                }
-                "circuit_breaker_per_model" => {
-                    if let Ok(v) = value.parse::<bool>() {
-                        config.circuit_breaker_per_model = v;
-                    }
-                }
-                "empty_shell_retry_backoff_base_ms" => {
-                    if let Ok(v) = value.parse::<u64>() {
-                        config.empty_shell_retry_backoff_base_ms = v;
-                    }
-                }
-                "empty_shell_retry_backoff_max_ms" => {
-                    if let Ok(v) = value.parse::<u64>() {
-                        config.empty_shell_retry_backoff_max_ms = v;
-                    }
-                }
-                "empty_shell_pre_clamp_max_tokens" => {
-                    // Parse as JSON object: {"model": max_tokens}
-                    if let Ok(map) = serde_json::from_str::<std::collections::HashMap<String, u64>>(&value) {
-                        config.empty_shell_pre_clamp_max_tokens = map;
-                    }
-                }
-                "empty_shell_no_retry_prompt_tokens" => {
-                    if let Ok(v) = value.parse::<u64>() {
-                        config.empty_shell_no_retry_prompt_tokens = v;
-                    }
-                }
-                "request_max_prompt_tokens" => {
-                    if let Ok(v) = value.parse::<u64>() {
-                        config.request_max_prompt_tokens = v;
-                    }
-                }
-                "est_image_token_cost" => {
-                    if let Ok(v) = value.parse::<u64>() {
-                        config.est_image_token_cost = v;
-                    }
-                }
-                "est_audio_token_per_kb" => {
-                    if let Ok(v) = value.parse::<u64>() {
-                        config.est_audio_token_per_kb = v;
-                    }
-                }
-                "est_audio_token_cap" => {
-                    if let Ok(v) = value.parse::<u64>() {
-                        config.est_audio_token_cap = v;
-                    }
-                }
-                "est_unknown_part_token_cap" => {
-                    if let Ok(v) = value.parse::<u64>() {
-                        config.est_unknown_part_token_cap = v;
-                    }
-                }
-                "max_tokens_max" => {
-                    if let Ok(v) = value.parse::<u64>() {
-                        config.max_tokens_max = v;
-                    }
-                }
-                "retry_on_503" => {
-                    if let Ok(v) = value.parse::<bool>() {
-                        config.retry_on_503 = v;
-                    }
-                }
-                "probe_before_503_retry" => {
-                    if let Ok(v) = value.parse::<bool>() {
-                        config.probe_before_503_retry = v;
-                    }
-                }
-                "retry_on_500" => {
-                    if let Ok(v) = value.parse::<bool>() {
-                        config.retry_on_500 = v;
-                    }
-                }
-                "request_timeout_streaming_seconds" => {
-                    if let Ok(v) = value.parse::<u64>() {
-                        config.request_timeout_streaming_seconds = v;
-                    }
-                }
-                "concurrency_limit_per_model" => {
-                    // Parse as JSON object: {"model": limit}
-                    if let Ok(map) = serde_json::from_str::<std::collections::HashMap<String, u32>>(&value) {
-                        config.concurrency_limit_per_model = map;
-                    }
-                }
-                "concurrency_queue_timeout_ms" => {
-                    if let Ok(v) = value.parse::<u64>() {
-                        config.concurrency_queue_timeout_ms = v;
-                    }
-                }
-                "upstream_connect_timeout_secs" => {
-                    if let Ok(v) = value.parse::<u64>() {
-                        config.upstream_connect_timeout_secs = v;
-                    }
-                }
-                "upstream_pool_idle_timeout_secs" => {
-                    if let Ok(v) = value.parse::<u64>() {
-                        config.upstream_pool_idle_timeout_secs = v;
-                    }
-                }
-                "retry_jitter_ms" => {
-                    if let Ok(v) = value.parse::<u64>() {
-                        config.retry_jitter_ms = v;
-                    }
-                }
+                "inject_stream_usage" => Self::env_parse_into(&key, &value, &mut config.inject_stream_usage),
+                "synthesize_empty_choices" => Self::env_parse_into(&key, &value, &mut config.synthesize_empty_choices),
+                "retry_on_empty_shell" => Self::env_parse_into(&key, &value, &mut config.retry_on_empty_shell),
+                "empty_shell_retry_max_tokens" => Self::env_parse_into(&key, &value, &mut config.empty_shell_retry_max_tokens),
+                "empty_shell_retry_attempts" => Self::env_parse_into(&key, &value, &mut config.empty_shell_retry_attempts),
+                "empty_shell_probe_before_retry" => Self::env_parse_into(&key, &value, &mut config.empty_shell_probe_before_retry),
+                "circuit_breaker_threshold" => Self::env_parse_into(&key, &value, &mut config.circuit_breaker_threshold),
+                "circuit_breaker_per_model" => Self::env_parse_into(&key, &value, &mut config.circuit_breaker_per_model),
+                "empty_shell_retry_backoff_base_ms" => Self::env_parse_into(&key, &value, &mut config.empty_shell_retry_backoff_base_ms),
+                "empty_shell_retry_backoff_max_ms" => Self::env_parse_into(&key, &value, &mut config.empty_shell_retry_backoff_max_ms),
+                "empty_shell_pre_clamp_max_tokens" => Self::env_json_into(&key, &value, &mut config.empty_shell_pre_clamp_max_tokens),
+                "empty_shell_no_retry_prompt_tokens" => Self::env_parse_into(&key, &value, &mut config.empty_shell_no_retry_prompt_tokens),
+                "request_max_prompt_tokens" => Self::env_parse_into(&key, &value, &mut config.request_max_prompt_tokens),
+                "est_image_token_cost" => Self::env_parse_into(&key, &value, &mut config.est_image_token_cost),
+                "est_audio_token_per_kb" => Self::env_parse_into(&key, &value, &mut config.est_audio_token_per_kb),
+                "est_audio_token_cap" => Self::env_parse_into(&key, &value, &mut config.est_audio_token_cap),
+                "est_unknown_part_token_cap" => Self::env_parse_into(&key, &value, &mut config.est_unknown_part_token_cap),
+                "max_tokens_max" => Self::env_parse_into(&key, &value, &mut config.max_tokens_max),
+                "retry_on_503" => Self::env_parse_into(&key, &value, &mut config.retry_on_503),
+                "probe_before_503_retry" => Self::env_parse_into(&key, &value, &mut config.probe_before_503_retry),
+                "retry_on_500" => Self::env_parse_into(&key, &value, &mut config.retry_on_500),
+                "request_timeout_streaming_seconds" => Self::env_parse_into(&key, &value, &mut config.request_timeout_streaming_seconds),
+                "concurrency_limit_per_model" => Self::env_json_into(&key, &value, &mut config.concurrency_limit_per_model),
+                "concurrency_queue_timeout_ms" => Self::env_parse_into(&key, &value, &mut config.concurrency_queue_timeout_ms),
+                "upstream_connect_timeout_secs" => Self::env_parse_into(&key, &value, &mut config.upstream_connect_timeout_secs),
+                "upstream_pool_idle_timeout_secs" => Self::env_parse_into(&key, &value, &mut config.upstream_pool_idle_timeout_secs),
+                "retry_jitter_ms" => Self::env_parse_into(&key, &value, &mut config.retry_jitter_ms),
                 _ => {}
             }
         }

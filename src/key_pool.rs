@@ -7,8 +7,8 @@ use tracing::{info, warn};
 use crate::config::Config;
 use crate::metrics::Metrics;
 
-/// Mask an API key for display: first 4 chars + "***" + last 4 chars.
-/// If the key has fewer than 8 characters, returns "***".
+/// 对 API key 做掩码以便展示：前 4 个字符 + "***" + 后 4 个字符。
+/// 若 key 少于 8 个字符，则返回 "***"。
 pub fn mask_key(key: &str) -> String {
     let chars: Vec<char> = key.chars().collect();
     if chars.len() < 8 {
@@ -19,7 +19,7 @@ pub fn mask_key(key: &str) -> String {
     format!("{}***{}", first, last)
 }
 
-/// Unique identifier for a key (we keep the string in an Arc to avoid cloning).
+/// Key 的唯一标识（字符串放在 Arc 里以避免克隆）。
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct KeyId(pub Arc<String>);
 
@@ -30,48 +30,45 @@ pub enum KeyState {
     Cooling {
         ready_at: Instant,
     },
-    /// Disabled after repeated auth failures. `ready_at` is a fallback expiry:
-    /// if a health probe never recovers the key (probe endpoint itself is
-    /// unavailable, or probes keep failing), `cool_down_task` will reactivate
-    /// the key once `ready_at` passes — so the pool can't permanently shrink
-    /// to zero when probes fail.
+    /// 多次鉴权失败后被禁用。`ready_at` 是一个兜底过期时间：
+    /// 如果健康探测一直没能恢复该 key（探测端点本身不可用，或探测持续失败），
+    /// `cool_down_task` 会在 `ready_at` 到期后重新激活该 key —— 这样在探测
+    /// 全部失败时，池也不会永久收缩到零。
     Disabled {
         ready_at: Instant,
     },
 }
 
-/// Internal state stored per key.
+/// 每个 key 存储的内部状态。
 #[derive(Debug)]
 pub struct InnerKeyState {
     pub key: Arc<String>,
     pub state: KeyState,
-    pub weight: u32, // penalty multiplier for score-based selection
+    pub weight: u32, // 打分选择时的惩罚倍数
     pub fail_count: u32,
     pub last_success: Option<Instant>,
     pub bucket: TokenBucket,
-    /// Consecutive empty-shell or 504 responses for circuit breaker.
-    /// If circuit_breaker_per_model is true, tracks per-model counts.
-    /// Otherwise uses "global" key.
+    /// 熔断器使用的连续空壳/504 响应计数。
+    /// 若 circuit_breaker_per_model 为 true，按 model 维度分别计数；
+    /// 否则使用 "global" 这个 key。
     pub circuit_breaker_failures: std::collections::HashMap<String, u32>,
 }
 
-/// Public handle to a key's state (cloneable, cheap).
+/// 指向某个 key 状态的公开句柄（可低成本克隆）。
 #[derive(Debug, Clone)]
 pub struct KeyStateHandle {
     pub(crate) inner: Arc<RwLock<InnerKeyState>>,
-    /// How many requests currently hold this key (acquired but not yet
-    /// returned / released). Kept outside `inner` so we can update it
-    /// synchronously without ever locking the async RwLock.
+    /// 当前持有该 key 的请求数（已获取但尚未归还）。放在 `inner` 之外，这样
+    /// 我们可以同步更新它，而不必去锁那个 async RwLock。
     pub(crate) in_flight: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl KeyStateHandle {
-    /// Returns the key as an owned String.
+    /// 以 owned String 返回该 key。
     ///
-    /// Uses the async `read()` path rather than `blocking_read()`, which
-    /// panics when called from inside a tokio runtime worker thread (the
-    /// exact panic we hit before this fix).  Tokio's `RwLock` is never
-    /// poisoned, so `read().await` is both safe and correct here.
+    /// 走 async 的 `read()` 路径而非 `blocking_read()`——后者在 tokio
+    /// runtime worker 线程里调用会 panic（正是我们此前踩过的那个 panic）。
+    /// tokio 的 `RwLock` 永不中毒，所以这里 `read().await` 既安全又正确。
     pub async fn key(&self) -> String {
         let guard = self.inner.read().await;
         (*guard.key).clone()
@@ -86,7 +83,7 @@ impl KeyStateHandle {
         self.inner.read().await.state
     }
 
-    /// Current consecutive auth/forbidden failure counter.
+    /// 当前连续的鉴权/403 失败计数。
     pub async fn fail_count(&self) -> u32 {
         self.inner.read().await.fail_count
     }
@@ -124,12 +121,11 @@ impl KeyStateHandle {
     pub async fn set_last_success(&self) {
         let mut guard = self.inner.write().await;
         guard.last_success = Some(Instant::now());
-        // Reset circuit breaker on success
+        // 成功时重置熔断器
         guard.circuit_breaker_failures.clear();
     }
 
-    /// Increment circuit breaker failure count for a specific model.
-    /// Returns true if threshold is exceeded.
+    /// 增加某 model 的熔断失败计数。超过阈值时返回 true。
     pub async fn increment_circuit_breaker(&self, model: &str, threshold: u32) -> bool {
         let mut guard = self.inner.write().await;
         let count = guard.circuit_breaker_failures.entry(model.to_string()).or_insert(0);
@@ -137,25 +133,25 @@ impl KeyStateHandle {
         *count >= threshold
     }
 
-    /// Check if circuit breaker threshold is exceeded for a model.
+    /// 检查某 model 是否已超过熔断阈值。
     pub async fn check_circuit_breaker(&self, model: &str, threshold: u32) -> bool {
         let guard = self.inner.read().await;
         guard.circuit_breaker_failures.get(model).map_or(false, |c| *c >= threshold)
     }
 
-    /// Reset circuit breaker failure count for a model.
+    /// 重置某 model 的熔断失败计数。
     pub async fn reset_circuit_breaker(&self, model: &str) {
         let mut guard = self.inner.write().await;
         guard.circuit_breaker_failures.remove(model);
     }
 
-    /// Reset all circuit breaker failure counts.
+    /// 重置所有 model 的熔断失败计数。
     pub async fn reset_all_circuit_breakers(&self) {
         let mut guard = self.inner.write().await;
         guard.circuit_breaker_failures.clear();
     }
 
-    // ── in-flight tracking ──────────────────────────────────────────
+    // ── 在途计数 ────────────────────────────────────────────────────
 
     pub fn inc_in_flight(&self) {
         self.in_flight
@@ -169,10 +165,17 @@ impl KeyStateHandle {
         self.in_flight.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Try to consume one token from the key's bucket with a deadline.
-    /// Returns `true` when the token was consumed before the deadline,
-    /// `false` when the deadline elapsed without success. The caller should
-    /// drop this key handle and acquire a different one on `false`.
+    /// 该句柄的稳定身份标识：共享 `inner` 状态的内存地址。两个句柄指向
+    /// 同一个 key 槽位时才相等（句柄只是共享同一个 `Arc` 的低成本克隆）。
+    /// 代理层的 tried-key 集合用它来在重试时可靠地排除刚失败的 key —— 句柄
+    /// 自身的栈地址在调用间并不稳定，但这个 Arc 指针是稳定的。
+    pub fn identity(&self) -> u64 {
+        std::sync::Arc::as_ptr(&self.inner) as u64
+    }
+
+    /// 在截止时间前尝试从该 key 的桶里消费一个令牌。
+    /// 在截止时间前消费成功返回 `true`；截止时间到仍未成功返回 `false`。
+    /// 调用方在收到 `false` 时应丢弃该 key 句柄并去获取另一个。
     pub async fn try_consume_token(&self, timeout_ms: u64) -> bool {
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
         let guard = self.inner.read().await;
@@ -183,16 +186,15 @@ impl KeyStateHandle {
             .is_ok()
     }
 
-    /// Available tokens in this key's bucket (for score calculation).
+    /// 该 key 桶中当前可用令牌数（用于打分计算）。
     pub async fn available_tokens(&self) -> f64 {
         let guard = self.inner.read().await;
         guard.bucket.available_tokens().await
     }
 }
 
-/// Simple token bucket implementation. Not Clone — cloning would silently
-/// reset `tokens` and `last_refill`, bypassing the rate limit. Each key owns
-/// exactly one bucket for its lifetime.
+/// 简单的令牌桶实现。不可 Clone —— 克隆会静默重置 `tokens` 和
+/// `last_refill`，从而绕过限流。每个 key 在其生命周期内只持有一个桶。
 pub struct TokenBucket {
     capacity: f64,
     refill_per_sec: f64,
@@ -200,10 +202,10 @@ pub struct TokenBucket {
     last_refill: Mutex<Instant>,
 }
 
-/// Outcome of a non-blocking consume attempt.
+/// 非阻塞消费尝试的结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConsumeError {
-    /// Bucket has fewer tokens than requested right now.
+    /// 当前桶中令牌数少于请求数量。
     NotEnough,
 }
 
@@ -213,13 +215,12 @@ impl TokenBucket {
         Self {
             capacity: cap,
             refill_per_sec,
-            tokens: Mutex::new(cap), // start full
+            tokens: Mutex::new(cap), // 起始即满
             last_refill: Mutex::new(Instant::now()),
         }
     }
 
-    /// Refill the bucket proportionally to elapsed time. Must be called with
-    /// both mutexes held.
+    /// 按经过时间比例补充令牌。调用时必须同时持有两把锁。
     fn refill_locked(&self, toks: &mut f64, last: &mut Instant) {
         let now = Instant::now();
         let elapsed = now.duration_since(*last).as_secs_f64();
@@ -229,8 +230,8 @@ impl TokenBucket {
         }
     }
 
-    /// Non-blocking snapshot of the current available tokens (after a refill
-    /// pass). Returns `capacity` if the refill rate is zero (bucket stays full).
+    /// 当前可用令牌的非阻塞快照（在刷新补充之后）。若补充速率为零（桶保持
+    /// 全满）则返回 `capacity`。
     pub async fn available_tokens(&self) -> f64 {
         if self.refill_per_sec <= 0.0 {
             return self.capacity;
@@ -241,19 +242,18 @@ impl TokenBucket {
         *toks
     }
 
-    /// Try to consume `tokens` **without blocking**. Returns `Ok(())` if the
-    /// bucket had enough tokens (they are deducted atomically with the refill
-    /// pass). Returns `Err(NotEnough)` otherwise — caller should either wait
-    /// or switch to another key.
+    /// 尝试**不阻塞**地消费 `tokens` 个令牌。桶中令牌足够时返回 `Ok(())`
+    /// （随刷新补充一起原子地扣除令牌）；否则返回 `Err(NotEnough)` —— 调用方
+    /// 应当等待或切换到另一个 key。
     pub async fn try_consume(&self, tokens: f64) -> Result<(), ConsumeError> {
         if tokens <= 0.0 {
             return Ok(());
         }
-        if self.refill_per_sec <= 0.0 {
-            // No refill — permanent bucket; consume from the initial capacity.
-        }
         let mut toks = self.tokens.lock().await;
         let mut last = self.last_refill.lock().await;
+        // refill_locked 在 refill_per_sec == 0 时是空操作（内部有判断），
+        // 所以一个永久（不补充）的桶在这里就是从初始容量里往下扣 —— 效果与
+        // 显式提前返回的 consume() 一样，只是不走那条特判分支。
         self.refill_locked(&mut toks, &mut last);
         if *toks >= tokens {
             *toks -= tokens;
@@ -262,9 +262,8 @@ impl TokenBucket {
         Err(ConsumeError::NotEnough)
     }
 
-    /// Consume `tokens`, waiting at most until `deadline`. Returns `Ok(())`
-    /// on success, `Err(ConsumeError::NotEnough)` if the deadline elapsed
-    /// before enough tokens accumulated.
+    /// 消费 `tokens` 个令牌，最多等待到 `deadline`。成功返回 `Ok(())`，
+    /// 截止时间前仍未攒够令牌则返回 `Err(ConsumeError::NotEnough)`。
     pub async fn consume_with_timeout(
         &self,
         tokens: f64,
@@ -274,11 +273,11 @@ impl TokenBucket {
             return Ok(());
         }
         if self.refill_per_sec <= 0.0 {
-            // No refill: try once and bail.
+            // 不补充：尝试一次就放弃。
             return self.try_consume(tokens).await;
         }
         loop {
-            // Fast path: refill + check.
+            // 快速路径：刷新补充 + 检查。
             {
                 let mut toks = self.tokens.lock().await;
                 let mut last = self.last_refill.lock().await;
@@ -289,18 +288,17 @@ impl TokenBucket {
                 }
                 let need = tokens - *toks;
                 drop((toks, last));
-                // How long until we'd have enough if nobody else consumes?
+                // 假如没人再消费，还要等多久才能凑够？
                 let wait_secs = need / self.refill_per_sec;
                 let now = Instant::now();
                 let target = now + Duration::from_secs_f64(wait_secs);
                 if target > deadline {
-                    // Would exceed the deadline — don't bother sleeping the
-                    // full interval; sleep until deadline then do a final
-                    // check (another consumer may have left tokens).
+                    // 会超过截止时间 —— 不必睡满整个间隔，直接睡到截止时间
+                    // 再做一次最终检查（可能有别的消费者留下了令牌）。
                     if deadline > now {
                         tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
                     }
-                    // Final attempt.
+                    // 最终尝试。
                     let mut toks = self.tokens.lock().await;
                     let mut last = self.last_refill.lock().await;
                     self.refill_locked(&mut toks, &mut last);
@@ -310,23 +308,21 @@ impl TokenBucket {
                     }
                     return Err(ConsumeError::NotEnough);
                 }
-                // Sleep until we expect enough, then loop to re-check under lock.
+                // 睡到预计凑够的时刻，然后在锁下重新检查再循环。
                 tokio::time::sleep_until(tokio::time::Instant::from_std(target)).await;
             }
         }
     }
 
-    /// Attempt to consume `tokens` tokens, waiting until enough are available.
-    /// Retained for backwards compatibility with tests; production code should
-    /// prefer `try_consume` / `consume_with_timeout` to avoid unbounded waits.
+    /// 尝试消费 `tokens` 个令牌，等待直到令牌足够。仅为兼容旧测试而保留；
+    /// 生产代码应优先使用 `try_consume` / `consume_with_timeout`，避免无限等待。
     #[deprecated = "使用 try_consume 或 consume_with_timeout 以支持超时换 key"]
     pub async fn consume(&self, tokens: f64) -> Result<(), ()> {
         if tokens <= 0.0 {
             return Ok(());
         }
         if self.refill_per_sec <= 0.0 {
-            // No refill configured — never block forever. Return success since
-            // the bucket starts full and we have no way to replenish.
+            // 没配置补充 —— 绝不永久阻塞。桶初始即满且无从补充，直接返回成功。
             return Ok(());
         }
         loop {
@@ -343,14 +339,14 @@ impl TokenBucket {
                 *toks -= tokens;
                 return Ok(());
             }
-            // Not enough tokens; release locks and sleep until we expect to have enough.
+            // 令牌不足；释放锁，睡到预计凑够的时刻。
             let need = tokens - *toks;
             drop((toks, last));
             let wait_secs = need / self.refill_per_sec;
             if wait_secs > 0.0 {
                 tokio::time::sleep(Duration::from_secs_f64(wait_secs)).await;
             }
-            // loop again
+            // 再循环一次
         }
     }
 }
@@ -365,9 +361,9 @@ impl std::fmt::Debug for TokenBucket {
     }
 }
 
-/// Build a fresh `KeyStateHandle` for `key_str` with a full token bucket and
-/// `Active` state. Shared by `KeyPool::new` (startup init) and `add_key`
-/// (runtime key injection) so both paths construct identical handles.
+/// 为 `key_str` 构造一个全新的 `KeyStateHandle`，带一个满的令牌桶和
+/// `Active` 状态。`KeyPool::new`（启动初始化）和 `add_key`（运行时注入 key）
+/// 都共用它，两条路径构造出的句柄完全一致。
 fn make_handle(config: &Config, key_str: &str) -> KeyStateHandle {
     let bucket = TokenBucket::new(
         config.rate_limiter.burst as u32,
@@ -392,11 +388,11 @@ fn make_handle(config: &Config, key_str: &str) -> KeyStateHandle {
 }
 
 pub struct KeyPool {
-    /// map from key string to handle
+    /// key 字符串到句柄的映射
     pub(crate) inner: RwLock<HashMap<String, KeyStateHandle>>,
     config: Config,
     metrics: Arc<Metrics>,
-    /// For broadcasting state changes (optional).
+    /// 用于广播状态变化（可选）。
     pub_notifier: tokio::sync::broadcast::Sender<KeyStateHandle>,
 }
 
@@ -404,7 +400,7 @@ impl KeyPool {
     pub fn new(config: &Config, metrics: Arc<Metrics>) -> Self {
         let (tx, _) = tokio::sync::broadcast::channel(16);
         let mut inner = HashMap::new();
-        // Initialize keys
+        // 初始化 keys
         for key_str in &config.keys {
             let handle = make_handle(config, key_str);
             inner.insert(key_str.clone(), handle);
@@ -417,22 +413,32 @@ impl KeyPool {
         }
     }
 
-    /// Acquires the best key via a score-based selection. After acquiring,
-    /// the caller **must** call `handle.dec_in_flight()` when the request
-    /// is complete (success or failure).
+    /// 通过打分选择获取最佳 key。获取后，调用方在请求完成时（无论成功还是
+    /// 失败）**必须**调用 `handle.dec_in_flight()`。
     ///
-    /// The score favours keys with more available tokens and fewer in-flight
-    /// requests. Multi-key ties are broken randomly. Keys with `weight` < 1
-    /// (penalised via `mark_failure`) see a proportional score penalty.
+    /// 打分优先选择可用令牌更多、在途请求更少的 key。多个 key 同分时随机打破
+    /// 平局。`weight` < 1 的 key（经 `mark_failure` 惩罚过）会按比例扣分。
     ///
-    /// Returns `None` when no active key exists.
+    /// 没有活跃 key 时返回 `None`。
     pub async fn acquire(&self) -> Option<KeyStateHandle> {
+        self.acquire_excluding(&[]).await
+    }
+
+    /// 与 `acquire` 类似，但绝不会返回指针哈希落在 `exclude_hashes` 中的 key。
+    /// 重试/令牌饥饿循环用它避免在本请求中再次选中刚刚失败的 key：否则刚失败的
+    /// key 在下一轮循环里可能被再次选中（`mark_failure` 只把它的权重减半，
+    /// 而非归零），白白浪费一个槽位和一次令牌消费尝试。没有活跃且未被排除的
+    /// key 时返回 `None`。
+    pub async fn acquire_excluding(
+        &self,
+        exclude_hashes: &[u64],
+    ) -> Option<KeyStateHandle> {
         let handles: Vec<KeyStateHandle> = {
             let read_guard = self.inner.read().await;
             read_guard.values().cloned().collect()
         };
 
-        // ── Collect active keys with computed scores ────────────────────
+        // ── 收集活跃 key 并计算打分 ────────────────────────────────────
         struct Candidate {
             handle: KeyStateHandle,
             score: f64,
@@ -440,12 +446,19 @@ impl KeyPool {
         const IN_FLIGHT_PENALTY: f64 = 0.15;
         let mut candidates: Vec<Candidate> = Vec::new();
         for handle in handles {
+            // 跳过调用方显式排除的 key（本请求已试过）。identity 是共享的
+            // `inner` Arc 指针，在句柄克隆之间保持稳定。
+            if !exclude_hashes.is_empty() {
+                if exclude_hashes.contains(&handle.identity()) {
+                    continue;
+                }
+            }
             let guard = handle.inner.read().await;
             let is_active = matches!(guard.state, KeyState::Active);
             if !is_active {
                 continue;
             }
-            // Compute score inside the read guard to minimise lock contention.
+            // 在读锁内计算打分，以尽量减少锁竞争。
             let available = guard.bucket.available_tokens().await;
             let capacity = guard.bucket.capacity;
             let in_flight = handle.in_flight.load(std::sync::atomic::Ordering::Relaxed) as f64;
@@ -464,7 +477,7 @@ impl KeyPool {
             return None;
         }
 
-        // ── Top-1 with random tie-break ─────────────────────────────────
+        // ── 取最高分，同分随机打破 ─────────────────────────────────────
         candidates.sort_by(|a, b| b.score.total_cmp(&a.score));
         let best_score = candidates[0].score;
         let top_n = candidates
@@ -481,10 +494,9 @@ impl KeyPool {
         Some(chosen.clone())
     }
 
-    /// Get all keys currently in Cooling state (for bad key recovery).
+    /// 获取当前处于 Cooling 状态的所有 key（用于坏 key 恢复）。
     pub async fn get_bad_keys(&self) -> Vec<String> {
-        // Snapshot the handles first so we don't hold the outer lock while
-        // awaiting each inner lock.
+        // 先快照句柄，这样在逐个等待内部锁时不会持有外层锁。
         let handles: Vec<(String, KeyStateHandle)> = {
             let read_guard = self.inner.read().await;
             read_guard
@@ -502,7 +514,7 @@ impl KeyPool {
         bad
     }
 
-    /// Get all keys currently in Disabled state (for health-probe recovery).
+    /// 获取当前处于 Disabled 状态的所有 key（用于健康探测恢复）。
     pub async fn get_disabled_keys(&self) -> Vec<String> {
         let handles: Vec<(String, KeyStateHandle)> = {
             let read_guard = self.inner.read().await;
@@ -521,10 +533,20 @@ impl KeyPool {
         disabled
     }
 
-    /// Atomically record a non-throttling upstream auth/forbidden failure for
-    /// `key_str` and, if the consecutive failure count crosses the configured
-    /// threshold, transition the key to `KeyState::Disabled` until a health
-    /// probe recovers it. Returns `true` if the key was just disabled.
+    /// 原子地记录 `key_str` 的一次非限流上游鉴权/403 失败；若连续失败计数
+    /// 超过配置阈值，则将该 key 切换到 `KeyState::Disabled`，直到健康探测恢复
+    /// 它。若该 key 正是该次被禁用的则返回 `true`。
+    /// 原子地记录 `key_str` 的一次非限流上游鉴权/403 失败；若连续失败计数
+    /// 超过配置阈值，则将该 key 切换到 `KeyState::Disabled`，直到健康探测恢复
+    /// 它。若该 key 正是该次被禁用的则返回 `true`。
+    ///
+    /// 这条路径在每一个上游响应（401/500/429 且无 Retry-After）上都会执行。
+    /// 我们刻意**不**在这里调用 `refresh_metrics()`：那会在热路径上做一次
+    /// O(N) 的全 key 状态清点（每个 key 每次失败都要一次 async 读锁）。Prometheus
+    /// 的 key 状态 gauge 由 `cool_down_task` 周期性的 `refresh_metrics()`（每
+    /// `health_check.interval_seconds` 一次）保持新鲜，所以 gauge 最多滞后一个
+    /// 周期 —— 这是我们为不在每次错误响应上串行 N 次锁获取而做的有意权衡。
+    /// `main.rs` 在启动时也会调用一次 `refresh_metrics()`。
     pub async fn mark_failure(&self, key_str: &str, threshold: u32) -> bool {
         let read_guard = self.inner.read().await;
         if let Some(handle) = read_guard.get(key_str) {
@@ -534,13 +556,12 @@ impl KeyPool {
             let fail_count = handle.fail_count().await;
             let already_disabled = matches!(handle.state().await, KeyState::Disabled { .. });
             if already_disabled {
-                // Already disabled; nothing more to do (weight is already 1).
-                self.refresh_metrics().await;
+                // 已禁用；无需再做什么（权重已是 1）。
                 return true;
             }
-            // Halve the weight even below threshold so the next weighted-random
-            // `acquire()` is unlikely to re-pick this same key within one retry
-            // sequence. Fix for "retry wastes an attempt on the same bad key".
+            // 即便没到阈值也把权重减半，这样下一次加权随机的 `acquire()`
+            // 在一个重试序列内不太可能再选中同一个坏 key。修复"重试在同一个坏
+            // key 上浪费一次尝试"的问题。
             {
                 let w = handle.weight().await as i32;
                 let delta = -(w.max(1) / 2);
@@ -554,27 +575,25 @@ impl KeyPool {
                     key = %mask_key(key_str),
                     fail_count,
                     threshold,
-                    "Key disabled after {} consecutive auth failures; awaiting health probe or expiry recovery",
+                    "连续 {} 次鉴权失败后禁用该 key；等待健康探测或过期恢复",
                     fail_count
                 );
                 let _ = self.pub_notifier.send(handle);
-                self.refresh_metrics().await;
                 return true;
             }
             warn!(
                 key = %mask_key(key_str),
                 fail_count,
                 threshold,
-                "Recorded non-throttling auth failure (no disable yet)",
+                "记录一次非限流鉴权失败（尚未禁用）",
             );
         }
-        self.refresh_metrics().await;
         false
     }
 
-    /// Force a key into `Disabled` state (used by the health checker when a
-    /// key's recovery probe errors `max_consecutive_failures` times in a row).
-    /// Mirrors the `Disabled` transition inside `mark_failure`.
+    /// 强制将一个 key 置于 `Disabled` 状态（当健康检查发现某 key 的恢复探测
+    /// 连续 `max_consecutive_failures` 次报错时使用）。与 `mark_failure` 中的
+    /// `Disabled` 转换逻辑一致。
     pub async fn disable_key(&self, key_str: &str) {
         let read_guard = self.inner.read().await;
         if let Some(handle) = read_guard.get(key_str) {
@@ -584,19 +603,19 @@ impl KeyPool {
             handle.set_state(KeyState::Disabled { ready_at }).await;
             warn!(
                 key = %mask_key(key_str),
-                "Key force-disabled by health probe (consecutive probe failures)"
+                "健康探测强制禁用该 key（连续探测失败）"
             );
             let _ = self.pub_notifier.send(handle);
         }
-        self.refresh_metrics().await;
+        // gauge 刷新推迟到 cool_down_task（参见 mark_failure 的说明）。
     }
 
-    /// Reactivate a previously Disabled key after a successful health probe.
+    /// 成功的健康探测后，重新激活一个此前被禁用的 key。
     pub async fn recover_disabled(&self, key_str: &str) {
         self.mark_good(key_str).await;
     }
 
-    /// Count keys by state — for Prometheus gauges.
+    /// 按状态统计 key 数量 —— 用于 Prometheus gauge。
     pub async fn count_states(&self) -> (i64, i64, i64) {
         let handles: Vec<KeyStateHandle> = {
             let read_guard = self.inner.read().await;
@@ -616,13 +635,13 @@ impl KeyPool {
         (active, cooling, disabled)
     }
 
-    /// Refresh the Prometheus key-state gauges if metrics are attached.
+    /// 若已挂载 metrics 则刷新 Prometheus 的 key 状态 gauge。
     pub async fn refresh_metrics(&self) {
         let (a, c, d) = self.count_states().await;
         self.metrics.set_key_counts(a, c, d);
     }
 
-    /// Mark a key as good (successful request)
+    /// 将 key 标记为正常（请求成功）。
     pub async fn mark_good(&self, key_str: &str) {
         let read_guard = self.inner.read().await;
         if let Some(handle) = read_guard.get(key_str) {
@@ -631,18 +650,24 @@ impl KeyPool {
             handle.set_state(KeyState::Active).await;
             handle.reset_weight().await;
             handle.reset_fail().await;
-            handle.reset_all_circuit_breakers().await; // Also reset circuit breaker on success
-            info!(key = %mask_key(key_str), "Marked key as good (active)");
+            handle.reset_all_circuit_breakers().await; // 成功时也重置熔断器
+            info!(key = %mask_key(key_str), "将 key 标记为正常（active）");
             let _ = self.pub_notifier.send(handle);
         }
-        self.refresh_metrics().await;
+        // gauge 刷新推迟到 cool_down_task（参见 mark_failure 的说明）。
     }
 
-    /// Mark a key as bad (got 429/403) and put it into cooldown.
+    /// 将 key 标记为坏（收到 429/403）并进入冷却。
     ///
-    /// If the upstream asks for a Retry-After longer than `cooldown.max_seconds`,
-    /// we cap it to `max_seconds` to prevent a single key from draining the
-    /// pool for an unbounded time. This is an intentional policy choice.
+    /// 若上游要求的 Retry-After 长于 `cooldown.max_seconds`，我们把它截断到
+    /// `max_seconds`，以避免单个 key 把池抽干到无上限的时间。这是有意的
+    /// 策略选择。
+    ///
+    /// 若该 key 已在 Cooling，只有当新的 `ready_at` 会**延长**既有冷却时
+    /// 才应用它 —— 绝不缩短。并发的 429 带着长 Retry-After，可能在数秒后
+    /// 紧接着又来一个带更短（或没有）Retry-After；没有这条取最大值规则，
+    /// 后到的调用会用更短的值覆盖既有的长冷却，违背上游的退避请求。非
+    /// Cooling 的先前状态（Active / Disabled）则照旧无条件覆盖。
     pub async fn mark_bad(&self, key_str: &str, retry_after: Option<u64>) {
         let read_guard = self.inner.read().await;
         if let Some(handle) = read_guard.get(key_str) {
@@ -651,7 +676,29 @@ impl KeyPool {
             let base = self.config.cooldown.base_seconds;
             let max = self.config.cooldown.max_seconds;
             let delay = retry_after.unwrap_or(base).min(max);
-            let ready_at = Instant::now() + Duration::from_secs(delay);
+            let new_ready_at = Instant::now() + Duration::from_secs(delay);
+            // 保留既有的更长冷却：只有当新的 ready_at 更晚时才覆盖
+            // Cooling 的 ready_at。首次标记（先前状态非 Cooling）则无条件覆盖。
+            let prev_ready_at = {
+                let guard = handle.inner.read().await;
+                if let KeyState::Cooling { ready_at } = guard.state {
+                    Some(ready_at)
+                } else {
+                    None
+                }
+            };
+            let ready_at = match prev_ready_at {
+                Some(prev) if prev > new_ready_at => prev,
+                _ => new_ready_at,
+            };
+            let applied_delay = ready_at
+                .checked_duration_since(Instant::now())
+                .map(|d| d.as_secs())
+                .filter(|&s| s > 0)
+                .unwrap_or(delay);
+            // `filter(s > 0)` 守住亚秒边界：当我们保留了更长的 `prev`
+            // ready_at 但只剩几百毫秒时，原始 `as_secs()` 会截断为 0，日志会
+            // 误读成"冷却 0 秒"。回退到新的 `delay` 让日志反映一个正的冷却预算。
             handle.set_state(KeyState::Cooling { ready_at }).await;
             let w = handle.weight().await as i32;
             let delta = -(w.max(1) / 2);
@@ -659,17 +706,17 @@ impl KeyPool {
             handle.increment_fail().await;
             warn!(
                 key = %mask_key(key_str),
-                delay = delay,
-                "Marked key as bad, cooling for {} seconds",
-                delay
+                delay = applied_delay,
+                "将 key 标记为坏，冷却 {} 秒",
+                applied_delay
             );
             let _ = self.pub_notifier.send(handle);
         }
-        self.refresh_metrics().await;
+        // gauge 刷新推迟到 cool_down_task（参见 mark_failure 的说明）。
     }
 
-    /// Increment circuit breaker failure count for a key and model (for empty-shell/504 responses).
-    /// Returns true if the threshold is exceeded.
+    /// 增加某 key、某 model 的熔断失败计数（针对空壳/504 响应）。超过阈值
+    /// 返回 true。
     pub async fn increment_circuit_breaker(&self, key_str: &str, model: &str, threshold: u32) -> bool {
         let read_guard = self.inner.read().await;
         if let Some(handle) = read_guard.get(key_str) {
@@ -681,7 +728,7 @@ impl KeyPool {
         }
     }
 
-    /// Check if a key has exceeded the circuit breaker threshold for a model.
+    /// 检查某 key 对某 model 是否已超过熔断阈值。
     pub async fn check_circuit_breaker(&self, key_str: &str, model: &str, threshold: u32) -> bool {
         let read_guard = self.inner.read().await;
         if let Some(handle) = read_guard.get(key_str) {
@@ -693,13 +740,12 @@ impl KeyPool {
         }
     }
 
-    /// Inject a key into the pool at runtime. Returns `true` if the key was
-    /// newly added, `false` if it already existed (its existing handle is left
-    /// untouched). The new key starts `Active` with a full token bucket and is
-    /// immediately eligible for `acquire()`.
+    /// 在运行时向池中注入一个 key。key 是新加入的返回 `true`，已存在则
+    /// 返回 `false`（其既有句柄保持不动）。新 key 起始为 `Active` 且桶是满的，
+    /// 立即可以被 `acquire()` 选中。
     pub async fn add_key(&self, key_str: String) -> bool {
         if key_str.len() < 8 || key_str.trim().is_empty() {
-            warn!(key = %mask_key(&key_str), "Refusing to add key: too short or blank");
+            warn!(key = %mask_key(&key_str), "拒绝添加 key：过短或为空");
             return false;
         }
         let mut write_guard = self.inner.write().await;
@@ -708,30 +754,74 @@ impl KeyPool {
         }
         let handle = make_handle(&self.config, &key_str);
         write_guard.insert(key_str.clone(), handle);
-        info!(key = %mask_key(&key_str), "Key added to pool at runtime");
+        info!(key = %mask_key(&key_str), "运行时向池中添加 key");
         drop(write_guard);
         self.refresh_metrics().await;
         true
     }
 
-    /// Remove a key from the pool at runtime. Returns `true` if the key was
-    /// present (and removed), `false` otherwise. In-flight requests holding the
-    /// key continue to completion; `acquire()` will simply never pick it again.
+    /// 一次性持有写锁批量添加 keys，然后只刷新一次 metrics。这是 admin
+    /// POST `/admin/keys` 路径 —— 调用方可能一次粘贴成百上千个 key，而走
+    /// 每次 `add_key`（每次都要获取写锁并跑一次 O(N) 状态扫描）会让它退化
+    /// 成 O(N²) 的锁抖动，卡住代理的热路径。这里我们只持一次写锁做完所有
+    /// 插入。
+    ///
+    /// 返回 `(added, already_present, invalid)`，这样 admin 调用方可以汇报
+    /// 每个 key 的处置结果而无需再扫一遍池。`invalid` 存放过短或为空的 key
+    /// （即 `add_key` 应用的同样门槛判定为无效的那些）。
+    pub async fn add_keys_batch(
+        &self,
+        keys: Vec<String>,
+    ) -> (Vec<String>, Vec<String>, Vec<String>) {
+        let mut added = Vec::new();
+        let mut already_present = Vec::new();
+        let mut invalid = Vec::new();
+        // 第一遍：在无锁状态下分区 —— 长度/空判都是纯计算，不碰共享状态。
+        // 这样写锁只在 HashMap 插入时持有。
+        let mut to_insert: Vec<String> = Vec::new();
+        for k in keys {
+            if k.len() < 8 || k.trim().is_empty() {
+                invalid.push(k);
+                continue;
+            }
+            to_insert.push(k);
+        }
+        if !to_insert.is_empty() {
+            let mut write_guard = self.inner.write().await;
+            for k in to_insert {
+                if write_guard.contains_key(&k) {
+                    already_present.push(k);
+                } else {
+                    let handle = make_handle(&self.config, &k);
+                    write_guard.insert(k.clone(), handle);
+                    info!(key = %mask_key(&k), "运行时向池中添加 key");
+                    added.push(k);
+                }
+            }
+            drop(write_guard);
+            // 整批只刷新一次 —— 不论批量多大都很便宜。
+            self.refresh_metrics().await;
+        }
+        (added, already_present, invalid)
+    }
+
+    /// 在运行时从池中移除一个 key。key 存在（并被移除）返回 `true`，否则
+    /// 返回 `false`。持有该 key 的在途请求会继续完成；`acquire()` 只是再也不会
+    /// 选中它。
     pub async fn remove_key(&self, key_str: &str) -> bool {
         let mut write_guard = self.inner.write().await;
         let removed = write_guard.remove(key_str).is_some();
         drop(write_guard);
         if removed {
-            info!(key = %mask_key(key_str), "Key removed from pool at runtime");
+            info!(key = %mask_key(key_str), "运行时从池中移除 key");
             self.refresh_metrics().await;
         }
         removed
     }
 
-    /// Snapshot every key's current state for the admin `/admin/keys`
-    /// endpoint / observability. `Instant`-based fields are surfaced as
-    /// human-friendly derived values (state name, seconds-until-ready,
-    /// seconds-since-last-success) because `Instant` isn't serializable.
+    /// 为 admin `/admin/keys` 端点 / 可观测性快照所有 key 的当前状态。
+    /// `Instant` 字段以人类友好的派生值呈现（状态名、距就绪秒数、距上次
+    /// 成功秒数），因为 `Instant` 无法序列化。
     pub async fn snapshot(&self) -> Vec<serde_json::Value> {
         let handles: Vec<(String, KeyStateHandle)> = {
             let read_guard = self.inner.read().await;
@@ -756,7 +846,7 @@ impl KeyPool {
                 ),
             };
             let last_success_secs = guard.last_success.map(|t| {
-                // `Instant` has no wall-clock; expose elapsed-since as a proxy.
+                // `Instant` 没有墙上时钟；用"距今已过多久"作为替代呈现。
                 now.saturating_duration_since(t).as_secs()
             });
             out.push(serde_json::json!({
@@ -774,12 +864,11 @@ impl KeyPool {
         out
     }
 
-    /// Background task to move cooling keys back to active when ready.
-    /// `stop` is a Notify that signals graceful shutdown.
+    /// 把冷却中的 key 在到期时重新转回 active 的后台任务。`stop` 是一个
+    /// 用于优雅停机信号的 Notify。
     ///
-    /// This task currently reuses `health_check.interval_seconds` as its sweep
-    /// period. If the two intervals need to diverge in the future, add a
-    /// dedicated `cooldown.interval_seconds` field.
+    /// 本任务目前复用 `health_check.interval_seconds` 作为扫描周期。日后若
+    /// 两个周期需要分开，再加一个专用的 `cooldown.interval_seconds` 字段。
     pub async fn cool_down_task(self: Arc<Self>, stop: Arc<tokio::sync::Notify>) {
         let mut interval = tokio::time::interval(Duration::from_secs(
             self.config.health_check.interval_seconds,
@@ -789,13 +878,12 @@ impl KeyPool {
             tokio::select! {
                 _ = interval.tick() => {}
                 _ = stop.notified() => {
-                    info!("Cooldown task stopping");
+                    info!("冷却任务停止");
                     break;
                 }
             }
             let now = Instant::now();
-            // Snapshot handles first to avoid holding the outer read lock across
-            // multiple inner-lock awaits.
+            // 先快照句柄，避免在多个内部锁 await 期间一直持有外层读锁。
             let handles: Vec<(String, KeyStateHandle)> = {
                 let read_guard = self.inner.read().await;
                 read_guard
@@ -818,19 +906,35 @@ impl KeyPool {
                 }
             }
             for (key_str, handle) in to_update {
-                let mut guard = handle.inner.write().await;
-                let was_disabled = matches!(guard.state, KeyState::Disabled { .. });
-                guard.state = KeyState::Active;
-                guard.weight = 1;
-                guard.fail_count = 0;
+                let was_disabled =
+                    self.reactivate_after_cooldown(&handle).await;
                 if was_disabled {
-                    info!(key = %mask_key(&key_str), "Disabled key reactivated by cooldown expiry (probes likely failing)");
+                    info!(key = %mask_key(&key_str), "冷却到期重新激活被禁用的 key（探测可能正在失败）");
                 } else {
-                    info!(key = %mask_key(&key_str), "Cooldown finished, reactivating key (no probe)");
+                    info!(key = %mask_key(&key_str), "冷却结束，重新激活该 key（无探测）");
                 }
             }
             self.refresh_metrics().await;
         }
+    }
+
+    /// 冷却到期重新激活：把一个 Cooling/Disabled 的 key 转回 `Active`，
+    /// 重置打分/权重/失败计数，并**清掉过期的熔断计数**。由 `cool_down_task`
+    /// 在某个 key 的 `ready_at` 已到（无探测）时调用。返回该 key 此前是否为
+    /// Disabled（仅用于日志）。
+    ///
+    /// 拆成 `pub(crate)` 辅助函数是为了让这些不变式（状态 → Active、cb 计数
+    /// 清空）可以脱离扫描任务的墙上时钟做单测。一个刚冷却完的 key 应当拿到
+    /// 一张干净的熔断清白 —— 否则恢复后的第一个空壳/504 会立刻再次触发熔断
+    /// 断路器，key 就会在 cool→shell→cool 之间永远振荡。
+    pub(crate) async fn reactivate_after_cooldown(&self, handle: &KeyStateHandle) -> bool {
+        let mut guard = handle.inner.write().await;
+        let was_disabled = matches!(guard.state, KeyState::Disabled { .. });
+        guard.state = KeyState::Active;
+        guard.weight = 1;
+        guard.fail_count = 0;
+        guard.circuit_breaker_failures.clear();
+        was_disabled
     }
 }
 
@@ -907,7 +1011,7 @@ mod retry_state_machine_tests {
     #[tokio::test]
     async fn mark_failure_below_threshold_keeps_active() {
         let pool = build_pool(&["k1", "k2"]);
-        // threshold = 3; two failures must NOT disable the key.
+        // 阈值 = 3；两次失败绝不能禁用该 key。
         assert!(!pool.mark_failure("k1", 3).await);
         assert!(!pool.mark_failure("k1", 3).await);
         let handle = pool.inner.read().await.get("k1").cloned().unwrap();
@@ -926,7 +1030,7 @@ mod retry_state_machine_tests {
         );
         let handle = pool.inner.read().await.get("k1").cloned().unwrap();
         assert!(matches!(handle.state().await, KeyState::Disabled { .. }));
-        // A Disabled key is no longer acquired.
+        // Disabled 的 key 不会再被获取。
         let acquired = pool.acquire().await.expect("another key still active");
         assert_ne!(acquired.key().await, "k1");
     }
@@ -962,16 +1066,14 @@ mod retry_state_machine_tests {
 
     #[tokio::test]
     async fn mark_failure_halves_weight_even_below_threshold() {
-        // Even before the disable threshold is reached, mark_failure must
-        // reduce the key's weight so a subsequent weighted-random acquire()
-        // is unlikely to re-select it within the same retry sequence.
+        // 即便未到禁用阈值，mark_failure 也必须减小该 key 的权重，这样
+        // 随后的加权随机 acquire() 在同一个重试序列内不太可能再次选中它。
         let pool = build_pool(&["k1"]);
         let handle = pool.inner.read().await.get("k1").cloned().unwrap();
-        // Default weight starts at 1 — to make the "halving" observable, bump
-        // it to a known higher value first.
+        // 默认权重起始为 1 —— 为了让"减半"可见，先把权重提到一个已知更高值。
         handle.add_weight(7).await; // weight = 1 + 7 = 8
         assert_eq!(handle.weight().await, 8);
-        let disabled = pool.mark_failure("k1", 100).await; // threshold high → no disable
+        let disabled = pool.mark_failure("k1", 100).await; // 阈值很高 → 不会禁用
         assert!(!disabled);
         let w = handle.weight().await;
         assert_eq!(
@@ -1002,7 +1104,7 @@ mod mask_key_tests {
 
     #[test]
     fn unicode_key_does_not_panic() {
-        // 8+ Unicode characters: should not panic and should produce some mask.
+        // 8 个以上的 Unicode 字符：不应 panic 且应产生某种掩码。
         let key = "ключ-для-теста-12345";
         let masked = mask_key(key);
         assert!(masked.contains("***"), "masked={}", masked);
@@ -1113,7 +1215,7 @@ mod score_selection_tests {
     async fn try_consume_token_succeeds_on_full_bucket() {
         let pool = build_pool_with_keys(&["k1"], 100.0, 10);
         let handle = pool.acquire().await.expect("key acquired");
-        // bucket starts full (burst=10), one consume must succeed immediately.
+        // 桶初始即满（burst=10），一次消费必须立刻成功。
         let got = handle.try_consume_token(50).await;
         assert!(got, "token must be consumed from a full bucket");
         handle.dec_in_flight();
@@ -1121,24 +1223,23 @@ mod score_selection_tests {
 
     #[tokio::test]
     async fn try_consume_token_times_out_when_bucket_empty_and_zero_qps() {
-        // qps=0 means no refill — after draining, no token can arrive.
+        // qps=0 表示不补充 —— 抽干后不可能再来令牌。
         let pool = build_pool_with_keys(&["k1"], 0.0, 1);
         let handle = pool.acquire().await.expect("key acquired");
-        // Drain the one token.
+        // 抽干那唯一一个令牌。
         assert!(handle.try_consume_token(0).await, "first consume ok");
-        // Second consume with short timeout must return false (no refill).
+        // 第二次消费用很短的超时必须返回 false（无补充）。
         let got = handle.try_consume_token(10).await;
         assert!(!got, "must time out when bucket stays empty");
         handle.dec_in_flight();
     }
 
-    /// Score-based selection: a key with a fuller bucket must be picked over
-    /// one whose bucket has been drained. We verify by draining k2 first,
-    /// then calling `acquire` repeatedly and asserting k1 is chosen.
+    /// 打分选择：桶更满的 key 必须优先于已被抽干的 key 被选中。我们通过先
+    /// 抽干 k2，然后反复调用 `acquire` 并断言选中 k1 来验证。
     #[tokio::test]
     async fn acquire_prefers_key_with_more_tokens() {
         let pool = build_pool_with_keys(&["k1", "k2"], 0.0, 10);
-        // Drain k2 to zero so its score is strictly lower than k1's.
+        // 把 k2 抽干到 0，使其打分严格低于 k1。
         let h2 = pool
             .inner
             .read()
@@ -1147,11 +1248,11 @@ mod score_selection_tests {
             .cloned()
             .expect("k2 exists");
         for _ in 0..10 {
-            // Directly consume tokens without going through inc_in_flight.
+            // 不走 inc_in_flight，直接消费令牌。
             let got = h2.try_consume_token(0).await;
             assert!(got, "drain k2");
         }
-        // Now k2 has 0 tokens, k1 has 10. acquire must pick k1.
+        // 现在 k2 有 0 个令牌，k1 有 10 个。acquire 必须选 k1。
         let h = pool.acquire().await.expect("active key exists");
         let k = h.key().await;
         assert_eq!(
@@ -1161,9 +1262,9 @@ mod score_selection_tests {
         h.dec_in_flight();
     }
 
-    /// `mark_bad` must transition a key from Active to Cooling, so subsequent
-    /// `acquire()` skips it. This mirrors the 403 "Authorization failed"
-    /// cooldown path implemented in `process_upstream_attempt`.
+    /// `mark_bad` 必须把一个 key 从 Active 切换到 Cooling，使随后的
+    /// `acquire()` 跳过它。这与 `process_upstream_attempt` 中实现的 403
+    /// "Authorization failed" 冷却路径对应。
     #[tokio::test]
     async fn mark_bad_puts_key_into_cooling() {
         let pool = build_pool_with_keys(&["k1"], 100.0, 10);
@@ -1177,9 +1278,83 @@ mod score_selection_tests {
         );
         drop(g);
 
-        // With only one key now in Cooling, acquire must return None.
+        // 现在唯一的 key 处于 Cooling，acquire 必须返回 None。
         let acquire = pool.acquire().await;
         assert!(acquire.is_none(), "Cooling key must not be acquireable");
+    }
+
+    /// 回归：一个更短的后续 `mark_bad` 不得缩短既有 Cooling key 的
+    /// `ready_at`。没有取最大值规则时，第一个长 Retry-After 之后紧接着
+    /// 来的第二个并发 429（带短 Retry-After 或 `None` → base）会覆盖掉
+    /// 那条长冷却，让上游在仍被限流时提前再次猛打该 key。
+    #[tokio::test]
+    async fn mark_bad_preserves_longer_existing_cooldown() {
+        let pool = build_pool_with_keys(&["k1"], 100.0, 10);
+        // 第一次标记：长 Retry-After，被截断到 max_seconds（2s）。
+        pool.mark_bad("k1", Some(60)).await;
+        let ready_at_1 = {
+            let h = pool.inner.read().await.get("k1").cloned().unwrap();
+            let g = h.inner.read().await;
+            match g.state {
+                KeyState::Cooling { ready_at } => ready_at,
+                _ => panic!("must be Cooling after first mark_bad"),
+            }
+        };
+        // 第二次标记：短冷却（None → base=1s），严格早于第一次设置的值。
+        // 不得把 ready_at 提前。
+        pool.mark_bad("k1", None).await;
+        let ready_at_2 = {
+            let h = pool.inner.read().await.get("k1").cloned().unwrap();
+            let g = h.inner.read().await;
+            match g.state {
+                KeyState::Cooling { ready_at } => ready_at,
+                _ => panic!("must remain Cooling after second mark_bad"),
+            }
+        };
+        assert_eq!(
+            ready_at_2, ready_at_1,
+            "second mark_bad with a shorter cooldown must not shorten the existing one"
+        );
+    }
+
+    /// 回归：冷却到期重新激活（`cool_down_task` 的自动路径，不是 `mark_good`）
+    /// 必须清掉过期的按 model 维度的熔断计数。修复前，`cool_down_task` 直接
+    /// 设置 `state = Active` 却不清 `circuit_breaker_failures`，于是被熔断器
+    /// 冷却下来的 key 回来时计数仍停在阈值 → 恢复后的第一个空壳立刻再次触发
+    /// 熔断器，key 就在 Cool→shell→Cool 之间永远振荡。
+    #[tokio::test]
+    async fn reactivate_after_cooldown_clears_circuit_breaker_counters() {
+        let pool = build_pool_with_keys(&["k1"], 100.0, 10);
+        // 用一个很小的 Retry-After 冷却该 key，使 ready_at 在测试检查状态时已
+        // 在过去；我们通过抽出来的 `reactivate_after_cooldown` 辅助函数
+        // （`cool_down_task` 调用的同一个）手工驱动状态转换，以避开墙上时钟
+        // 的扫描间隔。
+        pool.mark_bad("k1", Some(0)).await;
+        // 给该 key + model 放一些熔断失败（仿佛之前出现过空壳）。
+        pool.increment_circuit_breaker("k1", "z-ai/glm-5.2", 3).await;
+        pool.increment_circuit_breaker("k1", "z-ai/glm-5.2", 3).await;
+        {
+            let h = pool.inner.read().await.get("k1").cloned().unwrap();
+            let g = h.inner.read().await;
+            assert!(matches!(g.state, KeyState::Cooling { .. }));
+            assert_eq!(
+                g.circuit_breaker_failures.get("z-ai/glm-5.2"),
+                Some(&2),
+                "precondition: cb counter must be populated"
+            );
+        }
+        // 显式驱动冷却到期的状态转换。
+        let h = pool.inner.read().await.get("k1").cloned().unwrap();
+        let was_disabled = pool.reactivate_after_cooldown(&h).await;
+        assert!(!was_disabled, "a Cooling key reactivates as not-was-disabled");
+
+        let g = h.inner.read().await;
+        assert!(matches!(g.state, KeyState::Active), "must be Active");
+        assert!(
+            g.circuit_breaker_failures.is_empty(),
+            "cb counters must be cleared on cooldown-expiry reactivation, found: {:?}",
+            g.circuit_breaker_failures
+        );
     }
 }
 
@@ -1256,9 +1431,9 @@ mod runtime_key_tests {
     async fn add_then_remove_key_changes_pool() {
         let pool = pool(&["k1"]);
         assert!(pool.add_key("k2-new-key".to_string()).await);
-        // Duplicate add returns false.
+        // 重复添加返回 false。
         assert!(!pool.add_key("k2-new-key".to_string()).await);
-        // Too-short key is rejected.
+        // 过短的 key 被拒绝。
         assert!(!pool.add_key("short".to_string()).await);
 
         let snap = pool.snapshot().await;
@@ -1270,7 +1445,7 @@ mod runtime_key_tests {
         assert!(maskeds.iter().any(|m| m.contains("k2")));
 
         assert!(pool.remove_key("k2-new-key").await);
-        assert!(!pool.remove_key("k2-new-key").await); // already gone
+        assert!(!pool.remove_key("k2-new-key").await); // 已经不在池里
         assert_eq!(pool.snapshot().await.len(), 1);
     }
 

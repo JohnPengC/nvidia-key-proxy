@@ -1,26 +1,26 @@
-# NVIDIA API Key Load‑Balancing Proxy (Rust)
+# NVIDIA API Key 负载均衡代理（Rust）
 
-## Overview
+## 概览
 
-A lightweight, high‑performance proxy written in Rust that fronts multiple NVIDIA API keys.  
-Clients (e.g. OpenAI‑compatible SDKs) talk to the proxy using the usual `base_url`, `api_key` and `model` parameters.  
-The proxy picks a healthy key from a pool, applies per‑key rate limiting, forwards the request to the real NVIDIA endpoint, and returns the response unchanged (including streaming SSE).
+一个用 Rust 编写的轻量、高性能代理，在多个 NVIDIA API key 前做一层。
+Client（如 OpenAI 兼容 SDK）用惯常的 `base_url`、`api_key`、`model` 参数和代理对话。
+代理从池子里挑一个健康 key、做 per-key 限流、把请求转发到真正的 NVIDIA 端点，并把响应原样返回（含流式 SSE）。
 
-Key goals  
+核心目标
 
-* **Load‑balance** many keys to avoid per‑key rate limits.  
-* **Automatic throttling detection** – 429/403 triggers a cool‑down for the offending key.  
-* **Health checking** – background probes keep the pool aware of dead keys.  
-* **Observability** – Prometheus metrics and structured tracing.  
-* **Transparent usage** – downstream clients need no code changes.  
-* **Secure** – real keys never leave the process; logs are desensitized.  
-* **Concurrency limiting** – per-model semaphore caps concurrent upstream requests (prevents 503 "Worker local total request limit reached"); queue timeout returns 503 with `Retry-After`.  
-* **Empty-shell detection & retry** – NVIDIA's silent 200 with `usage:null` is detected; retries with clamped `max_tokens` + exponential backoff + optional upstream health probe; per-model circuit breaker.  
-* **Network resilience** – configurable connection pool (idle timeout 90s, connect timeout 5s), retry jitter (default 100ms); network errors tracked in metrics.  
-* **Streaming timeout** – separate `request_timeout_streaming_seconds` for long generations.  
-* **max_tokens validation** – drops invalid `max_tokens` (≤0, >100k, non‑numeric, negative strings) before they hit NVIDIA.
+* **负载均衡**：跨多个 key 分发，规避单 key 限流。
+* **自动限流检测** —— 429/403 触发对应 key 的冷却。
+* **健康检查** —— 后台探测让池子感知坏 key。
+* **可观测性** —— Prometheus 指标 + 结构化 tracing。
+* **透明使用** —— 下游 client 无需改代码。
+* **安全** —— 真实 key 不出进程；日志脱敏。
+* **并发限制** —— per-model 信号量给并发上游请求数封顶（避免 503 "Worker local total request limit reached"）；排队超时返回 503 带 `Retry-After`。
+* **空壳检测与重试** —— 检测 NVIDIA 带着静默 200 + `usage:null` 的软失败；用钳住的 `max_tokens` + 指数 backoff + 可选上游健康探测重试；per-model 断路器。
+* **网络韧性** —— 可配置连接池（idle 超时 90s、connect 超时 5s）、重试抖动（默认 100ms）；网络错误进指标。
+* **流式超时** —— 独立的 `request_timeout_streaming_seconds` 应对长 generation。
+* **max_tokens 校验** —— 在打到 NVIDIA 之前丢掉非法 `max_tokens`（≤0、>100k、非数字、负数字符串）。
 
-## Architecture
+## 架构
 
 ```
 +----------------+    HTTP    +------------------+    HTTP    +-------------------+
@@ -44,75 +44,75 @@ Key goals
                                     +-- Metrics / Tracing
 ```
 
-### Modules
+### 模块
 
-| Module | Responsibility | Tech |
+| 模块 | 职责 | 技术 |
 |--------|----------------|------|
-| **Config** | Load `config.toml` / env / CLI. Implements custom `Debug` to mask API keys in logs. | `serde` + `toml` + `dotenvy` |
-| **KeyPool** | Hold `KeyState` (active, cooling, disabled). Provide `acquire()`, `mark_good()`, `mark_bad()`. Per‑model circuit‑breaker counters. | `DashMap`<br>`DashMap<KeyId, KeyState>` |
-| **TokenBucket** | Per‑key rate limiter (QPS + burst). | `async-tokenbucket` or custom using `tokio::time::Interval` |
-| **Proxy Handler** | Accept HTTP request → acquire key → wait for token → forward → update key state → return response (streaming SSE passthrough). Empty‑shell detection, pre‑clamp, retry with backoff, per‑model circuit breaker. | `warp` for server, `reqwest` client |
-| **HealthChecker** | Startup probe + periodic bad-key recovery. Update state. | `tokio::task::spawn` loop |
-| **Observability** | Prometheus endpoint at `metrics_path` (default `/metrics`); tracing with `tracing`+`tracing-subscriber`. | `prometheus`, `tracing` |
-| **Graceful Shutdown** | Listen for SIGINT/SIGTERM, stop accepting new connections, drain ongoing requests. | `tokio::signal`, warp’s graceful shutdown |
+| **Config** | 加载 `config.toml` / 环境变量 / CLI。自定义 `Debug` 把 API key 在日志里脱敏。 | `serde` + `toml` + `dotenvy` |
+| **KeyPool** | 维护 `KeyState`（active、cooling、disabled）。提供 `acquire()`、`mark_good()`、`mark_bad()`。Per-model 断路器计数。 | `DashMap`<br>`DashMap<KeyId, KeyState>` |
+| **TokenBucket** | Per-key 限流器（QPS + burst）。 | `async-tokenbucket` 或用 `tokio::time::Interval` 自实现 |
+| **Proxy Handler** | 接 HTTP 请求 → 拿 key → 等 token → 转发 → 更新 key 状态 → 返回响应（流式 SSE 透传）。空壳检测、预钳、带 backoff 重试、per-model 断路器。 | 服务端 `warp`，client 端 `reqwest` |
+| **HealthChecker** | 启动探测 + 周期性坏 key 恢复。更新状态。 | `tokio::task::spawn` 循环 |
+| **Observability** | Prometheus endpoint 在 `metrics_path`（默认 `/metrics`）；tracing 用 `tracing`+`tracing-subscriber`。 | `prometheus`、`tracing` |
+| **Graceful Shutdown** | 监听 SIGINT/SIGTERM，停收新连接、排空在途请求。 | `tokio::signal`、warp 的 graceful shutdown |
 
-### Key Acquisition Algorithm
+### Key 选取算法
 
-1. Filter `KeyPool` for `State::Active`.
-2. For each active key, compute a score:
+1. 在 `KeyPool` 里筛 `State::Active`。
+2. 对每个 active key 算一个分数：
    `score = (available_tokens / capacity) − in_flight × 0.15 / weight`
-   Weight starts at 1, halves on failure (min 1), resets to 1 on success.
-3. Pick the key with the highest score; tie‑break randomly.
-4. Return the selected key; the caller must call `dec_in_flight()` on completion.
+   weight 从 1 起、失败减半（下限 1）、成功重置为 1。
+3. 取分最高的 key；平局随机破。
+4. 返回选中的 key；调用方完事必须调 `dec_in_flight()`。
 
-### Rate Limiting
+### 限流
 
-* Token bucket refills at `qps_per_key` tokens per second, bucket size = `burst`.
-* Before forwarding, `bucket.consume_with_timeout(1, deadline)` waits up to `token_wait_ms` (default 200 ms). On timeout the key is released and the next‑best key is tried (bounded by `max_key_switches`).
+* Token 桶以 `qps_per_key` 每秒补充，桶容量 = `burst`。
+* 转发前 `bucket.consume_with_timeout(1, deadline)` 最多等 `token_wait_ms`（默认 200 ms）。超时则释放该 key、试次优 key（受 `max_key_switches` 限制）。
 
-### Cool‑down & Health
+### 冷却与健康
 
-* On 429/403 with `Retry-After`: cool the key for `min(Retry-After, cooldown.max_seconds)`.  
-  On 403 "Authorization failed": immediate cooldown regardless of header.
-* On network/timeout error: mark key bad (cool for `cooldown.base_seconds`), retry once with a different key.
-* Health checker runs every `health_interval` seconds:
-  * Probe each key via `/v1/models`; success → `Active`, fail count reset.
-  * Consecutive probe failures (`max_consecutive_failures`) → force `Disabled` until next probe succeeds or cooldown expires.
+* 429/403 带 `Retry-After`：冷却该 key `min(Retry-After, cooldown.max_seconds)`。
+  403 "Authorization failed"：无视该头、立即冷却。
+* 网络/超时错误：标记 key 为坏（冷却 `cooldown.base_seconds`），换一个 key 重试一次。
+* 健康检查器每 `health_interval` 秒跑一轮：
+  * 用 `/v1/models` 探测每个 key；成功 → `Active`、失败计数清零。
+  * 连续探测失败达 `max_consecutive_failures` → 强制 `Disabled`，直到下次探测成功或冷却到期。
 
-### Circuit Breaker (per key & model)
+### 断路器（per key & model）
 
-Consecutive empty‑shell (200 with `usage:null`) or 504 responses increment a per‑model counter on the key. When the counter reaches `circuit_breaker_threshold` (default 3), the key is cooled. Enabled/disabled via `circuit_breaker_per_model` (default true).
+连续的空壳（200 带 `usage:null`）或 504 响应递增该 key 上 per-model 计数。达到 `circuit_breaker_threshold`（默认 3）即冷却该 key。经由 `circuit_breaker_per_model`（默认 true）开启/关闭。
 
-### Validation
+### 校验
 
-Two validation layers prevent avoidable upstream failures and reduce noise in `failure.log`:
+两层校验挡掉本可避免的上游失败、并降低 `failure.log` 噪声：
 
-1. **Configuration validation** (`Config::validate`, called from `Config::load` after env overrides):
-   * Rejects placeholder `base_url` values (`example.com`, `localhost`, `127.0.0.1`) and URLs without a scheme.
-   * Rejects obviously fake/short API keys (`fake`, `dummy`, `test`, `example`, `placeholder`, or shorter than 8 characters).
-   * Warns when `request_timeout_seconds` is set below 5 seconds, because such aggressive values cause false timeouts on normal LLM latency.
+1. **配置校验**（`Config::validate`，在 `Config::load` 应用环境变量覆盖后调用）：
+   * 拒绝占位 `base_url`（`example.com`、`localhost`、`127.0.0.1`）与无 scheme 的 URL。
+   * 拒绝明显是假/太短的 API key（含 `fake`、`dummy`、`test`、`example`、`placeholder`，或短于 8 字符）。
+   * `request_timeout_seconds` 低于 5 秒时告警，因为过激的值在正常 LLM 延迟下会误超时。
 
-2. **Request-body normalization** in the proxy handler before a key is consumed:
-   * `max_tokens`: bool/null/string/≤0/>100k → dropped; numeric strings coerced to int. Negative results from context‑window math (e.g. `-14758`) are caught.
-   * `reasoning_effort`: `true`→"high", `false`/null/invalid→dropped.
-   * `model` remapped via `model_aliases` if present.
-   * `tools` / `function.description` / `function.name`: null/missing → empty string (NVIDIA rejects `null`).
-   * Invalid requests are returned as 400 immediately, without acquiring a key or contacting NVIDIA.
+2. 在代理 handler 里、消费 key 之前的**请求体规范化**：
+   * `max_tokens`：bool/null/字符串/≤0/>100k → 丢弃；数字字符串强转为 int。上下文窗口算术产生的负值（如 `-14758`）被拦下。
+   * `reasoning_effort`：`true`→"high"，`false`/null/非法→丢弃。
+   * `model` 若在 `model_aliases` 里则重映射。
+   * `tools` / `function.description` / `function.name`：null/缺失 → 空串（NVIDIA 拒绝 `null`）。
+   * 非法请求立即返回 400、不拿 key、不打 NVIDIA。
 
-### Metrics (Prometheus)
+### 指标（Prometheus）
 
 * `proxy_requests_total{status="success|error|throttled"}`
 * `proxy_key_state_total{state="active|cooling|disabled"}`
 * `proxy_key_cooling_seconds_remaining{key_id="..."} (gauge)`
 * `proxy_request_latency_seconds` (histogram)
 
-### Configuration Example (config.toml)
+### 配置示例（config.toml）
 
 ```toml
 listen_addr = "0.0.0.0:8888"
 base_url    = "https://integrate.api.nvidia.com"
 
-# API keys – can also be set via NVIDIA_KEYS env var (comma‑separated)
+# API keys —— 也可通过 NVIDIA_KEYS 环境变量设置（逗号分隔）
 keys = [
     "nvapi-xxxxxxxxxxxxxxxx1",
     "nvapi-xxxxxxxxxxxxxxxx2",
@@ -122,9 +122,8 @@ keys = [
 [rate_limiter]
 qps_per_key = 0.65
 burst       = 8
-# Maximum milliseconds to wait on a single key's token bucket before
-# switching to another key (default 200). 0 disables switching — the
-# existing unbounded-wait behaviour is preserved.
+# 在一个 key 的 token 桶上最多等多少毫秒，超时就切到另一个 key
+#（默认 200）。0 = 关闭切换——保持既有无限等待行为。
 token_wait_ms = 200
 
 [cooldown]
@@ -136,83 +135,76 @@ interval_seconds = 30
 timeout_seconds  = 5
 max_consecutive_failures = 3
 
-# Request timeout in seconds. Set to 0 to disable (recommended for streaming).
-# Non-streaming requests use this timeout end-to-end. Streaming requests
-# bypass this timeout entirely (long-running token generation can exceed 60s).
-# Default increased to 600s for long-context non-streaming completions.
+# 请求超时（秒）。设为 0 可禁用（流式建议设 0）。
+# 非流式请求端到端使用此超时。流式请求完全绕过此超时
+#（长 generation 可能超过 60s）。
+# 默认上调到 600s 以适配长上下文非流式补全。
 request_timeout_seconds = 600
 
-# Optional: separate timeout for streaming connections (connect + idle read).
-# When set > 0, this governs the streaming path instead of request_timeout_seconds.
-# 0 = use request_timeout_seconds for both (legacy). Default 0 (disabled).
+# 可选：流式连接专用超时（connect + idle read）。
+# 设为 > 0 时由它接管流式路径，而非 request_timeout_seconds。
+# 0 = 流式与非流式都用 request_timeout_seconds（旧行为）。默认 0（关闭）。
 # request_timeout_streaming_seconds = 0
 
-# On NVIDIA's "empty-shell" soft failure — a 200 whose body is
-# `{"choices":[],"id":"","usage":null,...}` (no real inference ran; common on
-# `/compact` with max_tokens larger than the model's remaining context budget) —
-# retry with max_tokens clamped to `empty_shell_retry_max_tokens` before
-# giving up and surfacing a 502. Without this, Claude Code's `/compact` prints
-# the misleading "summarization produced empty response". Defaults to true;
-# disable via NVIDIA_RETRY_ON_EMPTY_SHELL=false.
+# NVIDIA "空壳" 软失败 —— 一个 200，body 为
+# `{"choices":[],"id":"","usage":null,...}`（没真正跑推理；常见于 /compact
+# 且 max_tokens 超出模型剩余上下文预算）—— 把 max_tokens 钳到
+# `empty_shell_retry_max_tokens` 重试，仍失败再返回 502。否则 Claude Code 的
+# /compact 会打印误导性 "summarization produced empty response"。默认 true；
+# 关闭请设 NVIDIA_RETRY_ON_EMPTY_SHELL=false。
 retry_on_empty_shell = true
 
-# max_tokens used for the post-shell retry. The first upstream call may itself
-# be pre-clamped (see `empty_shell_pre_clamp_max_tokens` below) so the budget
-# fits without burning a round-trip into a guaranteed shell. 8192 is
-# conservative across GLM-family models on build.integrate.
-# Env override: NVIDIA_EMPTY_SHELL_RETRY_MAX_TOKENS.
+# 重试空壳时使用的 max_tokens。第一次上游调用本身可能已被预钳
+#（见下 `empty_shell_pre_clamp_max_tokens`），让预算刚好放得下，省掉一次
+# 注定空壳的往返。8192 在 build.integrate 上对 GLM 系模型保守可用。
+# 环境变量覆盖：NVIDIA_EMPTY_SHELL_RETRY_MAX_TOKENS。
 empty_shell_retry_max_tokens = 8192
 
-# Number of retry attempts for empty-shell soft failures.
-# 2 = original + two retries. 0 = no retry (falls back to 502).
-# Default 2. Env override: NVIDIA_EMPTY_SHELL_RETRY_ATTEMPTS.
+# 空壳软失败的重试次数。
+# 2 = 原始 + 两次重试。0 = 不重试（回退到 502）。
+# 默认 2。环境变量覆盖：NVIDIA_EMPTY_SHELL_RETRY_ATTEMPTS。
 empty_shell_retry_attempts = 2
 
-# Base delay for exponential backoff between empty-shell retries (ms).
-# Default 500. Env override: NVIDIA_EMPTY_SHELL_RETRY_BACKOFF_BASE_MS.
+# 空壳重试之间指数 backoff 的基线延迟（毫秒）。
+# 默认 500。环境变量覆盖：NVIDIA_EMPTY_SHELL_RETRY_BACKOFF_BASE_MS。
 empty_shell_retry_backoff_base_ms = 500
 
-# Cap for a single empty-shell retry backoff sleep (ms).
-# Default 5000. Env override: NVIDIA_EMPTY_SHELL_RETRY_BACKOFF_MAX_MS.
+# 单次空壳重试 backoff 睡眠上限（毫秒）。
+# 默认 5000。环境变量覆盖：NVIDIA_EMPTY_SHELL_RETRY_BACKOFF_MAX_MS。
 empty_shell_retry_backoff_max_ms = 5000
 
-# Per-model max_tokens ceiling for pre-clamping on the *first* upstream call.
-# When a request targets a model in this map and max_tokens exceeds the
-# ceiling, the proxy clamps it before the request goes out — for every
-# request, streaming included. NVIDIA's GLM-class models return an HTTP-200
-# "empty-shell" body (choices:[], usage:null) when `prompt + max_tokens`
-# exceeds the remaining context budget; clamping at the entrance makes the
-# budget fit so inference actually runs, instead of burning a round-trip into
-# a guaranteed shell. Default includes z-ai/glm-5.2 → 32000.
-# Override via NVIDIA_EMPTY_SHELL_PRE_CLAMP_MAX_TOKENS (JSON map).
+# 在*第一次*上游调用时预钳的 per-model max_tokens 上限。
+# 当请求命中的 model 在此 map 里、且 max_tokens 超过上限时，代理在请求发出
+# 前就把它钳住——对每个请求（含流式）生效。NVIDIA 的 GLM 系模型在
+# `prompt + max_tokens` 超出剩余上下文预算时返回一个 HTTP-200 空壳 body
+#（choices:[]、usage:null）；入口就钳住预算，让推理真正跑起来，而不是烧一次
+# 注定空壳的往返。默认含 z-ai/glm-5.2 → 32000。
+# 覆盖方式：NVIDIA_EMPTY_SHELL_PRE_CLAMP_MAX_TOKENS（JSON map）。
 empty_shell_pre_clamp_max_tokens = { "z-ai/glm-5.2" = 32000 }
 
-# Retry on 500 Internal Server Error. GLM-class models intermittently return
+# 是否对 500 Internal Server Error 重试。GLM 系模型偶发性返回
 # {"message":"Failed to generate completions","type":"Internal Server Error","code":500}
-# as a transient per-request worker failure — the same prompt typically succeeds
-# on another key seconds later. When enabled, 500 triggers a retry against
-# another key using the same backoff/retry budget as 401/503. Default true.
-# Env override: NVIDIA_RETRY_ON_500.
+# 是一种瞬时 per-request worker 失败——同一 prompt 秒后往往在另一个 key 上
+# 成功。开启后 500 用与 401/503 相同的 backoff/重试预算在另一个 key 上重试。
+# 默认 true。环境变量覆盖：NVIDIA_RETRY_ON_500。
 retry_on_500 = true
 
-# Optional: before retrying an empty-shell failure, do a lightweight health
-# probe against /v1/models to avoid retrying into a degraded upstream.
-# Default true. Env override: NVIDIA_EMPTY_SHELL_PROBE_BEFORE_RETRY.
+# 可选：重试空壳失败前，先对 /v1/models 做一次轻量健康探测，
+# 避免往已降级的上游重试。默认 true。环境变量覆盖：
+# NVIDIA_EMPTY_SHELL_PROBE_BEFORE_RETRY。
 empty_shell_probe_before_retry = true
 
-# Circuit breaker threshold. After N consecutive empty-shell or 504
-# responses on a given key/model, the key is cooled for cooldown.base_seconds.
-# 0 = disabled. Default 3. Env override: NVIDIA_CIRCUIT_BREAKER_THRESHOLD.
+# 断路器阈值。某 (key, model) 上连续 N 次空壳或 504 即把该 key 冷却
+# cooldown.base_seconds 秒。0 = 关闭。默认 3。环境变量覆盖：
+# NVIDIA_CIRCUIT_BREAKER_THRESHOLD。
 circuit_breaker_threshold = 3
 
-# Whether circuit breaker tracks failures per (key, model) pair
-# instead of globally per key. Default true. Env override:
-# NVIDIA_CIRCUIT_BREAKER_PER_MODEL.
+# 断路器是否按 (key, model) 对追踪失败，而非全局 per key。默认 true。
+# 环境变量覆盖：NVIDIA_CIRCUIT_BREAKER_PER_MODEL。
 circuit_breaker_per_model = true
 
-# Optional ceiling for max_tokens validation. Any request with max_tokens
-# > this value will have the field dropped (model default used). Default
-# 100000. Override via MAX_TOKENS_MAX env var.
+# 可选：max_tokens 校验上限。任何 max_tokens 超过此值的请求会把该字段丢弃
+#（用模型默认）。默认 100000。覆盖方式：MAX_TOKENS_MAX 环境变量。
 # max_tokens_max = 100000
 
 [observability]
@@ -221,21 +213,21 @@ metrics_path   = "/metrics"
 log_level      = "info"
 ```
 
-### Building & Running
+### 构建与运行
 
 ```bash
-# Clone / create project
+# 克隆 / 建项目
 git clone <repo-url> nvidia-key-proxy
 cd nvidia-key-proxy
 
-# Build
+# 构建
 cargo build --release
 
-# Run (uses ./config.toml or env)
+# 运行（用 ./config.toml 或环境变量）
 ./target/release/nvidia-key-proxy
 ```
 
-Dockerfile (optional):
+Dockerfile（可选）：
 
 ```dockerfile
 FROM rust:1.78-slim AS builder
@@ -249,31 +241,31 @@ EXPOSE 8888
 ENTRYPOINT ["/usr/local/bin/nvidia-key-proxy"]
 ```
 
-### Testing Strategy
+### 测试策略
 
-* **Unit tests** – `KeyPool` state transitions, token‑bucket correctness, proxy retry / timeout behaviour, and request validation (`max_tokens`, `reasoning_effort`, empty-shell retry logic, upstream health probe).
-* **Integration tests** – spin up a mock NVIDIA server (using `warp`) that can return 200, 429, 500, empty-shell 200; assert proxy rotates keys, honors rate limits, honors cool‑down, retries on empty-shell with clamped `max_tokens`, probes upstream health before retry. Additional tests cover the health endpoint, metrics (enabled/disabled), unknown-path 404 handling, and configuration validation.
-* **Load test** – use `wrk` or `hey` against the proxy; verify metrics show distributed load and that no single key exceeds its QPS.
-* **Security audit** – ensure logs never contain full API keys (custom `Debug` impl on `Config` masks keys as `XXXX***XXXX`).
+* **单元测试** —— `KeyPool` 状态转换、token 桶正确性、代理重试/超时行为，以及请求校验（`max_tokens`、`reasoning_effort`、空壳重试逻辑、上游健康探测）。
+* **集成测试** —— 起一个 mock NVIDIA 服务（用 `warp`），能返回 200、429、500、空壳 200；断言代理轮换 key、尊重限流、尊重冷却、对空壳用钳住的 `max_tokens` 重试、重试前探测上游健康。另有测试覆盖 health 端点、metrics（开/关）、未知路径 404 处理、配置校验。
+* **压测** —— 用 `wrk` 或 `hey` 打代理；验证指标显示负载被分摊、没有单 key 超其 QPS。
+* **安全审计** —— 确保日志绝不出现完整 API key（`Config` 的自定义 `Debug` 把 key 脱敏成 `XXXX***XXXX`）。
 
-### Failure-Log-Driven Reliability (2026‑07‑23)
+### 基于 failure.log 的可靠性改造（2026‑07‑23）
 
-Analysis of `failure.log` revealed four dominant error classes. All are addressed in the current implementation:
+分析 `failure.log` 揭示四类高频错误。当前实现均已处理：
 
-| Category | Count | Root Cause | Fix |
+| 类别 | 计数 | 根因 | 修复 |
 |---|---|---|---|
-| `empty_choices_shell_first` | ~30% | NVIDIA returns 200 with `choices:[]`, `usage:null`, `id:""` — no inference ran. | **Pre-clamp `max_tokens` on the first upstream call** (per-model, `empty_shell_pre_clamp_max_tokens`, default GLM‑5.2 → 32000; covers streaming) so the `prompt + max_tokens` budget fits. If a shell still returns, **retry with `max_tokens` clamped to `empty_shell_retry_max_tokens`** (default 8192) — configurable attempts (`empty_shell_retry_attempts`, default 2), exponential backoff (`empty_shell_retry_backoff_base_ms` / `..._max_ms`), optional upstream health probe before retry (`empty_shell_probe_before_retry`). Per‑model circuit breaker (`circuit_breaker_per_model`, default true). Surfaces actionable 502 instead of misleading "summarization produced empty response". |
-| `timeout` | ~15% | 300s hard timeout too short for long-context non-streaming. | **Default `request_timeout_seconds` raised to 600s**. Streaming requests bypass this entirely. New `request_timeout_streaming_seconds` for separate streaming timeout. Warn threshold raised to 30s. |
-| `upstream_5xx` (504/503/500) | ~10% | Gateway timeout / resource exhausted / transient `{"message":"Failed to generate completions"}` 500. | Client `connect_timeout` (5s) unchanged; per-request timeout now only for non-streaming. Streaming path unbounded by default. **503 retries** another key with backoff (`retry_on_503`, default true, optional `probe_before_503_retry`). **500 retries** another key with the same backoff/retry budget (`retry_on_500`, default true) — GLM 500s are transient per-request failures, not deterministic bans. |
-| `upstream_4xx` (400 `max_tokens < 1`) | ~2% | Client-computed `max_tokens` underflow (large context + reserved tokens). | **Proxy drops invalid `max_tokens`** (≤0, >100k, non-numeric). Ceiling configurable via `max_tokens_max` (default 100_000) or `MAX_TOKENS_MAX` env. |
+| `empty_choices_shell_first` | ~30% | NVIDIA 返回 200 带 `choices:[]`、`usage:null`、`id:""` —— 没跑推理。 | **在第一次上游调用时预钳 `max_tokens`**（per-model，`empty_shell_pre_clamp_max_tokens`，默认 GLM‑5.2 → 32000；含流式），让 `prompt + max_tokens` 预算放得下。仍返回空壳时**用 `max_tokens` 钳到 `empty_shell_retry_max_tokens`**（默认 8192）重试——次数可配（`empty_shell_retry_attempts`，默认 2）、指数 backoff（`empty_shell_retry_backoff_base_ms` / `..._max_ms`）、重试前可选上游健康探测（`empty_shell_probe_before_retry`）。Per-model 断路器（`circuit_breaker_per_model`，默认 true）。最终用一个可操作的 502 替代误导性的 "summarization produced empty response"。 |
+| `timeout` | ~15% | 300s 硬超时对长上下文非流式太短。 | **`request_timeout_seconds` 默认上调到 600s**。流式请求完全绕过。新增 `request_timeout_streaming_seconds` 给流式单独的超时。告警阈值上调到 30s。 |
+| `upstream_5xx`（504/503/500） | ~10% | 网关超时 / 资源耗尽 / 瞬时 `{"message":"Failed to generate completions"}` 500。 | client `connect_timeout`（5s）不变；per-request 超时只作用于非流式。流式默认不设上限。**503** 换另一个 key 带 backoff 重试（`retry_on_503`，默认 true，可选 `probe_before_503_retry`）。**500** 用同一 backoff/重试预算换另一个 key 重试（`retry_on_500`，默认 true）—— GLM 的 500 是瞬时 per-request 失败，不是确定性封禁。 |
+| `upstream_4xx`（400 `max_tokens < 1`） | ~2% | client 算出的 `max_tokens` 下溢（大上下文 + 预留 token）。 | **代理丢弃非法 `max_tokens`**（≤0、>100k、非数字）。上限可配 `max_tokens_max`（默认 100_000）或 `MAX_TOKENS_MAX` 环境变量。 |
 
-### Future Enhancements
+### 未来增强
 
-* Dynamic key addition/removal via a protected admin endpoint.
-* Per‑model weighting or cost‑aware scheduling.
-* Support for multiple upstream bases (region fail‑over).
-* gRPC/WebSocket forwarding if NVIDIA adds such interfaces.
+* 经一个受保护的管理端点动态增删 key。
+* Per-model 加权或成本感知调度。
+* 支持多个上游 base（区域故障转移）。
+* 若 NVIDIA 开放 gRPC/WebSocket 接口则转发之。
 
----  
+---
 
-*End of design document.*
+*设计文档结束。*

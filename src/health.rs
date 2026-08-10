@@ -12,10 +12,9 @@ pub struct HealthChecker {
     interval: Duration,
     timeout: Duration,
     max_failures: usize,
-    /// Per-key count of *consecutive probe errors* (network/probe failures,
-    /// not non-2xx). When a key's count reaches `max_failures`, the health
-    /// checker force-disables it (see `recover_one`) instead of forever
-    /// deferring to the cooldown timer. Reset to 0 on a successful probe.
+    /// 该 key 的*连续探测错误*计数（网络/探测失败，而非非 2xx）。当某 key 的
+    /// 计数达到 `max_failures` 时，健康检查器强制禁用它（见 `recover_one`），
+    /// 而不是永远等待冷却计时器。成功探测后重置为 0。
     probe_failures: std::sync::Mutex<std::collections::HashMap<String, usize>>,
     client: reqwest::Client,
 }
@@ -43,16 +42,16 @@ impl HealthChecker {
         }
     }
 
-    /// Run once at startup to check all keys.
+    /// 启动时跑一次，检查所有 key。
     pub async fn run_startup(&self) {
-        info!("Running startup health check for all keys");
+        info!("正在对所有 key 执行启动健康检查");
         if let Err(e) = self.check_all_keys().await {
-            error!("Startup health check failed: {}", e);
+            error!("启动健康检查失败：{}", e);
         }
     }
 
-    /// Periodically check only bad (cooling) keys to see if they've recovered.
-    /// `stop` allows graceful shutdown of this background loop.
+    /// 周期性地只检查坏（冷却中）的 key，看它们是否已恢复。
+    /// `stop` 用于优雅关停这个后台循环。
     pub async fn run_bad_key_checker(&self, stop: Arc<tokio::sync::Notify>) {
         let mut interval = tokio::time::interval(self.interval);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -60,11 +59,11 @@ impl HealthChecker {
             tokio::select! {
                 _ = interval.tick() => {
                     if let Err(e) = self.check_bad_keys().await {
-                        error!("Bad key check round failed: {}", e);
+                        error!("坏 key 检查轮失败：{}", e);
                     }
                 }
                 _ = stop.notified() => {
-                    info!("Bad key checker stopping");
+                    info!("坏 key 检查器正在停止");
                     break;
                 }
             }
@@ -83,28 +82,26 @@ impl HealthChecker {
                     self.key_pool.mark_good(&key_str).await;
                 }
                 Ok(status) => {
-                    // Don't punish the key: NVIDIA's /v1/models can return
-                    // 403/401 on a perfectly valid key (account/region gating).
-                    // Cool-down here would drain the pool. Only log and leave
-                    // the key's state untouched.
-                    warn!(key = %mask_key(&key_str), status = %status, "Startup probe non-2xx; leaving key state untouched");
+                    // 不要惩罚 key：NVIDIA 的 /v1/models 对一个完全有效的 key
+                    // 也可能返回 403/401（账户/区域门控）。这里冷却会把池子抽干。
+                    // 只记日志、不动 key 的状态。
+                    warn!(key = %mask_key(&key_str), status = %status, "启动探测非 2xx；保持 key 状态不变");
                 }
                 Err(e) => {
-                    warn!(key = %mask_key(&key_str), error = %e, "Startup probe error; leaving key state untouched");
+                    warn!(key = %mask_key(&key_str), error = %e, "启动探测出错；保持 key 状态不变");
                 }
             }
         }
         Ok(())
     }
 
-    /// Check only keys currently in Cooling state. A key whose cooldown has not
-    /// yet elapsed is skipped — we only probe keys whose ready_at has passed,
-    /// so cooldown timing is respected and we avoid probing a key too early.
+    /// 只检查当前处于 Cooling 状态的 key。未到冷却时间的 key 跳过——
+    /// 我们只探测 ready_at 已过的 key，以尊重冷却计时、避免过早探测。
     async fn check_bad_keys(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let bad_keys = self.key_pool.get_bad_keys().await;
-        // Also probe Disabled keys: those were marked bad after repeated
-        // auth failures (see Proxy::handle_request + KeyPool::mark_failure).
-        // A success here reactivates them; a non-success leaves them Disabled.
+        // 也探测 Disabled 的 key：那些是反复认证失败后被标记为坏的
+        //（见 Proxy::handle_request + KeyPool::mark_failure）。此处成功则
+        // 重新激活；非成功则保持 Disabled。
         let disabled_keys = self.key_pool.get_disabled_keys().await;
         if bad_keys.is_empty() && disabled_keys.is_empty() {
             return Ok(());
@@ -112,7 +109,7 @@ impl HealthChecker {
         info!(
             bad = bad_keys.len(),
             disabled = disabled_keys.len(),
-            "Recovery probe round"
+            "恢复探测轮"
         );
         for key_str in &bad_keys {
             self.recover_one(key_str, false).await;
@@ -123,31 +120,28 @@ impl HealthChecker {
         Ok(())
     }
 
-    /// Probe a single bad/disabled key and react accordingly.
+    /// 探测单个坏/禁用 key 并据此反应。
     ///
-    /// * Success → recover the key (`mark_good` / `recover_disabled`) and reset
-    ///   its consecutive-probe-error counter.
-    /// * Non-2xx → not decisive (NVIDIA's `/v1/models` can 403/401 on a
-    ///   perfectly valid key), so defer to the cooldown timer; the error
-    ///   counter is left untouched.
-    /// * Probe *error* (network/timeout) → increment the consecutive-error
-    ///   counter. Once it reaches `max_failures` the key is force-disabled so a
-    ///   persistently-unreachable key can't keep cycling through cooldown
-    ///   forever. A `max_failures` of 0 disables this behaviour.
+    /// * 成功 → 恢复 key（`mark_good` / `recover_disabled`）并重置其连续探测错误计数。
+    /// * 非 2xx → 不算定性（NVIDIA 的 `/v1/models` 对一个完全有效的 key 也可能
+    ///   403/401），交给冷却计时器；错误计数不动。
+    /// * 探测*出错*（网络/超时）→ 递增连续错误计数。一旦达到 `max_failures`
+    ///   就强制禁用 key，避免一个长期不可达的 key 永远在冷却里循环。
+    ///   `max_failures` 为 0 关闭此行为。
     async fn recover_one(&self, key_str: &str, was_disabled: bool) {
         match self.probe_key(key_str).await {
             Ok(status) if status.is_success() => {
                 self.reset_probe_failures(key_str);
                 if was_disabled {
-                    info!(key = %mask_key(key_str), "Disabled key recovered via probe; reactivating");
+                    info!(key = %mask_key(key_str), "禁用 key 经探测恢复；重新激活");
                     self.key_pool.recover_disabled(key_str).await;
                 } else {
-                    info!(key = %mask_key(key_str), "Bad key recovered via probe; marking as good");
+                    info!(key = %mask_key(key_str), "坏 key 经探测恢复；标记为好");
                     self.key_pool.mark_good(key_str).await;
                 }
             }
             Ok(status) => {
-                warn!(key = %mask_key(key_str), status = %status, "Recovery probe non-2xx; deferring to cooldown timer");
+                warn!(key = %mask_key(key_str), status = %status, "恢复探测非 2xx；交给冷却计时器");
             }
             Err(e) => {
                 let count = {
@@ -156,9 +150,9 @@ impl HealthChecker {
                     *c += 1;
                     *c
                 };
-                warn!(key = %mask_key(key_str), error = %e, probe_errors = count, max_failures = self.max_failures, "Recovery probe error");
+                warn!(key = %mask_key(key_str), error = %e, probe_errors = count, max_failures = self.max_failures, "恢复探测出错");
                 if self.max_failures > 0 && count >= self.max_failures {
-                    warn!(key = %mask_key(key_str), "Consecutive probe failures reached threshold; force-disabling key");
+                    warn!(key = %mask_key(key_str), "连续探测失败达阈值；强制禁用 key");
                     self.key_pool.disable_key(key_str).await;
                     self.reset_probe_failures(key_str);
                 }
