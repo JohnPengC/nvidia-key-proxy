@@ -1837,7 +1837,12 @@ impl Proxy {
         // 求失败——这正是让那些直连 NVIDIA 能工作的 cc-switch 客户端、经过代理也无需
         // 在它们一侧改 body 的关键。
         let parsed_body: Option<serde_json::Value> = serde_json::from_slice(&body).ok();
-        let body_summary = body_summary(&parsed_body);
+        // 注意：body_summary 在此**先暂用原始 parsed_body**——下面 `body_value` 走完
+        // 规范化（max_tokens clamp、模型别名重写、`reasoning_effort`、`temperature` 校
+        // 准等）后会**重新计算一次**，使 failure.log / 日志里看到的是 NVIDIA 实际收到的
+        // 值，而非客户端原始值。保留此处临时变量仅为后续块作用域引用方便，实际写日志
+        // 用的 summary 在下面 `let body_summary = body_summary(&body_value);` 处覆盖。
+        let _body_summary_pre_normalize = body_summary(&parsed_body);
 
         // ── body 规范化（原地改写解析后的 JSON）────────────────────────────
         //
@@ -2102,6 +2107,14 @@ impl Proxy {
                 .unwrap_or_else(|_| body.clone()),
             None => body.clone(),
         };
+
+        // M-tier：body_summary 从**规范化后**的 `body_value` 重算（原始诊断用的
+        // `_body_summary_pre_normalize` 仅作上下文参考、不出日志）。这样
+        // failure.log / 日志记录的 `max_tokens`、`model` 别名重写、`stream` 等
+        // 都是 NVIDIA 上游实际收到、并以其为准做失败归因时的字段——而非客户端
+        // 原始未改写的值（避免「NVIDIA 在 max_tokens=8192 上空壳了」与日志里写
+        // 「max_tokens=100000」时产生误判根源）。
+        let body_summary = body_summary(&body_value);
 
         // 提取 `model` 用于日志。优先取（可能改写过的）值，使日志显示 NVIDIA 实际看到
         // 的名字。

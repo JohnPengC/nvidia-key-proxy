@@ -439,14 +439,25 @@ impl std::fmt::Debug for TokenBucket {
 /// `Active` 状态。`KeyPool::new`（启动初始化）和 `add_key`（运行时注入 key）
 /// 都共用它，两条路径构造出的句柄完全一致。
 fn make_handle(config: &Config, key_str: &str) -> KeyStateHandle {
-    let bucket = TokenBucket::new(
-        config.rate_limiter.burst as u32,
-        if config.rate_limiter.qps_per_key > 0.0 {
-            config.rate_limiter.qps_per_key
-        } else {
-            1.0
-        },
-    );
+    // `qps_per_key = 0` 的语义是**关闭 per-key 限流**（运维常见直觉：0 即不限制），
+    // 不是偷偷换成 1 QPS（这是此前版本的 footgun —— 配 `qps_per_key=0` "想不限流"
+    // 的部署实际被夹成 1 QPS，高并发下静默节流）。我们用"桶容量极大 + 补充速率为
+    // 正无穷"显式实现无限通行：`refill_locked` 里 `(toks + elapsed * INF).min(cap)`
+    // 把 toks 恒拉满 cap，任何 `try_consume(1)` 必得 Ok。`burst` 在此模式下一并
+    // 抬为 `u32::MAX` 容量以免起跑前桶就空着。finite 且 >0 走原 token 桶。
+    let (burst_cap, refill) = if config.rate_limiter.qps_per_key <= 0.0 {
+        (u32::MAX, f64::INFINITY)
+    } else {
+        (
+            if config.rate_limiter.burst == 0 {
+                1u32
+            } else {
+                config.rate_limiter.burst as u32
+            },
+            config.rate_limiter.qps_per_key,
+        )
+    };
+    let bucket = TokenBucket::new(burst_cap, refill);
     KeyStateHandle {
         inner: Arc::new(RwLock::new(InnerKeyState {
             key: Arc::new(key_str.to_string()),
@@ -1521,15 +1532,20 @@ mod score_selection_tests {
     }
 
     #[tokio::test]
-    async fn try_consume_token_times_out_when_bucket_empty_and_zero_qps() {
-        // qps=0 表示不补充 —— 抽干后不可能再来令牌。
+    async fn try_consume_token_succeeds_when_qps_zero_means_no_limit() {
+        // M4：qps=0 的语义是**关闭 per-key 限流**（不再偷偷换成 1 QPS）。
+        // 一个有限桶（burst=N）即使被抽干后，因为这桶的 refill 率被设成正无穷、
+        // 容量被抬到 u32::MAX，几乎"瞬间"补满，故**连续**消费必须永远 Ok。
         let pool = build_pool_with_keys(&["k1"], 0.0, 1);
         let handle = pool.acquire().await.expect("key acquired");
-        // 抽干那唯一一个令牌。
-        assert!(handle.try_consume_token(0).await, "first consume ok");
-        // 第二次消费用很短的超时必须返回 false（无补充）。
-        let got = handle.try_consume_token(10).await;
-        assert!(!got, "must time out when bucket stays empty");
+        // 连续抽干 100 次；零超时；应次次成功——证明 qps=0 ≠ 节流。
+        for i in 0..100 {
+            assert!(
+                handle.try_consume_token(0).await,
+                "consume #{} must succeed when qps=0 means unlimited",
+                i + 1
+            );
+        }
         handle.dec_in_flight();
     }
 
@@ -1538,11 +1554,11 @@ mod score_selection_tests {
     /// 这是 P1 给打分热路径开的旁路；此测试锁定其不变式：① 初始 == capacity（`new`
     /// store 了 cap 的 bits）；② 消费两次后严格下降；③ 与精确 `available_tokens()`
     /// 在同一读锁快照下一致（近似值正是每个精确路径在锁内 store 的那个值）。
-    /// 注意 `make_handle` 把 `qps_per_key=0` 强制成 `1.0`（桶永远会补充），
-    /// 故不做"恰好 == capacity-2"的精确断言——只断言单调下降 + 与精确值一致。
+    /// 用有限 qps（10 QPS）以便桶容量 / 消费可观察地下降；qps=0 现在表示无限、
+    /// 桶被构造成正无穷补充，因而无法观察"消费后下降"。
     #[tokio::test]
     async fn approx_tokens_track_consumption_without_async_locks() {
-        let pool = build_pool_with_keys(&["k1"], 0.0, 10);
+        let pool = build_pool_with_keys(&["k1"], 10.0, 10);
         let handle = pool.acquire().await.expect("key acquired");
         let h_inner = pool.inner.read().await.get("k1").cloned().unwrap();
         // 近似初始 == capacity（new 里 store 了 cap 的 bits）。

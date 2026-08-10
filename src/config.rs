@@ -25,9 +25,12 @@ fn host_of_url(url: &str) -> Option<String> {
         None => authority,
     };
     // 带方括号的 IPv6 字面量：`[::1]` 或 `[::1]:port`。
+    // 返回**不带**外层方括号的字符串（如 `::1`），让下游的占位 host 比对
+    //（`host_lower == "::1"`）一致命中。此前返回 `"[::1]"` 带方括号，比对
+    // 用 `== "::1"` 永远不命中，IPv6 loopback 的 base_url 不会被拒在门禁外。
     if let Some(rest) = authority.strip_prefix('[') {
         let close = rest.find(']')?;
-        return Some(format!("[{}]", &rest[..close]));
+        return Some(rest[..close].to_string());
     }
     // 普通 host —— 剥掉末尾的 `:port`。
     let host = match authority.rfind(':') {
@@ -885,6 +888,51 @@ impl Config {
         // 一并入 `validate` 让 `Config::load` 自动 fail-fast。
         self.validate_auth()?;
 
+        // ── 数值边界（M-tier）──────────────────────────────────────────────
+        // 这些都是会让代理在真实流量下"看起来在跑、其实黏死"的静默 misconfig：
+        // 把它们从 warn 升为 Err，避免运维以为是别的原因。
+        //
+        // `cooldown.base_seconds == 0`：`mark_bad(None)` 会立刻 `ready_at = now +
+        // 0` → 下一轮 `acquire` 立刻又选它，坏 key 永远不会真正冷却，对端限流/
+        // 403 会被无脑循环。允许 0 是把"冷却被禁用"语义悄悄混进来，不值得。
+        if self.cooldown.base_seconds == 0 {
+            return Err(
+                "cooldown.base_seconds must be > 0 (0 makes mark_bad effect a no-op → \
+                 bad keys never really cool, retry loop burns the upstream).".into(),
+            );
+        }
+        // `max_seconds < base_seconds`：`mark_bad` 里有 `delay =
+        // retry_after.min(max)`，max < base 时会把上游要求冷却 600s 的请求夹成
+        // 几秒，违背退避请求。允许时上游反向打脸，挂载期回不可用。允许相等。
+        if self.cooldown.max_seconds < self.cooldown.base_seconds {
+            return Err(format!(
+                "cooldown.max_seconds={} must be >= cooldown.base_seconds={} \
+                 (smaller max silently overrides longer upstream Retry-After).",
+                self.cooldown.max_seconds, self.cooldown.base_seconds
+            )
+            .into());
+        }
+        // `rate_limiter.burst == 0` 且 qps>0：桶容量 0 → 任何 `try_consume(1)` 都
+        // `Err(NotEnough)`，每请求都走 `consume_with_timeout` 等到超时再返回错误。
+        // 唯一合法的"不限流"形态是 `qps_per_key = 0`（见 make_handle）。
+        if self.rate_limiter.burst == 0 && self.rate_limiter.qps_per_key > 0.0 {
+            return Err(
+                "rate_limiter.burst must be > 0 when qps_per_key > 0 (burst=0 starves every \
+                 request; set qps_per_key=0 to actually disable rate limiting).".into(),
+            );
+        }
+        // `qps_per_key` 必须 finite 且有限正数（或 0）。NaN/Inf 在 token 桶的浮点
+        // 算术里会让 `store_approx`、`refill_locked` 的 `.min()` / 比较 NaN 假 [],
+        // 节流路径退化为永远 Err 或永不补充。
+        if !self.rate_limiter.qps_per_key.is_finite() || self.rate_limiter.qps_per_key < 0.0 {
+            return Err(format!(
+                "rate_limiter.qps_per_key={} must be a finite non-negative number \
+                 (NaN/Inf/- breaks token-bucket arithmetic; 0 disables per-key limiting).",
+                self.rate_limiter.qps_per_key
+            )
+            .into());
+        }
+
         info!("配置校验通过");
         Ok(())
     }
@@ -1258,5 +1306,94 @@ mod config_validation_tests {
         cfg.request_max_prompt_tokens = 100_000;
         cfg.empty_shell_no_retry_prompt_tokens = 0;
         assert!(cfg.validate().is_ok());
+    }
+
+    // ── M-tier 数值边界校验测试 ──────────────────────────────────────────
+
+    #[test]
+    fn cooldown_base_seconds_zero_fails() {
+        // base_seconds = 0 让 mark_bad 的 ready_at 立刻到期 → 坏 key 即时复活，
+        // 冷却实质禁用。必须 fail-fast。
+        let mut cfg = base_valid_config();
+        cfg.cooldown.base_seconds = 0;
+        assert!(
+            cfg.validate().is_err(),
+            "cooldown.base_seconds=0 必须被校验拒绝"
+        );
+    }
+
+    #[test]
+    fn cooldown_max_below_base_fails() {
+        // max<base 会让上游要求冷却 600s 的请求被夹成几秒，违反退避。
+        let mut cfg = base_valid_config();
+        cfg.cooldown.base_seconds = 60;
+        cfg.cooldown.max_seconds = 10;
+        let err = cfg.validate().expect_err("max<base must fail");
+        assert!(err.to_string().contains("must be >="));
+    }
+
+    #[test]
+    fn cooldown_max_eq_base_passes() {
+        // 相等合法（上游 Retry-After 与我们的 base 一致）。
+        let mut cfg = base_valid_config();
+        cfg.cooldown.base_seconds = 60;
+        cfg.cooldown.max_seconds = 60;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn rate_limiter_burst_zero_with_positive_qps_fails() {
+        // burst=0 + qps>0 → 桶容量 0，每请求都超时。必须失败。
+        let mut cfg = base_valid_config();
+        cfg.rate_limiter.burst = 0;
+        cfg.rate_limiter.qps_per_key = 1.0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn rate_limiter_burst_zero_with_qps_zero_passes() {
+        // qps=0 = 关闭限流（make_handle 将其构造成正无穷补充）；burst 也
+        // 不参与算术，故该组合合法。
+        let mut cfg = base_valid_config();
+        cfg.rate_limiter.qps_per_key = 0.0;
+        cfg.rate_limiter.burst = 0;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn rate_limiter_qps_nan_fails() {
+        // NaN / Inf 会让 token 桶浮点比较退化；必须失败。
+        let mut cfg = base_valid_config();
+        cfg.rate_limiter.qps_per_key = f64::NAN;
+        assert!(cfg.validate().is_err(), "NaN qps must fail");
+
+        let mut cfg2 = base_valid_config();
+        cfg2.rate_limiter.qps_per_key = f64::INFINITY;
+        assert!(cfg2.validate().is_err(), "Inf qps must fail");
+
+        let mut cfg3 = base_valid_config();
+        cfg3.rate_limiter.qps_per_key = -1.0;
+        assert!(cfg3.validate().is_err(), "negative qps must fail");
+    }
+
+    // ── M-tier IPv6 loopback host 修复 ───────────────────────────────────
+
+    #[test]
+    fn ipv6_loopback_base_url_fails() {
+        // 此前的 bug：host_of_url 返回 "[::1]"（带方括号），与 validate 的 "host_lower == "::1""
+        // 比对永不命中，IPv6 loopback 的 base_url 被门禁放行。
+        let mut cfg = base_valid_config();
+        cfg.base_url = "http://[::1]:8080".to_string();
+        let err = cfg.validate().expect_err("[::1] loopback must fail");
+        assert!(err.to_string().contains("placeholder"), "got: {err}");
+    }
+
+    #[test]
+    fn host_of_url_strips_ipv6_brackets() {
+        assert_eq!(host_of_url("http://[::1]:8080/v1").as_deref(), Some("::1"));
+        assert_eq!(host_of_url("http://[::1]/v1").as_deref(), Some("::1"));
+        // 仍能剥 IPv4 + port。
+        assert_eq!(host_of_url("http://127.0.0.1:8080/v1").as_deref(), Some("127.0.0.1"));
+        assert_eq!(host_of_url("https://api.nvidia.com/v1").as_deref(), Some("api.nvidia.com"));
     }
 }

@@ -163,9 +163,17 @@ impl AppState {
 /// 试不调用 `init_tracing`：它们没有 tracing subscriber，宏变 no-op，测试不读
 /// stdout，但也不会因 guard 生命周期问题丢东西。
 pub fn init_tracing(config: &Config) -> Option<tracing_appender::non_blocking::WorkerGuard> {
-    let filter = EnvFilter::try_from_default_env()
-        .or_else(|_| EnvFilter::try_new(&config.observability.log_level))
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+    // `EnvFilter::try_from_default_env()` 在 `RUST_LOG` **存在但为空**时不会
+    // 回退到默认/配置 —— 它构造一个**拒绝所有 spans** 的过滤器，等于把整个
+    // 进程日志静音（运维常用 `RUST_LOG=""` 想"—清掉一起步"，结果什么都没了）。
+    // 此处显式区分"未设置/空"与"真的设了非空值"：空或未设 → 回退到
+    // `observability.log_level`，再回退 `"info"`。
+    let filter = match std::env::var("RUST_LOG") {
+        Ok(v) if !v.trim().is_empty() => EnvFilter::try_new(v)
+            .unwrap_or_else(|_| EnvFilter::new(&config.observability.log_level)),
+        _ => EnvFilter::try_new(&config.observability.log_level)
+            .unwrap_or_else(|_| EnvFilter::new("info")),
+    };
     // non_blocking(stdout)：写挪到后台线程，业务协程非阻塞。无界 channel——
     // info 级日志量远未到压垮内存，无界保证不丢日志，符合"日志不能丢"的运维
     // 预期；debug 级 verbose 通常临时排障、不是常驻，无需为它上背压。
