@@ -1,7 +1,7 @@
 use bytes::Bytes;
-use once_cell::sync::OnceCell;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
@@ -241,12 +241,6 @@ pub struct Proxy {
     concurrency_limit_per_model: std::collections::HashMap<String, u32>,
     /// 等待一个并发信号量槽的最长时间（毫秒）。
     concurrency_queue_timeout_ms: u64,
-    /// 上游连接超时（秒）。
-    #[allow(dead_code)]
-    upstream_connect_timeout_secs: u64,
-    /// 上游连接池空闲超时（秒）。
-    #[allow(dead_code)]
-    upstream_pool_idle_timeout_secs: u64,
     /// 重试抖动（毫秒）。加到指数退避之上。
     retry_jitter_ms: u64,
 }
@@ -1333,8 +1327,6 @@ impl Proxy {
             max_tokens_max,
             concurrency_limit_per_model,
             concurrency_queue_timeout_ms,
-            upstream_connect_timeout_secs,
-            upstream_pool_idle_timeout_secs,
             retry_jitter_ms,
         }
     }
@@ -1991,7 +1983,7 @@ impl Proxy {
         if let Some(&limit) = cap_lookup {
             if limit > 0 {
                 // 按模型惰性初始化信号量（用 StdMutex 做内部可变性、线程安全）
-                static SEMAPHORES: OnceCell<StdMutex<HashMap<String, Arc<Semaphore>>>> = OnceCell::new();
+                static SEMAPHORES: OnceLock<StdMutex<HashMap<String, Arc<Semaphore>>>> = OnceLock::new();
                 let semaphores = SEMAPHORES.get_or_init(|| StdMutex::new(HashMap::new()));
 
                 // 取或创建本模型信号量
