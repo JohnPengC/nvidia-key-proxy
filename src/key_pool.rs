@@ -742,6 +742,33 @@ impl KeyPool {
         // gauge 刷新推迟到 cool_down_task（参见 mark_failure 的说明）。
     }
 
+    /// 空壳重试成功后的窄恢复：把 key 置 Active、重置 weight/fail，但**只清
+    /// 本 model 的熔断计数**，不清其它 model 的。
+    ///
+    /// 之所以和 `mark_good` 分开：空壳路径在 `increment_circuit_breaker` 时只
+    /// 累加**本 model** 的计数（见 `proxy.rs` 的 `cb_model`）；若恢复后用
+    /// `mark_good` → `reset_all_circuit_breakers()`，会把**别的 model** 的计数
+    /// 一并清掉，于是该 key 在 model A 上的 CB（默认阈值 3 的 per-(key,model)
+    /// 断路器）会因为一次 model B 的空壳重试成功而被抹平、永远触不到阈值——
+    /// 这是 S4 的根因。这里只抹本次重试对应的 model。
+    pub async fn mark_good_for_empty_shell_retry(&self, key_str: &str, model: &str) {
+        let read_guard = self.inner.read().await;
+        if let Some(handle) = read_guard.get(key_str) {
+            let handle = handle.clone();
+            drop(read_guard);
+            handle.set_state(KeyState::Active).await;
+            handle.reset_weight().await;
+            handle.reset_fail().await;
+            handle.reset_circuit_breaker(model).await; // 只清本 model 的熔断计数
+            debug!(
+                key = %mask_key(key_str),
+                model = %model,
+                "空壳重试成功，窄恢复（只清本 model 的熔断计数）"
+            );
+            let _ = self.pub_notifier.send(handle);
+        }
+    }
+
     /// 将 key 标记为坏（收到 429/403）并进入冷却。
     ///
     /// 若上游要求的 Retry-After 长于 `cooldown.max_seconds`，我们把它截断到
@@ -798,6 +825,22 @@ impl KeyPool {
             let _ = self.pub_notifier.send(handle);
         }
         // gauge 刷新推迟到 cool_down_task（参见 mark_failure 的说明）。
+    }
+
+    /// 对某个 key 的限流桶消费一个令牌。供空壳重试路径在重试**前**调用，
+    /// 以保证空壳重试不绕过 per-key QPS（S3）——此前 `handle_empty_shell_failure`
+    /// 直接 `build_upstream_request(...).send()`，从不消费令牌，使一个被限流
+    /// 的 key 能借空壳重试超出其 QPS 配额。返回 `false` 表示该 key 的桶空了、
+    /// 在 `timeout_ms` 内未补上；调用方可据此不重试或换 key。
+    pub async fn try_consume_token_for_key(&self, key_str: &str, timeout_ms: u64) -> bool {
+        let handle = {
+            let read_guard = self.inner.read().await;
+            read_guard.get(key_str).cloned()
+        };
+        match handle {
+            Some(h) => h.try_consume_token(timeout_ms).await,
+            None => false,
+        }
     }
 
     /// 增加某 key、某 model 的熔断失败计数（针对空壳/504 响应）。超过阈值
@@ -1544,6 +1587,42 @@ mod score_selection_tests {
             "cb counters must be cleared on cooldown-expiry reactivation, found: {:?}",
             g.circuit_breaker_failures
         );
+    }
+
+    /// S4 回归：空壳重试成功只清**本 model** 的熔断计数，不清其它 model 的。
+    /// 此前该路径调的是 `mark_good`（→ `reset_all_circuit_breakers`），会把该
+    /// key 在别的 model 上正在累积的 CB 计数一并抹平——于是 per-(key,model)
+    /// 断路器对"间歇空壳但重试能恢复"的 key 永远触不到阈值。
+    #[tokio::test]
+    async fn mark_good_for_empty_shell_retry_clears_only_that_model_cb() {
+        let pool = build_pool_with_keys(&["k1"], 100.0, 10);
+        // 两个 model 各累两次 CB（达到默认阈值 3 的 2/3）。
+        pool.increment_circuit_breaker("k1", "z-ai/glm-5.2", 3).await;
+        pool.increment_circuit_breaker("k1", "z-ai/glm-5.2", 3).await;
+        pool.increment_circuit_breaker("k1", "meta/llama-3.1-405b", 3).await;
+        pool.increment_circuit_breaker("k1", "meta/llama-3.1-405b", 3).await;
+        {
+            let h = pool.inner.read().await.get("k1").cloned().unwrap();
+            let g = h.inner.read().await;
+            assert_eq!(g.circuit_breaker_failures.get("z-ai/glm-5.2"), Some(&2));
+            assert_eq!(g.circuit_breaker_failures.get("meta/llama-3.1-405b"), Some(&2));
+        }
+        // 空壳重试成功——只清本 model（glm）。
+        pool.mark_good_for_empty_shell_retry("k1", "z-ai/glm-5.2").await;
+        let h = pool.inner.read().await.get("k1").cloned().unwrap();
+        let g = h.inner.read().await;
+        assert!(
+            g.circuit_breaker_failures.get("z-ai/glm-5.2").is_none(),
+            "glm cb must be cleared; got {:?}",
+            g.circuit_breaker_failures
+        );
+        assert_eq!(
+            g.circuit_breaker_failures.get("meta/llama-3.1-405b"),
+            Some(&2),
+            "llama cb must be untouched; got {:?}",
+            g.circuit_breaker_failures
+        );
+        assert!(matches!(g.state, KeyState::Active));
     }
 }
 

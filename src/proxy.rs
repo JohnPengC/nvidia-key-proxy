@@ -3332,6 +3332,28 @@ async fn handle_passthrough_stream(
                 req = %request_body_fingerprint(&retry_body),
                 "空壳软失败；以 clamp 后的 max_tokens 重试",
             );
+            // S3：空壳重试前从该 key 的限流桶消费一个令牌，使重试不绕过
+            // per-key QPS。此前该路径直接 `send()`，从不消费令牌——一个被
+            // 上游限流的 key 能借空壳重试超出其配额、加剧 429。消费失败（桶
+            // 空且 token_wait_ms 内未补上）说明该 key 已撞限流天花板，继续打
+            // 它只会再收 429——跳过本次重试，直接外抛 502（fallback 与 budget
+            // 耗尽的既有分支一致）。
+            let got_token = self
+                .key_pool
+                .try_consume_token_for_key(key_str, self.token_wait_ms)
+                .await;
+            if !got_token {
+                warn!(
+                    client_req_id = %client_req_id,
+                    key = %mask_key(key_str),
+                    "空壳重试前 key 令牌桶空（限流天花板）；跳过重试、外抛 502"
+                );
+                self.metrics.inc_error();
+                return Err(AttemptError::Fatal(warp::reject::custom(BadGateway {
+                    msg: "Upstream empty-shell failure; key rate-limited, retry skipped"
+                        .into(),
+                })));
+            }
             let rebuild = self.build_upstream_request(
                 url,
                 method,
@@ -3383,7 +3405,13 @@ async fn handle_passthrough_stream(
                             .map_err(AttemptError::Fatal)?;
                         return Ok(match outcome {
                             SuccessOutcome::Response(resp) => {
-                                self.key_pool.mark_good(key_str).await;
+                                // 空壳重试成功：窄恢复——只清本 model 的熔断计数，
+                                // 不清其它 model 的（S4）。若用 `mark_good` 会清掉
+                                // 该 key 在别的 model 上正在累积的 CB 计数，使那条
+                                // per-(key,model) 断路器永远触不到阈值。
+                                self.key_pool
+                                    .mark_good_for_empty_shell_retry(key_str, model)
+                                    .await;
                                 // 记录空壳重试成功指标
                                 self.metrics.inc_empty_shell_total(self.metrics_model(model), "retry_ok");
                                 AttemptResponse::Done(resp)
