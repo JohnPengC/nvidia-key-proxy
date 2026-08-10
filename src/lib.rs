@@ -285,10 +285,15 @@ pub fn build_routes(
                 if !enable_metrics {
                     return Err::<_, Rejection>(warp::reject::not_found());
                 }
+                // 显式声明 `charset=utf-8`：HTTP/1.1 规定未声明 charset 的
+                // `text/*` 默认按 `iso-8859-1` 解码（RFC 7231 §3.1.1.1），
+                // 这里的 help 文本是中文（UTF-8），不声明就会让严格遵守规约
+                // 的抓取端按 latin1 处理字节，并在后续 GBK/latin1↔UTF-8 转码
+                // 链路里被弄成 mojibake。Prometheus parser 本身能吃 UTF-8。
                 Ok(warp::reply::with_header(
                     metrics.render(),
                     "Content-Type",
-                    "text/plain; version=0.0.4",
+                    "text/plain; version=0.0.4; charset=utf-8",
                 ))
             }
         });
