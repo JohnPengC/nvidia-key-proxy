@@ -674,12 +674,32 @@ impl KeyPool {
     /// 强制将一个 key 置于 `Disabled` 状态（当健康检查发现某 key 的恢复探测
     /// 连续 `max_consecutive_failures` 次报错时使用）。与 `mark_failure` 中的
     /// `Disabled` 转换逻辑一致。
+    ///
+    /// **S7**：若该 key 已是 Disabled，保留其**更长**的 ready_at 而非无条件盖
+    /// `now + max_seconds`。否则一个持续不可达的 `/v1/models` 探针会让
+    /// `recover_one` 每轮都把它推远一个 max_seconds、计数又清零、cool_down_task
+    /// 的到期安全网永不触发，key 永久卡 Disabled、池子自我收缩。镜像 `mark_bad`
+    /// 的"永不缩短"规则。
     pub async fn disable_key(&self, key_str: &str) {
         let read_guard = self.inner.read().await;
         if let Some(handle) = read_guard.get(key_str) {
             let handle = handle.clone();
             drop(read_guard);
-            let ready_at = Instant::now() + Duration::from_secs(self.config.cooldown.max_seconds);
+            let base = self.config.cooldown.max_seconds;
+            let new_ready_at = Instant::now() + Duration::from_secs(base);
+            // 保留更长的既有 Disabled ready_at，避免反复探测失败时无脑后推。
+            let prev_ready_at = {
+                let guard = handle.inner.read().await;
+                if let KeyState::Disabled { ready_at } = guard.state {
+                    Some(ready_at)
+                } else {
+                    None
+                }
+            };
+            let ready_at = match prev_ready_at {
+                Some(prev) if prev > new_ready_at => prev,
+                _ => new_ready_at,
+            };
             handle.set_state(KeyState::Disabled { ready_at }).await;
             warn!(
                 key = %mask_key(key_str),
@@ -1060,8 +1080,24 @@ impl KeyPool {
     /// 清空）可以脱离扫描任务的墙上时钟做单测。一个刚冷却完的 key 应当拿到
     /// 一张干净的熔断清白 —— 否则恢复后的第一个空壳/504 会立刻再次触发熔断
     /// 断路器，key 就会在 cool→shell→cool 之间永远振荡。
+    ///
+    /// **S5 重检**：`cool_down_task` 在读锁下快照"now >= ready_at"后**释放**
+    /// 读锁、再去取每个 key 的写锁。在释放到取写锁之间，一个在途请求可能
+    /// `mark_bad(K, Some(long_retry_after))` 把 K 的 ready_at 推得更远（按
+    /// "永不缩短"规则）。若不重检，机械驱动的 reactivate 会无条件置 Active、
+    /// 清计数，使 K 在仍应 honoring Retry-After 时被激活，刚被限流的请求立刻
+    /// 再打回同 key、再 429。这里在写锁内再校验一次 state 仍是 Cooling/Disabled
+    /// **且** ready_at 已过；否则什么都不做，把该 key 留在它的冷却里。
     pub(crate) async fn reactivate_after_cooldown(&self, handle: &KeyStateHandle) -> bool {
         let mut guard = handle.inner.write().await;
+        let now = Instant::now();
+        match guard.state {
+            KeyState::Cooling { ready_at } if now >= ready_at => {}
+            KeyState::Disabled { ready_at } if now >= ready_at => {}
+            // 状态已被并发改动：已被提前恢复（health 探测 mark_good）、或
+            // ready_at 被并发 mark_bad 推远。保持现状，不动。
+            _ => return matches!(guard.state, KeyState::Disabled { .. }),
+        }
         let was_disabled = matches!(guard.state, KeyState::Disabled { .. });
         guard.state = KeyState::Active;
         guard.weight = 1;
@@ -1623,6 +1659,45 @@ mod score_selection_tests {
             g.circuit_breaker_failures
         );
         assert!(matches!(g.state, KeyState::Active));
+    }
+
+    /// S5 回归：`reactivate_after_cooldown` 必须在写锁内重检 ready_at。`cool_down_task`
+    /// 在读锁下快照"expired"后会释放读锁、再取写锁；该窗口里 `mark_bad` 可能
+    /// 把 ready_at 推到未来。机械的无条件 reactivate 会把一个仍应冷却的 key 置
+    /// Active、清计数，使其在仍应 honoring Retry-After 时被复用。这里手工模拟：
+    /// 先让它 expired、拿 handle、再用长 Retry-After 推远 ready_at，然后调用
+    /// reactivate 验证它**不**改状态。
+    #[tokio::test]
+    async fn reactivate_after_cooldown_respects_a_concurrent_reextension() {
+        let pool = build_pool_with_keys(&["k1"], 100.0, 10);
+        // 让它进入 Cooling 且 ready_at 在过去。
+        pool.mark_bad("k1", Some(0)).await;
+        // 拿到 handle（模拟 cool_down_task 快照阶段）。
+        let h = pool.inner.read().await.get("k1").cloned().unwrap();
+        {
+            let g = h.inner.read().await;
+            assert!(matches!(g.state, KeyState::Cooling { .. }));
+        }
+        // 模拟"取写锁窗口里 mark_bad 推远 ready_at"：用大 Retry-After（受
+        // max_seconds=2 限幅，故推到 ~now+2s）。注意不要在读锁持有期调写操作。
+        pool.mark_bad("k1", Some(10_000)).await;
+        {
+            let g = h.inner.read().await;
+            assert!(
+                matches!(g.state, KeyState::Cooling { ready_at } if ready_at > Instant::now() + Duration::from_secs(1)),
+                "after re-mark_bad with long retry_after (clamped to max_seconds=2), ready_at must be ~2s out, got {:?}",
+                g.state
+            );
+        }
+        // 现在 reactivate 不该把它置 Active——ready_at 还没到。
+        let was_disabled = pool.reactivate_after_cooldown(&h).await;
+        assert!(!was_disabled, "must not report was_disabled for Cooling key");
+        let g = h.inner.read().await;
+        assert!(
+            matches!(g.state, KeyState::Cooling { .. }),
+            "must remain Cooling (ready_at not yet reached), got {:?}",
+            g.state
+        );
     }
 }
 

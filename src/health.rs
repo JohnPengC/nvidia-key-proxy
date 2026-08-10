@@ -175,8 +175,22 @@ impl HealthChecker {
                 };
                 warn!(key = %mask_key(key_str), error = %e, probe_errors = count, max_failures = self.max_failures, "恢复探测出错");
                 if self.max_failures > 0 && count >= self.max_failures {
-                    warn!(key = %mask_key(key_str), "连续探测失败达阈值；强制禁用 key");
-                    self.key_pool.disable_key(key_str).await;
+                    // S7：对**已 Disabled** 的 key，不要再调 `disable_key`——它
+                    // 进来时就是 Disabled，反复探测失败时若每次都 `disable_key`
+                    // 并 reset 计数，旧版本会把 ready_at 无脑后推一个 max_seconds、
+                    // cool_down_task 的到期安全网永不触发，key 永久卡 Disabled、
+                    // 池子自我收缩。`disable_key` 现已保留更长 ready_at，故这里对
+                    // 已禁用的 key 只 reset 计数（避免下一轮立即又触阈值）、保持其
+                    // Disabled 状态与既有 ready_at 即可。
+                    if was_disabled {
+                        warn!(
+                            key = %mask_key(key_str),
+                            "连续探测失败已阈值，但 key 已禁用；保持其既有 ready_at（不重推）"
+                        );
+                    } else {
+                        warn!(key = %mask_key(key_str), "连续探测失败达阈值；强制禁用 key");
+                        self.key_pool.disable_key(key_str).await;
+                    }
                     self.reset_probe_failures(key_str);
                 }
             }
