@@ -28,25 +28,150 @@ use serde_json::{json, Value};
 
 use crate::key_pool::mask_key;
 
-/// 一个由 Mutex 守护的全局文件 handle，外加当前文件的字节计数，用于在
-/// `FAILURE_LOG_MAX_BYTES` 处轮转。写入很短（单行 JSON），竞争可忽略；
-/// 从不跨 await 持锁。
+/// 把序列化好的单行 JSON + 换行，写入目标文件。`file` 已就绪。
+fn write_line(file: &mut File, line: &str) -> std::io::Result<()> {
+    file.write_all(line.as_bytes())?;
+    file.write_all(b"\n")
+}
+
+/// 失败日志的异步写入后台。收到序列化行 → 写入 + flush，独占地轮转/回滚。
+/// 使用 `std::sync::Mutex`（而非持锁跨 await）：整个 write_failure 体现在
+/// channel send 上，是无锁操作，对业务协程透明——不会阻塞 tokio worker
+///（刷盘/轮转在专用线程上）。此前写 failure.log 的实现把 `writeln!` +
+/// `flush()` 跑在 async 热路径上，一旦上游 brownout（正是写入狂热时刻）
+/// 所有请求任务串行阻塞在一个 fd 互斥体上。
+static WRITER: Mutex<Option<WriterHandle>> = Mutex::new(None);
+
+struct WriterHandle {
+    tx: std::sync::mpsc::Sender<LogEntry>,
+}
+
+struct LogEntry {
+    line: String,
+}
+
+/// 单个后台 writer 任务，串行刷盘。
+fn spawn_writer_thread() {
+    let (tx, rx) = std::sync::mpsc::channel::<LogEntry>();
+    std::thread::Builder::new()
+        .name("failure-log-writer".to_string())
+        .spawn(move || {
+            // 失败日志聚合账号/上游错误体片段，应受进程文件权限保护。
+            let mut state = open_rotation_state();
+            for entry in rx.iter() {
+                let path = log_path();
+                let line_len = entry.line.len() as u64;
+                state.before_write_rotate(&path, line_len);
+                if let Some(st) = &mut state.inner {
+                    let _ = write_line(&mut st.file, &entry.line);
+                    // flush 以防进程崩溡丢掉末位日志——失败日志用于事后
+                    // 诊断，丢尾必然。刷盘成本摊摊在专用线程上，不挂热路径。
+                    let _ = st.file.flush();
+                    st.written += line_len + 1;
+                }
+            }
+        })
+        .expect("failure-log-writer thread spawn");
+    let mut g = WRITER.lock().unwrap_or_else(|p| p.into_inner());
+    *g = Some(WriterHandle { tx });
+}
+
+/// 确保 writer 线程已就绪。
+fn ensure_writer() {
+    // 快速路径：已挂则直接返回。
+    {
+        let g = WRITER.lock().unwrap_or_else(|p| p.into_inner());
+        if g.is_some() {
+            return;
+        }
+    }
+    spawn_writer_thread();
+}
+
+/// 持有打开文件 handle + 轮转状态。
 struct RotationState {
-    file: File,
-    /// 写到*当前*打开文件的字节数。轮转时重置。
-    written: u64,
-    /// 解析后的 `FAILURE_LOG_MAX_BYTES`。在 ensure_open 时抓取快照，避免进
-    /// 程中途改环境变量生效（配置快照）。
+    inner: Option<RotationFile>,
     max_bytes: u64,
 }
-static FAILURE_FILE: Mutex<Option<RotationState>> = Mutex::new(None);
-
-fn log_path() -> String {
-    std::env::var("FAILURE_LOG_PATH").unwrap_or_else(|_| "failure.log".to_string())
+struct RotationFile {
+    file: File,
+    written: u64,
 }
 
-/// `FAILURE_LOG_MAX_BYTES` 对当前文件的上限。0 = 关闭（无限 append——旧行
-/// 为）。打开时读取一次。
+impl RotationState {
+    /// 在写入 `line` 前，若它会让当前文件超过 `max_bytes`，则轮转旧文件到
+    /// 带时间戳归档名并开新文件。全程尽力而为：roll/reopen 失败就回退到
+    /// 继续用旧 handle，绝不丢日志。
+    fn before_write_rotate(&mut self, path: &str, line_len: u64) {
+        if self.max_bytes == 0 {
+            return;
+        }
+        let Some(st) = self.inner.as_mut() else {
+            return;
+        };
+        if st.written + line_len + 1 > self.max_bytes {
+            let _ = st.file.flush();
+            let stamp = Local::now().timestamp();
+            match std::fs::rename(path, format!("{}.{}", path, stamp)) {
+                Ok(_) => match OpenOptions::new().create(true).append(true).open(path) {
+                    Ok(new) => {
+                        set_private_perms(path, &new);
+                        st.file = new;
+                        st.written = 0;
+                    }
+                    Err(e) => {
+                        eprintln!("failure_log: 轮转 reopen 失败（{}）：{}", path, e);
+                        // roll 走的旧 inode fd 仍可写；归零 written 避免活锁。
+                        st.written = 0;
+                    }
+                },
+                Err(e) => {
+                    eprintln!("failure_log: 轮转 rename 失败（{}）：{}", path, e);
+                    st.written = 0;
+                }
+            }
+        }
+    }
+}
+
+fn open_rotation_state() -> RotationState {
+    RotationState {
+        inner: open_failure_file(),
+        max_bytes: max_bytes_setting(),
+    }
+}
+
+/// 在创建时设置 `0600` 权限（Unix），防其它本地用户读含 key/账号 id 的日志。
+fn open_failure_file() -> Option<RotationFile> {
+    let path = log_path();
+    let f = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .ok()?;
+    set_private_perms(&path, &f);
+    let written = f.metadata().map(|m| m.len()).unwrap_or_default();
+    Some(RotationFile { file: f, written })
+}
+
+/// 尽力把日志文件权限收到 `0600`（owner-only）。跨平台 no-op 在 Windows。
+fn set_private_perms(_path: &str, file: &File) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = file.metadata() {
+            // 仅当当前权限放得比 0600 宽松时才 tighten，免干扰运维预设
+            // 更高隔离的部署。
+            let cur = meta.permissions().mode() & 0o777;
+            if cur & 0o077 != 0 {
+                let _ = file.set_permissions(std::fs::Permissions::from_mode(cur & !0o077));
+            }
+        }
+    }
+    let _ = file;
+}
+
+/// `FAILURE_LOG_MAX_BYTES` 对当前文件的上限。0 = 关闭（无限 append——旧行为）。
 fn max_bytes_setting() -> u64 {
     std::env::var("FAILURE_LOG_MAX_BYTES")
         .ok()
@@ -54,31 +179,8 @@ fn max_bytes_setting() -> u64 {
         .unwrap_or(0)
 }
 
-fn ensure_open() {
-    // `unwrap_or_else(|p| p.into_inner())` 能扛中毒的 mutex——如果之前某次
-    // 写入 panic（这条路径本不该 panic，但 `writeln!`/`flush` 在 fd 损坏时
-    // 确实可能 panic），我们仍希望失败日志通道继续写，而不是把之后每条
-    // 失败记录都级联 panic 掉。
-    let mut guard = FAILURE_FILE.lock().unwrap_or_else(|p| p.into_inner());
-    if guard.is_none() {
-        let path = log_path();
-        match OpenOptions::new().create(true).append(true).open(&path) {
-            Ok(f) => {
-                // 把计数器起点设为当前文件大小（仅当开启轮转时），这样一个
-                // 本就很大的文件会在下一次写入就轮转，而不是忽略已有字节。
-                let written = f.metadata().map(|m| m.len()).unwrap_or_default();
-                *guard = Some(RotationState {
-                    file: f,
-                    written,
-                    max_bytes: max_bytes_setting(),
-                });
-            }
-            Err(e) => {
-                eprintln!("failure_log: 无法打开 {}：{}", path, e);
-                // 留 None——write_failure 变成 no-op。
-            }
-        }
-    }
+fn log_path() -> String {
+    std::env::var("FAILURE_LOG_PATH").unwrap_or_else(|_| "failure.log".to_string())
 }
 
 /// 生成一个短的、近单调的请求 id：unix 秒数 + per-process 计数。不是全局
@@ -116,20 +218,19 @@ pub fn write_failure(
     if std::env::var("FAILURE_LOG_DISABLE").is_ok() {
         return;
     }
-    ensure_open();
-    let mut guard = FAILURE_FILE.lock().unwrap_or_else(|p| p.into_inner());
-    let rot = match guard.as_mut() {
-        Some(r) => r,
-        None => return,
+    ensure_writer();
+    let tx = {
+        let g = WRITER.lock().unwrap_or_else(|p| p.into_inner());
+        g.as_ref().map(|h| h.tx.clone())
     };
+    let Some(tx) = tx else { return };
 
     let now = Local::now();
     let ts = now.format("%Y-%m-%d %H:%M:%S%.3f").to_string();
-    let error_time = ts.clone();
 
     let mut entry = json!({
         "ts": ts,
-        "error_time": error_time,
+        "error_time": ts.clone(),
         "req_id": gen_req_id(req_counter),
         "client_req_id": client_req_id,
         "method": method,
@@ -155,48 +256,11 @@ pub fn write_failure(
         entry["error_kind"] = Value::String(k.to_string());
     }
 
-    // 序列化后追加换行。serde_json::to_string 在我们这个 Value 形态下不会
-    // panic，但失败路径（不可能发生）上用一句简短 stderr 兜底。
+    // 序列化后追加换行。失败时回退 stderr，绝不 panic 阻塞热路径。
     match serde_json::to_string(&entry) {
         Ok(line) => {
-            // 若这行会让当前文件超过上限，则在写之前先轮转。`max_bytes == 0`
-            // 关闭轮转。
-            if rot.max_bytes > 0 && rot.written + (line.len() as u64) + 1 > rot.max_bytes {
-                let path = log_path();
-                // flush + 关闭当前文件，roll 到带时间戳的名字，再开新文件。
-                // 全程尽力而为：roll 失败就回退到继续用同一 handle，绝不丢
-                // 失败记录。
-                let _ = rot.file.flush();
-                let stamp = now.timestamp();
-                if let Err(e) = std::fs::rename(&path, format!("{}.{}", path, stamp)) {
-                    eprintln!("failure_log: 轮转 rename 失败（{}）：{}", path, e);
-                    // 没能 roll；继续往同一 handle append，并更新 `written`，
-                    // 避免每行都重试。
-                } else {
-                    match OpenOptions::new().create(true).append(true).open(&path) {
-                        Ok(new) => {
-                            rot.file = new;
-                            rot.written = 0;
-                        }
-                        Err(e) => {
-                            eprintln!("failure_log: 轮转后 reopen 失败（{}）：{}", path, e);
-                            // `rot.file` 仍持有旧 handle；Unix 上对已打开文件
-                            // rename 会让 fd 继续写到被移走的 inode，数据不丢。
-                            // **关键**：即使 reopen 失败也要把 `written` 归零，
-                            // 否则下一行 `written + len > max_bytes` 仍为真，会
-                            // 每行都重复 rename+reopen，对坏掉的文件系统形成一个
-                            // spin-on-every-line 的活锁——数据已安全落在被 roll
-                            // 走的旧 inode 上，没必要每行再试一遍。后续写入会继
-                            // 续在旧 handle（roll 走的文件）上累积，`written` 从 0
-                            // 起计，max_bytes 后再尝试一次 reopen（可能届时已恢复）。
-                            rot.written = 0;
-                        }
-                    }
-                }
-            }
-            let _ = writeln!(rot.file, "{}", line);
-            let _ = rot.file.flush();
-            rot.written += (line.len() as u64) + 1;
+            // 单行日志跨 await 压回 channel（背压可无限——INFO 量未见上限）。
+            let _ = tx.send(LogEntry { line });
         }
         Err(e) => {
             eprintln!("failure_log: 序列化失败：{}", e);

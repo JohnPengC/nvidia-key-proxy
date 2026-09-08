@@ -54,19 +54,15 @@ impl AppState {
         // tracing 由调用方（`main` / 测试入口）先于本函数调 `init_tracing` 完成；
         // 这里不再自调，避免在每个 `AppState::new`（main 一次、集成测试 N 次）里
         // 重试装 subscriber 并误关 log channel guard。详见 `init_tracing` 文档。
-        tracing::info!("已加载配置：{:?}", config);
-        eprintln!(
-            "[config-load] request_timeout_seconds={}",
-            config.request_timeout_seconds
+        // 只记录非敏感摘要：`{:?}` 打整个 `Config` 会把 `keys`、`bearer_token`、
+        // `admin_token` 明文写进日志聚合系统，抵消所有 `mask_key` 脱敏。
+        tracing::info!(
+            keys = config.keys.len(),
+            base_url = %config.base_url,
+            auth_enabled = config.auth.enabled,
+            request_timeout_seconds = config.request_timeout_seconds,
+            "已加载配置"
         );
-        let config_path =
-            std::env::var("NVIDIA_CONFIG_PATH").unwrap_or_else(|_| "config.toml".to_string());
-        eprintln!("[config-load] config_path={}", config_path);
-        if let Ok(content) = std::fs::read_to_string(&config_path) {
-            eprintln!("[config-load] config_file_len={}", content.len());
-        } else {
-            eprintln!("[config-load] config_file_read=FAILED");
-        }
 
         let metrics = Arc::new(Metrics::new());
         let active_keys_cached =
@@ -208,6 +204,10 @@ pub fn build_routes(
             |path: warp::path::FullPath,
              method: warp::http::Method,
              headers: warp::http::HeaderMap| {
+                // debug 关闭时不分配 host/UA 字符串。
+                if !tracing::level_enabled!(tracing::Level::DEBUG) {
+                    return;
+                }
                 let host = headers
                     .get("host")
                     .and_then(|v| v.to_str().ok())
@@ -265,6 +265,12 @@ pub fn build_routes(
         })
         .and(warp::method())
         .and(warp::header::headers_cloned())
+        // 代理路由也必须给 body 设上限：`warp::body::bytes()` 无上限地全量
+        // 缓冲，持 bearer 的 client（或 auth 关闭时任何人）几个 GB 级 POST
+        // 即可 OOM 进程。默认 32 MiB 对含 base64 图片的 chat 请求足够。
+        .and(warp::body::content_length_limit(
+            state.config.request_body_max_bytes,
+        ))
         .and(warp::body::bytes())
         .and(warp::addr::remote())
         .and_then({
@@ -363,43 +369,59 @@ pub fn build_routes(
 
 pub async fn handle_rejection(err: Rejection) -> Result<impl Reply, Rejection> {
     if err.find::<Unauthorized>().is_some() {
-        return Ok(warp::reply::with_status(
-            "Authentication required".to_string(),
-            StatusCode::UNAUTHORIZED,
-        ));
+        // RFC 7235：401 必须带 WWW-Authenticate，否则部分 client 不会重试/提示。
+        // 注意各分支返回类型必须一致（impl Reply），统一用 response 构造。
+        let res = warp::http::Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .header("WWW-Authenticate", "Bearer")
+            .body(warp::hyper::Body::from("Authentication required"))
+            .unwrap();
+        return Ok(res);
     } else if err.find::<AdminDisabled>().is_some() {
         return Ok(warp::reply::with_status(
             "Not found".to_string(),
             StatusCode::NOT_FOUND,
-        ));
+        )
+        .into_response());
     }
     if err.find::<warp::reject::InvalidQuery>().is_some() {
         error!("非法 query");
         Ok(warp::reply::with_status(
             "Invalid query".to_string(),
             StatusCode::BAD_REQUEST,
-        ))
+        )
+        .into_response())
     } else if err.find::<warp::reject::PayloadTooLarge>().is_some() {
         Ok(warp::reply::with_status(
             "Payload too large".to_string(),
             StatusCode::PAYLOAD_TOO_LARGE,
-        ))
+        )
+        .into_response())
+    } else if err.find::<warp::reject::LengthRequired>().is_some() {
+        Ok(warp::reply::with_status(
+            "Content-Length header required".to_string(),
+            StatusCode::LENGTH_REQUIRED,
+        )
+        .into_response())
     } else if err.find::<warp::reject::MethodNotAllowed>().is_some() {
         Ok(warp::reply::with_status(
             "Method not allowed".to_string(),
             StatusCode::METHOD_NOT_ALLOWED,
-        ))
+        )
+        .into_response())
     } else if err.is_not_found() {
         Ok(warp::reply::with_status(
             "Not found".to_string(),
             StatusCode::NOT_FOUND,
-        ))
+        )
+        .into_response())
     } else {
         error!("未处理的 rejection：{:?}", err);
         Ok(warp::reply::with_status(
             "Internal server error".to_string(),
             StatusCode::INTERNAL_SERVER_ERROR,
-        ))
+        )
+        .into_response())
     }
 }
 
@@ -430,10 +452,12 @@ impl warp::reject::Reject for AdminDisabled {}
 /// "长度就错"——对 bearer 令牌这种定长/几乎定长秘密，这是规避长度侧信道的
 /// 标准做法。仍是 polyfill：项目在所有路径上避免引入新 crate；见下文。
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    let mut diff: u8 = a.len() as u8 ^ b.len() as u8;
+    // 累加器用 `usize` 而非 `u8`：`u8` 下长度相差 256 的倍数时折叠为 0，
+    // 同前缀但不同长的两个 token 会被误判相等。
+    let mut diff: usize = a.len() ^ b.len();
     let n = a.len().min(b.len());
     for i in 0..n {
-        diff |= a[i] ^ b[i];
+        diff |= (a[i] ^ b[i]) as usize;
     }
     diff == 0
 }
@@ -539,25 +563,41 @@ fn admin_api(state: AppState) -> impl Filter<Extract = impl Reply, Error = Rejec
             }
         });
 
-    let del = warp::path!("admin" / "keys" / String)
+    // key 走请求 body（`{"key": "..."}`）而非 URL 路径：路径中的明文密钥会
+    // 落进 access log / entry_log / 响应体。响应里也只回掩码后的 key。
+    let del = warp::path!("admin" / "keys")
         .and(warp::delete())
+        .and(warp::body::content_length_limit(64 * 1024))
+        .and(warp::body::json())
         .and(warp::header::headers_cloned())
         .and_then({
             let s = state.clone();
-            move |key: String, headers: warp::http::HeaderMap| {
+            move |body: serde_json::Value, headers: warp::http::HeaderMap| {
                 let s = s.clone();
                 async move {
                     check_admin_token(&s.config.auth.admin_token, &headers)?;
+                    let key = body
+                        .get("key")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if key.is_empty() {
+                        return Ok::<_, Rejection>(json_reply(
+                            400,
+                            &serde_json::json!({ "error": "missing \"key\" in body" }),
+                        ));
+                    }
                     let removed = s.key_pool.remove_key(&key).await;
+                    let masked = crate::key_pool::mask_key(&key);
                     if removed {
-                        Ok::<_, Rejection>(json_reply(
+                        Ok(json_reply(
                             200,
-                            &serde_json::json!({ "removed": true, "key": key }),
+                            &serde_json::json!({ "removed": true, "key": masked }),
                         ))
                     } else {
-                        Ok::<_, Rejection>(json_reply(
+                        Ok(json_reply(
                             404,
-                            &serde_json::json!({ "removed": false, "key": key }),
+                            &serde_json::json!({ "removed": false, "key": masked }),
                         ))
                     }
                 }

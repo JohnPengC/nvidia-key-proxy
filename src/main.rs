@@ -89,10 +89,13 @@ async fn main() {
         .parse()
         .expect("Invalid listen address");
 
-    // 当绑定到 IPv4 通配地址（0.0.0.0）时，也绑定 IPv6 通配地址，
-    // 这样把 `localhost` 解析到 `::1` 的 client 也能连上（macOS 把
-    // ::1 排在最前）。否则 `http://localhost:<端口>` 会连不上，哪怕
-    // `http://127.0.0.1:<端口>` 是好的。
+    // 当绑定到 IPv4 通配地址（0.0.0.0）时，同时绑定 IPv6 通配地址，使把
+    // `localhost` 解析到 `::1` 的 client 也能连上（macOS 把 ::1 排在最前）。
+    // 但在 Linux（默认 `net.ipv6.bindv6only=0`）下，`[::]:port` 已经覆盖
+    // IPv4-mapped 空间，再绑 `0.0.0.0:port` 就会 `EADDRINUSE` 让
+    // `bind_with_graceful_shutdown` panic——生产 Linux 部署刚启动就崩。此处用
+    // try_bind 跳过不可用的额外地址（仅在双栈冲突时丢弃 IPv6 bind；macOS 会
+    // 得到两个监听 socket，不影响）。
     let mut addrs = vec![addr];
     if addr.ip().is_unspecified() && addr.is_ipv4() {
         if let Ok(v6) = format!("[::]:{}", addr.port()).parse::<SocketAddr>() {
@@ -106,12 +109,18 @@ async fn main() {
             "监听于 {}，指标路径 {}",
             a, state.config.observability.metrics_path
         );
-        let (_, fut) = warp::serve(routes.clone()).bind_with_graceful_shutdown(
-            a,
-            // 共用同一个关停信号 future；触发 warp 优雅关停。绑定器之间不共享
-            // 同一个 future 实例（future 不可重入），故每个绑定者各自 await 它。
-            await_shutdown_signal(),
-        );
+        let server = warp::serve(routes.clone());
+        let (_, fut) = match server
+            .try_bind_with_graceful_shutdown(a, await_shutdown_signal())
+        {
+            Ok(x) => x,
+            Err(e) => {
+                // 多半是 Linux 上 [::] 与 0.0.0.0 的 EADDRINUSE 冲突；
+                // 跳过该地址而非 panic 启动。
+                warn!("监听 {} 失败，跳过：{}", a, e);
+                continue;
+            }
+        };
         server_handles.push(tokio::spawn(fut));
     }
 
@@ -125,6 +134,10 @@ async fn main() {
         bg_stop.notify_waiters();
         info!("已通知后台 task 关停；等待在途请求排空……");
     });
+
+    // 先等关停信号，再给在途请求一个硬上限排空时间。
+    await_shutdown_signal().await;
+    info!("收到关停信号，开始排空在途请求……");
 
     // 等所有监听者关停，或超时硬墙到——后者强退，避免坏 client 把进程卡死。
     let drain = async {

@@ -17,6 +17,12 @@ pub struct HealthChecker {
     /// 计数达到 `max_failures` 时，健康检查器强制禁用它（见 `recover_one`），
     /// 而不是永远等待冷却计时器。成功探测后重置为 0。
     probe_failures: std::sync::Mutex<std::collections::HashMap<String, usize>>,
+    /// 该 key 的*连续探测 401* 计数。401 是"该 key 被上游拒绝"的确定性信号
+    ///（与 403 不同——后者可能是账户/区域门控，对一个完全有效的 key 也会
+    /// 出现）。连续 `max_failures` 次探测 401 即确诊 key 已失效/过期，由
+    /// `KeyPool::mark_expired` 永久除名。探测成功（2xx）时重置为 0；其它非
+    /// 2xx（403/429/5xx）不增不减。
+    probe_401s: std::sync::Mutex<std::collections::HashMap<String, usize>>,
     client: reqwest::Client,
     /// 启动健康检查已完成的读门。`run_startup` 在退出前（无论成功与否）把它
     /// 置 true；`/health` 路由在它为 false 时返回 503、为 true 后返回 204。这让
@@ -45,6 +51,7 @@ impl HealthChecker {
             timeout: Duration::from_secs(timeout_seconds),
             max_failures: max_consecutive_failures,
             probe_failures: std::sync::Mutex::new(std::collections::HashMap::new()),
+            probe_401s: std::sync::Mutex::new(std::collections::HashMap::new()),
             client,
             ready,
         }
@@ -141,7 +148,9 @@ impl HealthChecker {
     ///
     /// * 成功 → 恢复 key（`mark_good` / `recover_disabled`）并重置其连续探测错误计数。
     /// * 非 2xx → 不算定性（NVIDIA 的 `/v1/models` 对一个完全有效的 key 也可能
-    ///   403/401），交给冷却计时器；错误计数不动。
+    ///   403/401），交给冷却计时器；错误计数不动。**例外**：401 是 key 被拒的
+    ///   确定性信号，会累加独立的连续 401 计数，连续 `max_failures` 次后该 key
+    ///   被 `mark_expired` 永久除名（见 `recover_one` 的 401 分支）。
     ///   **注**：一个因 429（不带 Retry-After）被短冷却的 key 也走这条路径
     ///   （见 `Proxy::process_upstream_attempt` 的不重试分支）：探测期若上游仍在
     ///   限流，`/v1/models` 也回 429 → 非 2xx → 不重置也不递增。但它不依赖探测
@@ -161,6 +170,30 @@ impl HealthChecker {
                 } else {
                     info!(key = %mask_key(key_str), "坏 key 经探测恢复；标记为好");
                     self.key_pool.mark_good(key_str).await;
+                }
+            }
+            Ok(status) if status == StatusCode::UNAUTHORIZED => {
+                // 401 是探测端点对"该 key 被上游拒绝"的确定性信号（区别于
+                // 403 账户/区域门控）。连续 `max_failures` 次 401 即确诊 key
+                // 已失效/过期 → 永久除名并明确上报，避免它在 Disabled 状态
+                // 里无限探测、无限占着池位却从未被识别。
+                let count = {
+                    let mut map = self.probe_401s.lock().unwrap();
+                    let c = map.entry(key_str.to_string()).or_insert(0);
+                    *c += 1;
+                    *c
+                };
+                warn!(key = %mask_key(key_str), status = %status, consecutive_401s = count, max_failures = self.max_failures, "恢复探测返回 401");
+                if self.max_failures > 0
+                    && count >= self.max_failures
+                    && self.key_pool.mark_expired(key_str).await
+                {
+                    self.reset_probe_failures(key_str);
+                    warn!(
+                        key = %mask_key(key_str),
+                        "探测连续 {} 次 401：判定该 key 已过期失效，已永久移出轮询（不再探测）。请从 config.toml 的 keys 中删除该 key",
+                        self.max_failures
+                    );
                 }
             }
             Ok(status) => {
@@ -199,6 +232,7 @@ impl HealthChecker {
 
     fn reset_probe_failures(&self, key_str: &str) {
         self.probe_failures.lock().unwrap().remove(key_str);
+        self.probe_401s.lock().unwrap().remove(key_str);
     }
 
     async fn probe_key(

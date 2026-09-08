@@ -106,7 +106,11 @@ impl Drop for ConcurrencyGuard {
 /// 内部流和 guard。
 struct GuardedStream {
     inner: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>,
-    _guard: ConcurrencyGuard,
+    /// 并发信号量槽（若本模型配置了并发上限）：流的存活期内持有。
+    _concurrency: Option<ConcurrencyGuard>,
+    /// key 的 `in_flight` 租约：流被排空/drop 时才归还，使该 key 在长流
+    /// 期间的负载对后续 `acquire` 打分可见（而非响应 headers 一到就退款）。
+    _in_flight: Option<InFlightLease>,
 }
 
 impl Stream for GuardedStream {
@@ -133,7 +137,11 @@ impl Stream for GuardedStream {
 /// 那些候选尚未被包装，且自身已一对一平衡 inc/dec。
 struct InFlightGuard {
     handle: KeyStateHandle,
-    released: bool,
+    /// 与所有 `lease()` 副本共享的"已释放"标志：lease 被移入流式响应 body
+    /// （使 `in_flight` 覆盖到客户端排空该 key 的流为止），guard 本身在
+    /// `handle_request` 帧结束 drop——两者中先到的那个执行真正的 dec，另一个
+    /// 看到 flag 已置位而跳过。恰好一次 dec，无论生命周期谁更长。
+    released: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl InFlightGuard {
@@ -142,16 +150,25 @@ impl InFlightGuard {
     fn new(handle: KeyStateHandle) -> Self {
         Self {
             handle,
-            released: false,
+            released: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
-    /// 幂等地 decrement `in_flight`。可多次调用，且 `Drop` 跟在后面也安全——
-    /// 只有第一次调用真正 decrement。
+    /// 幂等地 decrement `in_flight`。可多次调用，且 `Drop`/lease 跟在后面也
+    /// 安全——只有第一次 swap 成功才真正 decrement。
     fn release(&mut self) {
-        if !self.released {
+        if !self.released.swap(true, Ordering::AcqRel) {
             self.handle.dec_in_flight();
-            self.released = true;
+        }
+    }
+
+    /// 生成一个可安全 `Send` 进响应 body 流的租约：与 guard 共享 released 标志。
+    /// 流式响应用它把该 key 的 `in_flight` 计数延长到客户端排空流为止——key 在
+    /// 长流期间的负载对后续打分可见，而不是 headers 一到就退款。
+    fn lease(&self) -> InFlightLease {
+        InFlightLease {
+            handle: self.handle.clone(),
+            released: self.released.clone(),
         }
     }
 
@@ -164,18 +181,32 @@ impl InFlightGuard {
 
     /// 把被包装的 handle 切换为 `new`：释放旧的（提前退款，让旧 key 的分数在
     /// 下一轮获取前恢复），然后取走 `new` 的所有权（它已被 `acquire_retry_key`
-    /// `inc_in_flight`），并把 `released` 标志复位，使稍后的 `release()` / `Drop`
-    /// 恰好 decrement 一次*新* handle。
+    /// `inc_in_flight`），并用一个全新的 `released` 标志，使稍后的
+    /// `release()` / `Drop` 恰好 decrement 一次*新* handle。
     fn swap(&mut self, new: KeyStateHandle) {
         self.release();
         self.handle = new;
-        self.released = false;
+        self.released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     }
 }
 
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
         self.release();
+    }
+}
+
+/// `InFlightGuard` 的可移入流副本，见 `InFlightGuard::lease`。
+struct InFlightLease {
+    handle: KeyStateHandle,
+    released: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for InFlightLease {
+    fn drop(&mut self) {
+        if !self.released.swap(true, Ordering::AcqRel) {
+            self.handle.dec_in_flight();
+        }
     }
 }
 
@@ -221,7 +252,9 @@ pub struct Proxy {
     known_models: std::collections::HashSet<String>,
     /// 上游 `/v1/models` 目录的缓存。NVIDIA 不需鉴权即可应答该端点，因此我们
     /// 透传并对结果做 memoize，避免在每个客户端启动时都重新探上游。
-    models_cache: Arc<Mutex<Option<serde_json::Value>>>,
+    /// 带 TTL 的缓存：无 TTL 时新上架的 NVIDIA 模型要等进程重启才可见。
+    /// 持锁跨越整个上游 fetch，并发首个请求自然串行——只有第一个真正打上游。
+    models_cache: Arc<Mutex<Option<(serde_json::Value, std::time::Instant)>>>,
     /// 在流式 chat 请求中注入 `stream_options.include_usage: true`，使 NVIDIA
     /// 在流结束时返回 token 用量。NVIDIA/OpenAI 仅在该标志置位时才 emit usage；
     /// 不注入的话我们的 token 指标对（常见的）流式场景恒为 0。
@@ -820,13 +853,31 @@ impl EstPromptCosts {
     }
 }
 
+/// 文本的粗略 token 估算：ASCII 按 ~4 字符/token；非 ASCII（CJK 等）按
+/// ~1 字符/token。纯 `chars/4` 对中文活跃 prompt 会低估约 4 倍，使
+/// 就产生真实 token 计费；OpenAI API 返回的 usage 与 OpenAI 计费。对 Claude
+/// Code 这类中文会话，`chars/4` 会让 413 硬上限与空壳不重试阈值形同虚设
+///（一个实际 ~90k token 的中文上下文估算只有 ~23k）。英文请求路径不变。
+fn text_token_estimate(s: &str) -> u64 {
+    let mut ascii = 0u64;
+    let mut non_ascii = 0u64;
+    for c in s.chars() {
+        if c.is_ascii() {
+            ascii += 1;
+        } else {
+            non_ascii += 1;
+        }
+    }
+    ascii / 4 + non_ascii
+}
+
 /// 单条 message `content` 的粗略 token 估算，content 可能是纯字符串（仅文本
-/// 请求）或类型化 part 数组（OpenAI 风格多模态）。文本按 `chars/4`；每个非文本
-/// part 用其 `EstPromptCosts::part_cost` 替代，使内联 base64 图像/音频不吹爆
-/// 估算、URL-only 图像不少算。
+/// 请求）或类型化 part 数组（OpenAI 风格多模态）。文本按 ASCII/4 + 非 ASCII/1；
+/// 每个非文本 part 用其 `EstPromptCosts::part_cost` 替代，使内联 base64 图像/
+/// 音频不吹爆估算、URL-only 图像不少算。
 fn message_content_tokens(content: &serde_json::Value, costs: &EstPromptCosts) -> u64 {
     match content {
-        serde_json::Value::String(s) => s.chars().count() as u64 / 4,
+        serde_json::Value::String(s) => text_token_estimate(s),
         serde_json::Value::Array(parts) => parts.iter().map(|p| costs.part_cost(p)).sum::<u64>(),
         // 一个非字符串、非数组的标量（number/bool/null）——按其序列化字符 / 4
         // 计数，有上限。罕见，主要是防御性回退。
@@ -946,15 +997,6 @@ fn build_empty_shell_detail(
 /// 而非那个让 Claude Code 的 `/compact` 打印 "summarization produced empty
 /// response" 的合成空内容 choice。内含一个结构化 OpenAI 形态的错误，使下游
 /// 消费者（cc-switch → Anthropic）把它归类为硬失败、而非零 token 完成。
-///
-/// `primary` 是驱动该 502 的 body（重试的空壳，或未重试时的原始空壳）。
-/// `original` 是首次尝试的空壳，即便 `primary` 是重试结果也保留下来用于日志
-/// detail。`retry_max` 是重试时使用的 clamp 后的 `max_tokens`（None 表示重试
-/// 被禁用 / 预算耗尽）。
-/// 构造一个 502 Bad Gateway 响应 body，把 NVIDIA 空壳软失败外抛给客户端——而非
-/// 那个让 Claude Code 的 `/compact` 打印 "summarization produced empty response"
-/// 的合成空内容 choice。内含一个结构化 OpenAI 形态的错误，使下游消费者（cc-switch
-/// → Anthropic）把它归类为硬失败、而非零 token 完成。
 ///
 /// `request_body` 是最后一次发给上游的 body（未重试时为原始，重试时为 clamp 后
 /// 的重试 body）。`shell_body` 是驱动本 502 的上游空壳 body（重试的空壳，或原始
@@ -1171,6 +1213,12 @@ where
         let mut changed = false;
         let mut out = String::with_capacity(complete.len() + 64);
         for line in complete.split_inclusive('\n') {
+            // 快路径：coerce 只在行内含 `"code"` 时才可能改动；对不含它的行
+            // 直接放行，避免逐行 `Bytes` 分配 + JSON 解析尝试。
+            if !line.contains("\"code\"") {
+                out.push_str(line);
+                continue;
+            }
             let coerced_line = coerce_sse_chunk(&Bytes::from(line.to_string()));
             if coerced_line.len() != line.len() || coerced_line.as_ref() != line.as_bytes() {
                 changed = true;
@@ -1441,9 +1489,14 @@ const EMPTY_CHOICES_PEEK_BYTES: usize = 64 * 1024;
 /// 剥离我们要重新计算的逐跳与长度相关 header，然后把 `resp_headers` 的其余
 /// 部分拷到 `builder` 上。流式透传与空 choices 合成路径共用，使客户端看到的转发
 /// header 集合与响应走哪条路径无关、保持一致。
+///
+/// `body_rewritten`：body 被本代理重序列化/合成/强转时为 true——此时必须剥掉
+/// `content-encoding`，否则上游若声称 gzip 而我们实际交付的是改写后的明文
+/// JSON，客户端会按 gzip 解、得到乱码。逐字节透传路径（false）保留原值。
 fn apply_forwarded_response_headers(
     builder: &mut warp::http::response::Builder,
     resp_headers: Vec<(String, Vec<u8>)>,
+    body_rewritten: bool,
 ) {
     for (key, value) in resp_headers {
         match key.as_str() {
@@ -1456,14 +1509,17 @@ fn apply_forwarded_response_headers(
             | "transfer-encoding"
             | "upgrade"
             | "content-length" => continue,
+            "content-encoding" if body_rewritten => continue,
             _ => {}
         }
         if let Ok(hv) = warp::http::HeaderValue::from_bytes(&value) {
             if let Some(headers) = builder.headers_mut() {
                 let key_bytes = key.as_bytes().to_vec();
-                let hname = warp::http::HeaderName::from_bytes(&key_bytes)
-                    .unwrap_or_else(|_| warp::http::HeaderName::from_bytes(b"x-unknown").unwrap());
-                headers.append(hname, hv);
+                // 无法解析的 header 名直接跳过，不要塌缩成统一的 `x-unknown`——
+                // 后者会把多个互不相同的上游 header 合并进同一个名字。
+                if let Ok(hname) = warp::http::HeaderName::from_bytes(&key_bytes) {
+                    headers.append(hname, hv);
+                }
             }
         }
     }
@@ -1621,9 +1677,17 @@ impl Proxy {
     /// 探上游（cc-switch / Cursor 在启动时都会触发）。任何失败时回退到仅
     /// `model_aliases` 列表，使该端点仍返回 200。
     async fn handle_models(&self) -> warp::reply::Response {
-        // 若已拉取过上游目录则从缓存提供。
-        if let Some(cached) = self.models_cache.lock().await.clone() {
-            return json_value_response(warp::http::StatusCode::OK, &cached);
+        /// 上游目录缓存有效期。NVIDIA 偶尔上架新模型；永久缓存会让它们要等
+        /// 进程重启才可见。
+        const MODELS_CACHE_TTL: Duration = Duration::from_secs(300);
+        // 持锁跨 fetch：并发首个请求串行，只有第一个真正打上游（其余在锁上
+        // 等待后直接吃缓存）。无锁检查 + 取锁重检会让 N 个并发客户端在启动
+        // 时同时击穿上游。
+        let mut cache = self.models_cache.lock().await;
+        if let Some((cached, at)) = &*cache {
+            if at.elapsed() < MODELS_CACHE_TTL {
+                return json_value_response(warp::http::StatusCode::OK, cached);
+            }
         }
 
         let result = self
@@ -1636,12 +1700,13 @@ impl Proxy {
             if resp.status().is_success() {
                 if let Ok(v) = resp.json::<serde_json::Value>().await {
                     if v.get("data").is_some() {
-                        *self.models_cache.lock().await = Some(v.clone());
+                        *cache = Some((v.clone(), std::time::Instant::now()));
                         return json_value_response(warp::http::StatusCode::OK, &v);
                     }
                 }
             }
         }
+        drop(cache);
 
         // 上游不可达 / 形态错误：回退到已配置的 `model_aliases` 列表。我们不再
         // 硬编码 NVIDIA 模型名。
@@ -1764,11 +1829,14 @@ impl Proxy {
         // 不应消费我们池中的 key、也不应烧一个限流 token。NVIDIA 无需鉴权即应答该端点
         // 并返回其完整真实目录，因此我们透传并对结果缓存（见 `handle_models`）。我们不在
         // 该路径上转发 chat 流量。
-        if method == warp::http::Method::GET && (path == "/v1/models" || path == "/v1/models/") {
+        if method == warp::http::Method::GET
+            && (path == "/v1/models"
+                || path == "/v1/models/"
+                || path.starts_with("/v1/models?")
+                || path.starts_with("/v1/models/?"))
+        {
             return Ok(self.handle_models().await);
         }
-
-        // ── 用 token 饥饿切换循环获取一个 key ──────────────────────────
 
         // ── 用 token 饥饿切换循环获取一个 key ──────────────────────────
         let max_switches = self.retry_config.max_key_switches as usize;
@@ -2311,6 +2379,10 @@ impl Proxy {
                 attempt,
                 body_value.is_some(),
                 &mut concurrency_guard,
+                // in_flight 租约：流式成功时移入响应 body 流，使该 key 的
+                // 在途计数覆盖到客户端排空流为止；其它结果下 lease 在尝试
+                // 结束时 drop 并退款（与 guard 共享幂等标志）。
+                Some(key_guard.lease()),
             );
 
             // 对流式请求，我们有显式流式超时（>0）；未设（0）时继承
@@ -2334,8 +2406,10 @@ impl Proxy {
                 match tokio::time::timeout(Duration::from_secs(timeout_secs), attempt_fut).await {
                     Ok(r) => r,
                     Err(_) => {
+                        // 只在此冷却一次（标记 mark_bad）；warn / failure.log 在
+                        // `AttemptError::Timeout` 分支里统一记录，避免同一事件
+                        // 被记录两次。
                         let k = key_guard.handle().key().await;
-                        warn!(key = %mask_key(&k), timeout_secs, "上游请求超时");
                         self.key_pool.mark_bad(&k, None).await;
                         Err(AttemptError::Timeout)
                     }
@@ -2344,7 +2418,9 @@ impl Proxy {
 
             match result {
                 Ok(AttemptResponse::Done(resp)) => {
-                    key_guard.release();
+                    // 不在此提前 release：流式响应的 in_flight 租约已移入 body
+                    // 流（客户端排空时才退款）；非流式的 lease 已在尝试结束时
+                    // 退款。guard 自身 Drop / 后续 release 均为幂等 no-op。
                     self.metrics.observe_latency(start.elapsed().as_secs_f64());
                     debug!(
                         client_req_id = %client_req_id,
@@ -2615,12 +2691,12 @@ impl Proxy {
         attempt: u32,
         request_body_is_json: bool,
         concurrency_guard: &mut Option<ConcurrencyGuard>,
+        in_flight_lease: Option<InFlightLease>,
     ) -> Result<AttemptResponse, AttemptError> {
         let key_str = key_handle.key().await;
-        let key_hash = {
-            let addr = key_handle as *const crate::key_pool::KeyStateHandle as usize;
-            addr as u64
-        };
+        // 稳定句柄身份（与重试排除集合一致）；此前误取了引用参数的栈地址，
+        // 该值随调用变化、与任何 key 都不对应。
+        let key_hash = key_handle.identity();
         debug!(
             client_req_id = %client_req_id,
             attempt = attempt,
@@ -2668,6 +2744,14 @@ impl Proxy {
         // 透传流式：当客户端要 `stream`、且上游以 SSE 响应时，原样把上游流转发
         // 而不缓冲。
         if is_streaming && is_sse && status.is_success() {
+            // 流式成功也要闭合健康环：在 headers 到达、`status` 判 2xx 时
+            // mark_good / inc_success。SSE 无下游可观测的 body 分类点，故此处
+            // 是唯一可判"上游接受了请求并开始产出"的位置。此前此分支在统一
+            // 处理点之前 return，导致流式成功从不复位 fail_count / 熔断计数，
+            // 且成功指标严重失真。中途流断的残流无法回溯撤销，这与非流式
+            // body 路径（headers 到达即 good）的既有语义一致。
+            self.key_pool.mark_good(&key_str).await;
+            self.metrics.inc_success();
             let resp = self
                 .handle_passthrough_stream(
                     resp,
@@ -2675,6 +2759,7 @@ impl Proxy {
                     status,
                     client_req_id,
                     concurrency_guard.take(),
+                    in_flight_lease,
                 )
                 .await
                 .map_err(AttemptError::Fatal)?;
@@ -2707,6 +2792,7 @@ impl Proxy {
                     status,
                     client_req_id,
                     concurrency_guard,
+                    in_flight_lease,
                 )
                 .await
             } else {
@@ -2720,6 +2806,7 @@ impl Proxy {
                     status,
                     client_req_id,
                     concurrency_guard.take(),
+                    in_flight_lease,
                 )
                 .await
                 .map(SuccessOutcome::Response)
@@ -3008,23 +3095,30 @@ impl Proxy {
                 .and_then(|i| url[i + 2..].find('/').map(|j| i + 2 + j))
                 .map(|i| &url[i..])
                 .unwrap_or(url);
-            failure_log::write_failure(
-                method.as_str(),
-                endpoint,
-                url,
-                model,
-                &key_str,
-                Some(status.as_u16()),
-                category,
-                &detail,
-                &body_excerpt,
-                body_summary,
-                attempt,
-                None,
-                next_req_id(),
-                client_req_id,
-                None,
-            );
+            // 降噪：`/v1/props` 是某些客户端的周期性探活/属性查询路径，上游
+            // NVIDIA 没有该端点、恒返回 404 "404 page not found"。这类记录曾占
+            // failure.log 的 99.5%，把真实故障信号完全淹没。404 + /v1/props 不
+            // 写 failure.log（响应仍照常透传给客户端）。
+            let is_props_probe_404 = status.as_u16() == 404 && endpoint == "/v1/props";
+            if !is_props_probe_404 {
+                failure_log::write_failure(
+                    method.as_str(),
+                    endpoint,
+                    url,
+                    model,
+                    &key_str,
+                    Some(status.as_u16()),
+                    category,
+                    &detail,
+                    &body_excerpt,
+                    body_summary,
+                    attempt,
+                    None,
+                    next_req_id(),
+                    client_req_id,
+                    None,
+                );
+            }
         }
 
         // 把数值型 `error.code` 规范成字符串。NVIDIA 返回
@@ -3034,31 +3128,9 @@ impl Proxy {
         let final_body = coerce_json_body(&body_bytes);
 
         let mut response_builder = warp::http::Response::builder().status(status);
-
-        for (key, value) in resp_headers {
-            match key.as_str() {
-                "connection"
-                | "keep-alive"
-                | "proxy-authenticate"
-                | "proxy-authorization"
-                | "te"
-                | "trailers"
-                | "transfer-encoding"
-                | "upgrade"
-                | "content-length" => continue,
-                _ => {}
-            }
-            if let Ok(hv) = warp::http::HeaderValue::from_bytes(&value) {
-                if let Some(headers) = response_builder.headers_mut() {
-                    let key_bytes = key.as_bytes().to_vec();
-                    let hname =
-                        warp::http::HeaderName::from_bytes(&key_bytes).unwrap_or_else(|_| {
-                            warp::http::HeaderName::from_bytes(b"x-unknown").unwrap()
-                        });
-                    headers.append(hname, hv);
-                }
-            }
-        }
+        // body 经 `coerce_json_body` 重序列化——剥 content-encoding（防止改写后
+        // 的明文体带着上游的 gzip 标记），并与流式路径共享同一套剥离规则。
+        apply_forwarded_response_headers(&mut response_builder, resp_headers, true);
 
         let body = warp::hyper::Body::from(final_body);
         let resp = response_builder.body(body).map_err(|e| {
@@ -3081,6 +3153,7 @@ impl Proxy {
         status: warp::http::StatusCode,
         client_req_id: &str,
         concurrency_guard: Option<ConcurrencyGuard>,
+        in_flight_lease: Option<InFlightLease>,
     ) -> Result<warp::http::Response<warp::hyper::Body>, Rejection> {
         let upstream = resp.bytes_stream();
         // 先把上游 reqwest 错误映射为 std::io::Error，再用 CoerceSseTap 包住：把跨
@@ -3113,15 +3186,15 @@ impl Proxy {
             });
 
         let mut response_builder = warp::http::Response::builder().status(status);
-        apply_forwarded_response_headers(&mut response_builder, resp_headers);
-
-        // 当已获取了按模型并发槽时，把 guard 移入 body 流，使该槽在客户端排空完
-        // body 之时（NVIDIA worker 在流结束时释放）才归还、而非 `handle_request`
+        apply_forwarded_response_headers(&mut response_builder, resp_headers, false);
+        // 把并发槽 / in_flight 租约移入 body 流：槽与 key 计数都在客户端排空
+        // body 时（NVIDIA worker 在流结束时释放）才归还，而非 `handle_request`
         // 返回之时——后者可能只是响应 headers 到达、远早于 token 生成完成。
-        let body = if let Some(guard) = concurrency_guard {
+        let body = if concurrency_guard.is_some() || in_flight_lease.is_some() {
             warp::hyper::Body::wrap_stream(Box::pin(GuardedStream {
                 inner: tapped,
-                _guard: guard,
+                _concurrency: concurrency_guard,
+                _in_flight: in_flight_lease,
             }))
         } else {
             warp::hyper::Body::wrap_stream(tapped)
@@ -3157,6 +3230,7 @@ impl Proxy {
         status: warp::http::StatusCode,
         client_req_id: &str,
         concurrency_guard: &mut Option<ConcurrencyGuard>,
+        in_flight_lease: Option<InFlightLease>,
     ) -> Result<SuccessOutcome, Rejection> {
         let mut upstream = resp.bytes_stream();
         let mut buf: Vec<u8> = Vec::new();
@@ -3172,6 +3246,19 @@ impl Proxy {
                 }
             };
             buf.extend_from_slice(&chunk);
+            // JSON 对象一定以 `}` 结尾——仅当缓冲尾部出现 `}` 时才尝试整段解析，
+            // 否则继续读。此前每个 chunk 都对至多 64 KiB 的缓冲做一次全解析，
+            // 慢速流上退化为 O(n²)。
+            if !matches!(
+                buf.iter().rev().find(|b| !b.is_ascii_whitespace()),
+                Some(b'}')
+            ) {
+                if buf.len() >= EMPTY_CHOICES_PEEK_BYTES {
+                    // 真正大的非流式 body：不再继续缓冲，流式透传。
+                    break;
+                }
+                continue;
+            }
             // 仅当缓冲是合法 UTF-8 时才尝试 JSON 解析。一个 gzipped / 二进制
             // body 在此失败并直接落到透传。
             let candidate = match std::str::from_utf8(&buf) {
@@ -3259,17 +3346,19 @@ impl Proxy {
             });
 
         let mut response_builder = warp::http::Response::builder().status(status);
-        apply_forwarded_response_headers(&mut response_builder, resp_headers);
+        apply_forwarded_response_headers(&mut response_builder, resp_headers, false);
         // 响应现为已知长度、带缓冲前缀的流；我们略去 Content-Length（用 chunked）
         // 以保持字节忠实、而无需为前缀 + 动态剩余重算它。
         //
-        // 把并发 guard 移入 body 流以覆盖流式 fallthrough（上方）——上游 worker 仍在
-        // 生成。合成缓冲路径（更早返回）不取该 guard；调用方帧持有它并在返回时 drop，
-        // 这没问题因该 body 已全缓冲（无更多上游工作）。
-        let body = if let Some(guard) = concurrency_guard.take() {
+        // 把并发 guard 与 in_flight 租约移入 body 流以覆盖流式 fallthrough（上方）
+        // ——上游 worker 仍在生成。合成缓冲路径（更早返回）不取这些 guard；调用方
+        // 帧持有并在返回时 drop，这没问题因该 body 已全缓冲（无更多上游工作）。
+        let concurrency = concurrency_guard.take();
+        let body = if concurrency.is_some() || in_flight_lease.is_some() {
             warp::hyper::Body::wrap_stream(Box::pin(GuardedStream {
                 inner: tapped,
-                _guard: guard,
+                _concurrency: concurrency,
+                _in_flight: in_flight_lease,
             }))
         } else {
             warp::hyper::Body::wrap_stream(tapped)
@@ -3361,6 +3450,7 @@ impl Proxy {
                     Some("empty_shell_probe_failed"),
                     None,
                 );
+                self.metrics.inc_error();
                 return Ok(AttemptResponse::Done(empty_shell_bad_gateway(
                     request_body,
                     &shell_body,
@@ -3536,6 +3626,7 @@ impl Proxy {
                                 resp_status,
                                 client_req_id,
                                 &mut no_guard,
+                                None,
                             )
                             .await
                             .map_err(AttemptError::Fatal)?;
@@ -3595,7 +3686,8 @@ impl Proxy {
                                     self.metrics_model(model),
                                     "retry_shell",
                                 );
-                                return Ok(AttemptResponse::Done(empty_shell_bad_gateway(
+                                self.metrics.inc_error();
+                return Ok(AttemptResponse::Done(empty_shell_bad_gateway(
                                     request_body, // 用于 fingerprint 的原始请求 body
                                     &body,        // 重试空壳 body
                                     client_req_id,
@@ -3609,7 +3701,8 @@ impl Proxy {
                         });
                     }
                     // 非 2xx 重试或合成被禁用：外抛 502。
-                    return Ok(AttemptResponse::Done(empty_shell_bad_gateway(
+                    self.metrics.inc_error();
+                return Ok(AttemptResponse::Done(empty_shell_bad_gateway(
                         request_body,
                         &shell_body,
                         client_req_id,
@@ -3642,7 +3735,8 @@ impl Proxy {
                         .await;
                     }
                     // 最后一次重试或无更多预算：外抛 502。
-                    return Ok(AttemptResponse::Done(empty_shell_bad_gateway(
+                    self.metrics.inc_error();
+                return Ok(AttemptResponse::Done(empty_shell_bad_gateway(
                         request_body,
                         &shell_body,
                         client_req_id,
@@ -3663,6 +3757,7 @@ impl Proxy {
             client_req_id = %client_req_id,
             "空壳软失败；外抛 502（重试被禁用或预算耗尽）",
         );
+        self.metrics.inc_error(); // 空壳 502 也是错误，计入失败指标
         Ok(AttemptResponse::Done(empty_shell_bad_gateway(
             request_body,
             &shell_body,
@@ -3718,7 +3813,9 @@ impl Proxy {
 
         let mut response_builder =
             warp::http::Response::builder().status(warp::http::StatusCode::OK);
-        apply_forwarded_response_headers(&mut response_builder, resp_headers);
+        // body 已被合成改写——剥掉上游的 content-encoding，避免客户端把明文
+        // JSON 当 gzip 解。
+        apply_forwarded_response_headers(&mut response_builder, resp_headers, true);
         // 丢弃上游 Content-Length / transfer-encoding，设我们自己的，使客户端确切知道
         // 合成 body 在何处结束。
         if let Some(headers) = response_builder.headers_mut() {
@@ -3992,6 +4089,7 @@ mod proxy_integration_tests {
             upstream_connect_timeout_secs: 5,
             upstream_pool_idle_timeout_secs: 90,
             retry_jitter_ms: 100,
+            request_body_max_bytes: crate::config::default_request_body_max_bytes(),
         }
     }
 

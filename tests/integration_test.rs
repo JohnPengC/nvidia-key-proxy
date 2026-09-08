@@ -70,6 +70,7 @@ fn test_config() -> Config {
         upstream_connect_timeout_secs: 5,
         upstream_pool_idle_timeout_secs: 90,
         retry_jitter_ms: 100,
+        request_body_max_bytes: nvidia_key_proxy::config::default_request_body_max_bytes(),
     }
 }
 
@@ -319,8 +320,9 @@ async fn admin_keys_list_and_add_and_remove() {
     // 删掉它。
     let resp = request()
         .method("DELETE")
-        .path("/admin/keys/nvapi-newkey-12345678")
+        .path("/admin/keys")
         .header("authorization", "Bearer admin-secret")
+        .json(&serde_json::json!({ "key": "nvapi-newkey-12345678" }))
         .reply(&filter)
         .await;
     assert_eq!(resp.status(), 200);
@@ -381,7 +383,7 @@ async fn front_door_auth_enforced() {
         .method("POST")
         .path("/v1/chat/completions")
         .header("content-type", "application/json")
-        .body(r#"{"model":"x","stream":false}"#)
+        .json(&serde_json::json!({"model":"x","stream":false}))
         .reply(&filter)
         .await;
     assert_eq!(resp.status(), 401);
@@ -392,7 +394,7 @@ async fn front_door_auth_enforced() {
         .path("/v1/chat/completions")
         .header("authorization", "Bearer wrong")
         .header("content-type", "application/json")
-        .body(r#"{"model":"x","stream":false}"#)
+        .json(&serde_json::json!({"model":"x","stream":false}))
         .reply(&filter)
         .await;
     assert_eq!(resp.status(), 401);
@@ -404,7 +406,7 @@ async fn front_door_auth_enforced() {
         .path("/v1/chat/completions")
         .header("authorization", "Bearer letmein")
         .header("content-type", "application/json")
-        .body(r#"{"model":"x","stream":false}"#)
+        .json(&serde_json::json!({"model":"x","stream":false}))
         .reply(&filter)
         .await;
     assert_ne!(resp.status(), 401);

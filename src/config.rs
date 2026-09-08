@@ -49,13 +49,25 @@ fn host_of_url(url: &str) -> Option<String> {
 
 #[derive(Deserialize, Clone)]
 pub struct Config {
+    #[serde(default = "default_listen_addr")]
     pub listen_addr: String,
+    #[serde(default = "default_base_url")]
     pub base_url: String,
+    #[serde(default)]
     pub keys: Vec<String>,
+    #[serde(default)]
     pub rate_limiter: RateLimiterConfig,
+    #[serde(default)]
     pub cooldown: CooldownConfig,
+    #[serde(default)]
     pub health_check: HealthCheckConfig,
+    #[serde(default)]
     pub observability: ObservabilityConfig,
+    /// 代理路由（`/v1/*`）单请求 body 的硬上限（字节）。超出即 413，
+    /// 在缓冲前拒绝，防内存撑爆。默认 32 MiB——足以覆盖带多张 base64
+    /// 图片的 chat 请求。可通过 `NVIDIA_REQUEST_BODY_MAX_BYTES` 覆盖。
+    #[serde(default = "default_request_body_max_bytes")]
+    pub request_body_max_bytes: u64,
     /// 可选的请求超时（秒）。0 表示完全禁用超时
     ///（代理长时间运行的流式请求时推荐此设置）。
     #[serde(default = "default_request_timeout_seconds")]
@@ -311,6 +323,19 @@ pub fn default_empty_shell_pre_clamp_max_tokens() -> std::collections::HashMap<S
     m
 }
 
+fn default_listen_addr() -> String {
+    "0.0.0.0:8080".to_string()
+}
+
+fn default_base_url() -> String {
+    "https://integrate.api.nvidia.com".to_string()
+}
+
+/// 代理路由 body 上限默认值的公开封装（供测试脚手架使用）。
+pub fn default_request_body_max_bytes() -> u64 {
+    32 * 1024 * 1024
+}
+
 fn default_request_timeout_seconds() -> u64 {
     60
 }
@@ -501,6 +526,7 @@ impl fmt::Debug for Config {
             .field("circuit_breaker_threshold", &self.circuit_breaker_threshold)
             .field("circuit_breaker_per_model", &self.circuit_breaker_per_model)
             .field("max_tokens_max", &self.max_tokens_max)
+            .field("request_body_max_bytes", &self.request_body_max_bytes)
             .field(
                 "concurrency_limit_per_model",
                 &self.concurrency_limit_per_model,
@@ -545,7 +571,9 @@ impl fmt::Debug for Config {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct RateLimiterConfig {
+    #[serde(default = "default_qps_per_key")]
     pub qps_per_key: f64,
+    #[serde(default = "default_burst")]
     pub burst: u64,
     /// 在切换到另一个 key 前，对单个 key 的 token bucket 等待的最长毫秒数
     ///（默认 200）。0 表示禁用切换——保留现有的无界等待行为。
@@ -557,9 +585,29 @@ fn default_token_wait_ms() -> u64 {
     200
 }
 
+fn default_qps_per_key() -> f64 {
+    0.65
+}
+
+fn default_burst() -> u64 {
+    8
+}
+
+impl Default for RateLimiterConfig {
+    fn default() -> Self {
+        Self {
+            qps_per_key: default_qps_per_key(),
+            burst: default_burst(),
+            token_wait_ms: default_token_wait_ms(),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct CooldownConfig {
+    #[serde(default = "default_cooldown_base_seconds")]
     pub base_seconds: u64,
+    #[serde(default = "default_cooldown_max_seconds")]
     pub max_seconds: u64,
     /// `cool_down_task` 扫描"冷却是否已到期"的独立周期（秒）。
     ///
@@ -576,6 +624,24 @@ pub struct CooldownConfig {
 
 fn default_cooldown_scan_interval_seconds() -> u64 {
     5
+}
+
+fn default_cooldown_base_seconds() -> u64 {
+    60
+}
+
+fn default_cooldown_max_seconds() -> u64 {
+    600
+}
+
+impl Default for CooldownConfig {
+    fn default() -> Self {
+        Self {
+            base_seconds: default_cooldown_base_seconds(),
+            max_seconds: default_cooldown_max_seconds(),
+            scan_interval_seconds: default_cooldown_scan_interval_seconds(),
+        }
+    }
 }
 
 /// 代理 → NVIDIA 的重试/上游错误策略。
@@ -641,16 +707,62 @@ impl Default for RetryConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct HealthCheckConfig {
+    #[serde(default = "default_health_check_interval_seconds")]
     pub interval_seconds: u64,
+    #[serde(default = "default_health_check_timeout_seconds")]
     pub timeout_seconds: u64,
+    #[serde(default = "default_health_check_max_consecutive_failures")]
     pub max_consecutive_failures: usize,
+}
+
+fn default_health_check_interval_seconds() -> u64 {
+    30
+}
+fn default_health_check_timeout_seconds() -> u64 {
+    5
+}
+fn default_health_check_max_consecutive_failures() -> usize {
+    3
+}
+
+impl Default for HealthCheckConfig {
+    fn default() -> Self {
+        Self {
+            interval_seconds: default_health_check_interval_seconds(),
+            timeout_seconds: default_health_check_timeout_seconds(),
+            max_consecutive_failures: default_health_check_max_consecutive_failures(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct ObservabilityConfig {
+    #[serde(default = "default_enable_metrics")]
     pub enable_metrics: bool,
+    #[serde(default = "default_metrics_path")]
     pub metrics_path: String,
+    #[serde(default = "default_log_level")]
     pub log_level: String,
+}
+
+fn default_enable_metrics() -> bool {
+    true
+}
+fn default_metrics_path() -> String {
+    "/metrics".to_string()
+}
+fn default_log_level() -> String {
+    "info".to_string()
+}
+
+impl Default for ObservabilityConfig {
+    fn default() -> Self {
+        Self {
+            enable_metrics: default_enable_metrics(),
+            metrics_path: default_metrics_path(),
+            log_level: default_log_level(),
+        }
+    }
 }
 
 impl Config {
@@ -666,7 +778,7 @@ impl Config {
             rate_limiter: RateLimiterConfig {
                 qps_per_key: 0.65,
                 burst: 8,
-                token_wait_ms: 0,
+                token_wait_ms: default_token_wait_ms(),
             },
             cooldown: CooldownConfig {
                 base_seconds: 60,
@@ -715,6 +827,7 @@ impl Config {
             upstream_connect_timeout_secs: default_upstream_connect_timeout_secs(),
             upstream_pool_idle_timeout_secs: default_upstream_pool_idle_timeout_secs(),
             retry_jitter_ms: default_retry_jitter_ms(),
+            request_body_max_bytes: default_request_body_max_bytes(),
         };
 
         // 优先用 NVIDIA_CONFIG_PATH，回退到 ./config.toml
@@ -722,26 +835,10 @@ impl Config {
             std::env::var("NVIDIA_CONFIG_PATH").unwrap_or_else(|_| "config.toml".to_string());
 
         if let Ok(content) = fs::read_to_string(&config_path) {
-            let toml_config: Config = toml::from_str(&content)?;
-            config.listen_addr = toml_config.listen_addr;
-            config.base_url = toml_config.base_url;
-            if !toml_config.keys.is_empty() {
-                config.keys = toml_config.keys;
-            }
-            config.rate_limiter = toml_config.rate_limiter;
-            config.cooldown = toml_config.cooldown;
-            config.health_check = toml_config.health_check;
-            config.observability = toml_config.observability;
-            config.request_timeout_seconds = toml_config.request_timeout_seconds;
-            config.retry = toml_config.retry;
-            config.allow_local_base_url = toml_config.allow_local_base_url;
-            config.auth = toml_config.auth;
-            // 合并 model_aliases：TOML 中定义的别名优先，但我们对
-            // 默认集合是 *新增*（而非替换），这样调用方在常见情况下
-            // 是扩展而非覆盖。
-            for (k, v) in toml_config.model_aliases.into_iter() {
-                config.model_aliases.insert(k, v);
-            }
+            // 每个字段都带 serde default：缺省的表/字段以默认值填充，
+            // 而不必整表齐全才能解析（此前 `[cooldown]` 少写一个键就整体
+            // 解析失败、进程直接退出）。
+            config = toml::from_str(&content)?;
         }
 
         // 从环境变量覆盖（NVIDIA_*）
@@ -813,13 +910,7 @@ impl Config {
                 )
                 .into());
             }
-            let key_lower = key.to_ascii_lowercase();
-            if key_lower.contains("fake")
-                || key_lower.contains("dummy")
-                || key_lower.contains("test")
-                || key_lower.contains("example")
-                || key_lower.contains("placeholder")
-            {
+            if crate::key_pool::looks_like_placeholder_key(key) {
                 return Err(format!(
                     "API key '{}' looks like a placeholder/fake key; \
                      provide real NVIDIA API keys",
@@ -933,6 +1024,28 @@ impl Config {
                 self.rate_limiter.qps_per_key
             )
             .into());
+        }
+
+        // `health_check.interval_seconds == 0`：tokio::time::interval(0) 会在
+        // 启动探针任务时 panic；同时 `cooldown.scan_interval_seconds=0` 回退到该
+        // 值也会 panic。`timeout_seconds == 0` 让所有探针立刻超时，每个 key 都
+        // 会被累积探测失败强制禁用——密钥池自我销毁。两者都必须 fail-fast。
+        if self.health_check.interval_seconds == 0 {
+            return Err(
+                "health_check.interval_seconds must be > 0 (0 panics tokio interval timers)."
+                    .into(),
+            );
+        }
+        if self.health_check.timeout_seconds == 0 {
+            return Err(
+                "health_check.timeout_seconds must be > 0 (0 makes every probe time out, \
+                 eventually disabling the entire key pool)."
+                    .into(),
+            );
+        }
+        // body 上限 0 会把所有带 body 的 POST 拒成 413。
+        if self.request_body_max_bytes == 0 {
+            return Err("request_body_max_bytes must be > 0.".into());
         }
 
         info!("配置校验通过");
@@ -1262,6 +1375,11 @@ impl Config {
                     &value,
                     &mut config.max_tokens_max
                 )),
+                "request_body_max_bytes" => record!(Self::env_parse_into(
+                    key,
+                    &value,
+                    &mut config.request_body_max_bytes
+                )),
                 "retry_on_503" => {
                     record!(Self::env_parse_into(key, &value, &mut config.retry_on_503))
                 }
@@ -1375,6 +1493,7 @@ mod config_validation_tests {
             upstream_connect_timeout_secs: 5,
             upstream_pool_idle_timeout_secs: 90,
             retry_jitter_ms: 100,
+            request_body_max_bytes: crate::config::default_request_body_max_bytes(),
         }
     }
 

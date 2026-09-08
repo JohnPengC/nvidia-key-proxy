@@ -108,6 +108,17 @@ fn key_disabled() -> &'static Gauge {
         .get_or_init(|| register_gauge!("proxy_key_disabled", "当前被禁用的 API key 数量").unwrap())
 }
 
+fn key_expired() -> &'static Gauge {
+    static KEY_EXPIRED: OnceLock<Gauge> = OnceLock::new();
+    KEY_EXPIRED.get_or_init(|| {
+        register_gauge!(
+            "proxy_key_expired",
+            "被健康探测连续 401 确诊过期、永久除名的 API key 数量（应从配置中清理）"
+        )
+        .unwrap()
+    })
+}
+
 // ── token 饥饿切换与 403 即时冷却的新指标 ──
 
 pub fn key_switch_token_starvation() -> &'static Counter {
@@ -338,9 +349,10 @@ impl Metrics {
     }
 
     /// 更新 key 状态 gauge。每次状态转换后由 `KeyPool::refresh_metrics` 调用。
-    pub fn set_key_counts(&self, active: i64, cooldown: i64, disabled: i64) {
+    pub fn set_key_counts(&self, active: i64, cooldown: i64, disabled: i64, expired: i64) {
         key_active().set(active as f64);
         key_cooldown().set(cooldown as f64);
         key_disabled().set(disabled as f64);
+        key_expired().set(expired as f64);
     }
 }
