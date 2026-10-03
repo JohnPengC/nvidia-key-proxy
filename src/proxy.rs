@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -210,6 +210,75 @@ impl Drop for InFlightLease {
     }
 }
 
+/// 全局网络熔断的共享状态。**进程级（跨 key）**：failure.log（2026-09-23 爆发）
+/// 里 25 个 key 全部出现过同样的 connect timeout、且同一时段其他请求成功——
+/// 网络故障是本机网络/上游整体性的，与 key 无关，per-key 熔断（或冷却）治不了
+/// 它，只会把全池打 Cooling。用 `Instant` 截止时间的 unix 秒数（`AtomicI64`）+
+/// 连续错误计数（`AtomicU64`），同步读写无需 async，供请求路径在最前面快速检查。
+///
+/// 行为：
+/// * 每次网络错误 `record_network_error`：计数 +1，并把截止时间推到
+///   `now + open_window_secs`（**每次错误都刷新**，滚动窗口）。
+/// * 每次上游成功 `record_network_success`：计数清零、截止时间清零——成功是
+///   网络恢复的最强信号，立即让路。
+/// * `is_open`：计数 ≥ 阈值且未过截止时间 → 熔断开，后续请求直接 503 +
+///   `Retry-After`（不发起上游调用），省掉每请求 ~10s 的双 connect 超时，
+///   也给网络恢复留时间。窗口到期自动过期（无探测）——下一次真实请求会重新
+///   尝试上游，成功即重置计数。
+struct NetworkBreaker {
+    /// 连续网络错误计数（跨 key、跨请求累积；成功清零）。
+    errors: AtomicU64,
+    /// 熔断截止时间的 unix 秒数（0 = 关）。每次网络错误刷新。
+    open_until: AtomicI64,
+    /// 熔断阈值：连续 N 次网络错误后打开。0 = 禁用熔断。
+    threshold: u64,
+    /// 熔断打开的滚动窗口（秒）。每次网络错误刷新截止时间。
+    window_secs: u64,
+}
+
+impl NetworkBreaker {
+    fn new(threshold: u64, window_secs: u64) -> Self {
+        Self {
+            errors: AtomicU64::new(0),
+            open_until: AtomicI64::new(0),
+            threshold,
+            window_secs,
+        }
+    }
+
+    /// 熔断是否打开。计数达阈值且未过截止时间。
+    fn is_open(&self) -> bool {
+        if self.threshold == 0 {
+            return false;
+        }
+        self.errors.load(Ordering::Relaxed) >= self.threshold && {
+            let until = self.open_until.load(Ordering::Relaxed);
+            until > 0 && until > chrono::Utc::now().timestamp()
+        }
+    }
+
+    /// 熔断打开时剩余的秒数（供 `Retry-After`）。至少 1。
+    fn retry_after_secs(&self) -> u64 {
+        let until = self.open_until.load(Ordering::Relaxed);
+        (until - chrono::Utc::now().timestamp()).max(0) as u64
+    }
+
+    /// 记录一次网络错误：计数 +1、刷新滚动窗口。
+    fn record_error(&self) {
+        self.errors.fetch_add(1, Ordering::Relaxed);
+        self.open_until.store(
+            chrono::Utc::now().timestamp() + self.window_secs as i64,
+            Ordering::Relaxed,
+        );
+    }
+
+    /// 记录一次上游成功：计数清零、窗口关闭。成功是网络恢复的最强信号。
+    fn record_success(&self) {
+        self.errors.store(0, Ordering::Relaxed);
+        self.open_until.store(0, Ordering::Relaxed);
+    }
+}
+
 /// 我们会把模型名原样带入 Prometheus 标签的最大长度。任何超出该长度（无论
 /// 如何到达）的名称都会被塌缩为 `"_unknown"`——即使是运营者配置的、意外超长
 /// 的别名——这样单个 `model` 就无法膨胀 /metrics 输出。
@@ -314,6 +383,9 @@ pub struct Proxy {
     concurrency_queue_timeout_ms: u64,
     /// 重试抖动（毫秒）。加到指数退避之上。
     retry_jitter_ms: u64,
+    /// 全局网络熔断（跨 key）：连续 N 次网络错误后短期直接 503 + Retry-After。
+    /// `Arc` 共享——`Proxy` 是 `Clone` 的，各路由/测试副本必须共享同一熔断状态。
+    network_breaker: std::sync::Arc<NetworkBreaker>,
 }
 
 /// 单次上游尝试的结果。`Retry` 仅用于不带 `Retry-After` 头且调用方仍有重试
@@ -1559,6 +1631,8 @@ impl Proxy {
         upstream_connect_timeout_secs: u64,
         upstream_pool_idle_timeout_secs: u64,
         retry_jitter_ms: u64,
+        network_breaker_threshold: u64,
+        network_breaker_window_secs: u64,
     ) -> Self {
         let client = reqwest::Client::builder()
             .pool_idle_timeout(Duration::from_secs(upstream_pool_idle_timeout_secs))
@@ -1614,6 +1688,10 @@ impl Proxy {
             concurrency_limit_per_model,
             concurrency_queue_timeout_ms,
             retry_jitter_ms,
+            network_breaker: std::sync::Arc::new(NetworkBreaker::new(
+                network_breaker_threshold,
+                network_breaker_window_secs,
+            )),
         }
     }
 
@@ -1838,6 +1916,37 @@ impl Proxy {
             return Ok(self.handle_models().await);
         }
 
+        // ── 全局网络熔断快速检查 ─────────────────────────────────────────
+        //
+        // 在 acquire key / 烧 token 之前检查：跨 key 连续网络错误达阈值且在滚动
+        // 窗口内时，直接 503 + Retry-After——省掉每请求 ~10s 的双 connect 超时，
+        // 也给网络恢复留时间。窗口到期自动过期，下一次真实请求重新尝试上游。
+        // `Retry-After` 让合规客户端（Claude Code 等）等到窗口结束再重试，而不是
+        // 立刻重发把 503 变成新的重试风暴。
+        if self.network_breaker.is_open() {
+            let retry_after = self.network_breaker.retry_after_secs();
+            warn!(
+                retry_after,
+                errors = self.network_breaker.errors.load(Ordering::Relaxed),
+                "全局网络熔断打开；直接拒绝（不发起上游调用）"
+            );
+            self.metrics.inc_error();
+            let body = serde_json::json!({
+                "error": {
+                    "message": "Upstream network unavailable (network circuit breaker open); retry later.",
+                    "type": "network_breaker_open",
+                }
+            })
+            .to_string();
+            let resp = warp::http::Response::builder()
+                .status(warp::http::StatusCode::SERVICE_UNAVAILABLE)
+                .header("content-type", "application/json")
+                .header("Retry-After", retry_after.to_string())
+                .body(warp::hyper::Body::from(body))
+                .unwrap();
+            return Ok(resp);
+        }
+
         // ── 用 token 饥饿切换循环获取一个 key ──────────────────────────
         let max_switches = self.retry_config.max_key_switches as usize;
         let token_timeout = self.token_wait_ms;
@@ -1908,8 +2017,11 @@ impl Proxy {
         let mut key_guard = InFlightGuard::new(key_handle);
 
         // 为本客户端请求生成一个唯一关联 id。所有上游尝试（含重试）将共享此 id，
-        // 使我们能在 failure.log 与 tracing 中追到重试链。
-        let client_req_id = format!("r{}", next_req_id());
+        // 使我们能在 failure.log 与 tracing 中追到重试链。掺入 unix 秒数（与
+        // `failure_log::gen_req_id` 同风格）：纯进程计数器在进程重启后复位，r90
+        // 之类短 id 会跨天碰撞（failure.log 实证：r90 在 09-08 与 09-23 各出现
+        // 3 次），跨重启追重试链会串到不同请求上。
+        let client_req_id = format!("r{:x}_{}", chrono::Local::now().timestamp(), next_req_id());
 
         // 一次性解析 body 以做校验与元数据提取。`body_value` 是我们即将上游转发的
         //（可能被改写过的）JSON；`body_bytes` 是由其派生的序列化字节。当客户端原始
@@ -2421,6 +2533,9 @@ impl Proxy {
                     // 不在此提前 release：流式响应的 in_flight 租约已移入 body
                     // 流（客户端排空时才退款）；非流式的 lease 已在尝试结束时
                     // 退款。guard 自身 Drop / 后续 release 均为幂等 no-op。
+                    // 上游成功——网络恢复的最强信号，重置全局网络熔断计数、立即
+                    // 让路（即便熔断还没打开也无害：清零是幂等的）。
+                    self.network_breaker.record_success();
                     self.metrics.observe_latency(start.elapsed().as_secs_f64());
                     debug!(
                         client_req_id = %client_req_id,
@@ -2474,8 +2589,8 @@ impl Proxy {
                     }));
                 }
                 Err(AttemptError::Network(e)) => {
-                    // 网络层错误：冷却 key，且若仍有重试次数则换另一个 key、不把它计为
-                    // 鉴权失败。
+                    // 网络层错误：降权（不冷却），且若仍有重试次数则换另一个 key、
+                    // 不把它计为鉴权失败。
                     let k = key_guard.handle().key().await;
                     warn!(key = %mask_key(&k), "请求发送错误: {}", e);
                     failure_log::write_failure(
@@ -2495,17 +2610,45 @@ impl Proxy {
                         &client_req_id,
                         Some("network"),
                     );
-                    self.key_pool.mark_bad(&k, None).await;
+                    // 不用 `mark_bad`（冷却 60s + fail_count++）：网络错误与 key 无关
+                    //——failure.log（2026-09-23 爆发）里 25 个 key 全部出现过同样的
+                    // connect timeout，且同一时段其他请求成功。冷却 key 治不了网络，
+                    // 只会让客户端的并发请求在几秒内把全池打进 Cooling、网络恢复后
+                    // 还要等 cool_down_task/健康探测（30s 周期）逐个捞回来。改用
+                    // `mark_transient_failure`（仅降权半、不冷却、不动 fail_count）
+                    // ——正是为「瞬态、非 key 级失败」设计的：多 key 池优先换 key，
+                    // 单 key 池仍能续试。
+                    self.key_pool.mark_transient_failure(&k).await;
+                    // 计入全局网络熔断：跨 key 连续网络错误达阈值后在滚动窗口内
+                    // 直接 503 + Retry-After（见 `handle_request` 最前面的检查点）。
+                    self.network_breaker.record_error();
+                    // 按 reqwest 错误语义分 kind 上报：`is_timeout` = 连接/发送超时
+                    //（上游慢），`is_connect` = 建连失败（DNS/TCP/TLS），其余 = 连接
+                    // 中途被断（EOF，服务端 keep-alive 静默断开）。分开后 dashboard
+                    // 能区分「上游慢」和「连接被断」两种形态（failure.log 里两种
+                    // 都出现过：123 条 timeout、33 条 EOF）。
+                    let net_kind = if e.is_timeout() {
+                        "timeout"
+                    } else if e.is_connect() {
+                        "connect"
+                    } else {
+                        "eof"
+                    };
+                    self.metrics
+                        .inc_network_errors_total(self.metrics_model(&model), net_kind);
                     // 网络错误常跨 key 相关（NVIDIA 维护、DNS 抖动、本地网络中断）：在
                     // 不同 key 上重试 `max_retries`（默认 3）次只会让已经收了 ~10s 连接
                     // 超时的客户端更痛苦。把网络错误重试上限封为 1 次额外尝试。
                     let network_retry_cap: u32 = 1;
                     if attempt < network_retry_cap && attempt < self.retry_config.max_retries {
                         if let Some(next) = self.acquire_retry_key(&mut tried_key_hashes).await {
-                            let will_retry_again = false; // 网络上限 = 1 → 无进一步重试
+                            // 网络上限 = 1 → 无进一步重试；但**不**完全跳过退避：
+                            // failure.log 里 56/59 对 retry gap 恰为 5.0s（连接超时 +
+                            // 立即重试）、81% 的重试仍失败——立即重试对跨 key 网络故障
+                            // 无益。走通用 `backoff_sleep`（attempt=1 → base 200ms +
+                            // jitter 100ms）给本地网络/上游恢复留一点窗口。
+                            let will_retry_again = true;
                             self.metrics.inc_retry_attempt_failure();
-                            self.metrics
-                                .inc_network_errors_total(self.metrics_model(&model), "connection");
                             key_guard.release();
                             let got_backup = next.try_consume_token(self.token_wait_ms).await;
                             let got_token = got_backup;
@@ -2560,6 +2703,11 @@ impl Proxy {
                         &client_req_id,
                         Some("timeout"),
                     );
+                    // 应用层请求超时也计入网络错误 metrics（kind="request_timeout"
+                    // 与 reqwest 的连接超时/EOF 区分开）：此前此分支只写 failure.log
+                    // 不进 metrics，dashboard 看不到这类上游慢。
+                    self.metrics
+                        .inc_network_errors_total(self.metrics_model(&model), "request_timeout");
                     if attempt < self.retry_config.max_retries {
                         if let Some(next) = self.acquire_retry_key(&mut tried_key_hashes).await {
                             let will_retry_again = attempt + 1 < self.retry_config.max_retries;
@@ -3687,7 +3835,7 @@ impl Proxy {
                                     "retry_shell",
                                 );
                                 self.metrics.inc_error();
-                return Ok(AttemptResponse::Done(empty_shell_bad_gateway(
+                                return Ok(AttemptResponse::Done(empty_shell_bad_gateway(
                                     request_body, // 用于 fingerprint 的原始请求 body
                                     &body,        // 重试空壳 body
                                     client_req_id,
@@ -3702,7 +3850,7 @@ impl Proxy {
                     }
                     // 非 2xx 重试或合成被禁用：外抛 502。
                     self.metrics.inc_error();
-                return Ok(AttemptResponse::Done(empty_shell_bad_gateway(
+                    return Ok(AttemptResponse::Done(empty_shell_bad_gateway(
                         request_body,
                         &shell_body,
                         client_req_id,
@@ -3736,7 +3884,7 @@ impl Proxy {
                     }
                     // 最后一次重试或无更多预算：外抛 502。
                     self.metrics.inc_error();
-                return Ok(AttemptResponse::Done(empty_shell_bad_gateway(
+                    return Ok(AttemptResponse::Done(empty_shell_bad_gateway(
                         request_body,
                         &shell_body,
                         client_req_id,
@@ -3910,8 +4058,8 @@ mod proxy_integration_tests {
     };
     use crate::key_pool::KeyPool;
     use crate::metrics::Metrics;
-    use crate::proxy::InFlightGuard;
-    use crate::proxy::Proxy;
+    use crate::proxy::{InFlightGuard, NetworkBreaker, Proxy};
+    use std::sync::atomic::Ordering;
 
     // 进程级 guard：置一次，使本模块无任何集成测试写入用于生产诊断的磁盘
     // failure.log。
@@ -4089,6 +4237,8 @@ mod proxy_integration_tests {
             upstream_connect_timeout_secs: 5,
             upstream_pool_idle_timeout_secs: 90,
             retry_jitter_ms: 100,
+            network_breaker_threshold: crate::config::default_network_breaker_threshold(),
+            network_breaker_window_secs: crate::config::default_network_breaker_window_secs(),
             request_body_max_bytes: crate::config::default_request_body_max_bytes(),
         }
     }
@@ -4133,6 +4283,8 @@ mod proxy_integration_tests {
             config.upstream_connect_timeout_secs,
             config.upstream_pool_idle_timeout_secs,
             config.retry_jitter_ms,
+            config.network_breaker_threshold,
+            config.network_breaker_window_secs,
         );
 
         let proxy_route = warp::path::full()
@@ -4158,6 +4310,227 @@ mod proxy_integration_tests {
             warp::serve(proxy_route).bind_ephemeral("127.0.0.1:0".parse::<SocketAddr>().unwrap());
         tokio::spawn(server);
         addr
+    }
+
+    /// `start_proxy` 的变体：同时返回共享的 `KeyPool` handle，让测试能在请求
+    /// 之后检查池子的 key 状态。
+    async fn start_proxy_with_pool(config: Config) -> (SocketAddr, Arc<KeyPool>) {
+        let metrics = Arc::new(Metrics::new());
+        let key_pool = Arc::new(KeyPool::new(&config, metrics.clone()));
+        let proxy = Proxy::new(
+            config.base_url.clone(),
+            key_pool.clone(),
+            metrics,
+            config.request_timeout_seconds,
+            config.request_timeout_streaming_seconds,
+            config.retry.clone(),
+            config.rate_limiter.token_wait_ms,
+            config.model_aliases.clone(),
+            config.inject_stream_usage,
+            config.synthesize_empty_choices,
+            config.retry_on_empty_shell,
+            config.empty_shell_retry_max_tokens,
+            config.empty_shell_retry_attempts,
+            config.empty_shell_probe_before_retry,
+            config.empty_shell_retry_backoff_base_ms,
+            config.empty_shell_retry_backoff_max_ms,
+            config.empty_shell_pre_clamp_max_tokens.clone(),
+            config.empty_shell_no_retry_prompt_tokens,
+            config.request_max_prompt_tokens,
+            crate::proxy::EstPromptCosts {
+                image_cost: config.est_image_token_cost,
+                audio_token_per_kb: config.est_audio_token_per_kb,
+                audio_token_cap: config.est_audio_token_cap,
+                unknown_part_cap: config.est_unknown_part_token_cap,
+            },
+            config.circuit_breaker_threshold,
+            config.circuit_breaker_per_model,
+            config.retry_on_503,
+            config.probe_before_503_retry,
+            config.retry_on_500,
+            config.max_tokens_max,
+            config.concurrency_limit_per_model.clone(),
+            config.concurrency_queue_timeout_ms,
+            config.upstream_connect_timeout_secs,
+            config.upstream_pool_idle_timeout_secs,
+            config.retry_jitter_ms,
+            config.network_breaker_threshold,
+            config.network_breaker_window_secs,
+        );
+
+        let proxy_route = warp::path::full()
+            .map(|p: warp::path::FullPath| p.as_str().to_string())
+            .and(warp::method())
+            .and(warp::header::headers_cloned())
+            .and(warp::body::bytes())
+            .and(warp::addr::remote())
+            .and_then({
+                let proxy = proxy.clone();
+                move |path: String, method, headers, body, remote| {
+                    let proxy = proxy.clone();
+                    async move {
+                        proxy
+                            .handle_request(path, method, headers, body, remote)
+                            .await
+                    }
+                }
+            })
+            .recover(recover_rejection);
+
+        let (addr, server) =
+            warp::serve(proxy_route).bind_ephemeral("127.0.0.1:0".parse::<SocketAddr>().unwrap());
+        tokio::spawn(server);
+        (addr, key_pool)
+    }
+
+    /// 回归（failure.log 2026-09-23 爆发）：网络错误（connect timeout / EOF）
+    /// 必须只降权、**不冷却** key。此前 `AttemptError::Network` 分支对每次网络
+    /// 错误 `mark_bad`——冷却 60s + fail_count++，客户端的并发请求在几秒内把
+    /// 全池打进 Cooling；网络错误与 key 无关（日志里 25 个 key 全部出现过同样
+    /// 的 connect timeout，且同一时段其他请求成功），冷却 key 治不了网络，
+    /// 网络恢复后还要等 cool_down_task 逐个捞回。这里用一个指向不可路由端口的
+    /// base_url 制造网络错误，断言重试后两个 key 仍处 Active。
+    #[tokio::test]
+    async fn network_error_does_not_cooldown_keys() {
+        // 127.0.0.1:1 是保留的不可路由端口——连接会被立即拒绝（类似 EOF），
+        // 触发 AttemptError::Network。allow_local_base_url 绕过 localhost 校验。
+        let mut cfg = test_config("http://127.0.0.1:1", 1, 5);
+        cfg.allow_local_base_url = true;
+        cfg.keys = vec!["key-a".to_string(), "key-b".to_string()];
+        let (addr, pool) = start_proxy_with_pool(cfg).await;
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://{}/v1/chat/completions", addr))
+            .body(r#"{"model":"m","messages":[]}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 502, "网络错误应以外抛 BadGateway 收场");
+
+        // 核心断言：网络错误后两个 key 都不得进入 Cooling——只有降权。
+        let bad = pool.get_bad_keys().await;
+        assert!(
+            bad.is_empty(),
+            "网络错误不得冷却 key（Cooling: {bad:?}）——冷却治不了跨 key 的网络故障，\
+             只会把全池打进 Cooling 让后续请求 503"
+        );
+        let disabled = pool.get_disabled_keys().await;
+        assert!(
+            disabled.is_empty(),
+            "网络错误不得禁用 key（Disabled: {disabled:?}）"
+        );
+        // sanity：key 仍可被 acquire（池子仍然活着）。
+        assert!(
+            pool.acquire().await.is_some(),
+            "网络错误后池子必须仍能 acquire（状态保持 Active）"
+        );
+    }
+
+    /// 全局网络熔断单元测试：连续 `threshold` 次网络错误后 `is_open()` 为真、
+    /// `retry_after_secs()` 反映剩余窗口；成功重置。
+    #[tokio::test]
+    async fn network_breaker_opens_after_threshold_and_resets_on_success() {
+        let breaker = NetworkBreaker::new(3, 30);
+        assert!(!breaker.is_open(), "初始关闭");
+        breaker.record_error();
+        breaker.record_error();
+        assert!(!breaker.is_open(), "2 次 < 阈值 3，仍关闭");
+        breaker.record_error();
+        assert!(breaker.is_open(), "3 次达阈值，打开");
+        let ra = breaker.retry_after_secs();
+        assert!(
+            (1..=30).contains(&ra),
+            "Retry-After 应在 [1, 30] 内（剩余窗口），实际 {ra}"
+        );
+        // 成功 → 立即重置。
+        breaker.record_success();
+        assert!(!breaker.is_open(), "成功后应立即关闭");
+        assert_eq!(breaker.retry_after_secs(), 0, "关闭时 Retry-After 为 0");
+    }
+
+    /// 全局网络熔断：窗口到期自动过期（无探测）。
+    #[tokio::test]
+    async fn network_breaker_window_expiry_reopens() {
+        let breaker = NetworkBreaker::new(2, 30);
+        breaker.record_error();
+        breaker.record_error();
+        assert!(breaker.is_open());
+        // 手动把截止时间拨到过去——模拟窗口到期。
+        breaker
+            .open_until
+            .store(chrono::Utc::now().timestamp() - 1, Ordering::Relaxed);
+        assert!(
+            !breaker.is_open(),
+            "窗口到期后熔断应自动过期，让下一次请求重新尝试上游"
+        );
+    }
+
+    /// 全局网络熔断：threshold = 0 完全禁用（任何错误都不打开）。
+    #[tokio::test]
+    async fn network_breaker_threshold_zero_disables() {
+        let breaker = NetworkBreaker::new(0, 30);
+        for _ in 0..100 {
+            breaker.record_error();
+        }
+        assert!(!breaker.is_open(), "threshold=0 必须完全禁用熔断");
+    }
+
+    /// 集成回归（failure.log 2026-09-23 爆发）：全局网络熔断打开后，后续请求
+    /// 必须被快速 503 + `Retry-After`（不发起上游调用）；成功请求重置熔断。
+    #[tokio::test]
+    async fn network_breaker_fast_rejects_503_with_retry_after() {
+        // base_url 指向不可路由端口——每个请求都网络错误。threshold=3、窗口
+        // 60s：每个客户端请求自身重试 1 次、产生 2 条网络错误，故两个请求后
+        // 计数达 4 ≥ 3，第三个请求应被快速 503。
+        let mut cfg = test_config("http://127.0.0.1:1", 1, 5);
+        cfg.allow_local_base_url = true;
+        cfg.network_breaker_threshold = 3;
+        cfg.network_breaker_window_secs = 60;
+        // 退避调小，让前两个请求快点失败。
+        cfg.retry.backoff_base_ms = 10;
+        cfg.retry_jitter_ms = 0;
+        let (addr, _pool) = start_proxy_with_pool(cfg).await;
+        let client = reqwest::Client::new();
+        let url = format!("http://{}/v1/chat/completions", addr);
+
+        // 前两个请求：网络错误 → 502（各产生 2 条错误，共 4 ≥ 阈值 3）。
+        for i in 0..2 {
+            let resp = client
+                .post(&url)
+                .body(r#"{"model":"m","messages":[]}"#)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 502, "请求 {i}：网络错误应收 502");
+        }
+
+        // 第三个请求：熔断已打开 → 快速 503 + Retry-After。
+        let start = std::time::Instant::now();
+        let resp = client
+            .post(&url)
+            .body(r#"{"model":"m","messages":[]}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 503, "熔断打开后应快速 503（不发起上游调用）");
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(500),
+            "熔断拒绝必须快（无 connect 超时），实际 {:?}",
+            start.elapsed()
+        );
+        let ra = resp
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok());
+        assert_eq!(
+            ra,
+            Some(60),
+            "Retry-After 应反映熔断窗口（60s），实际 {ra:?}"
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["error"]["type"], "network_breaker_open");
     }
 
     #[tokio::test]

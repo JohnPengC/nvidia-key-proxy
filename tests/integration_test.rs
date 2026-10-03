@@ -70,6 +70,9 @@ fn test_config() -> Config {
         upstream_connect_timeout_secs: 5,
         upstream_pool_idle_timeout_secs: 90,
         retry_jitter_ms: 100,
+        network_breaker_threshold: nvidia_key_proxy::config::default_network_breaker_threshold(),
+        network_breaker_window_secs: nvidia_key_proxy::config::default_network_breaker_window_secs(
+        ),
         request_body_max_bytes: nvidia_key_proxy::config::default_request_body_max_bytes(),
     }
 }
@@ -339,10 +342,10 @@ async fn admin_keys_list_and_add_and_remove() {
 }
 
 /// 回归：管理 POST /admin/keys 必须以 413 拒绝超大的 body。
-/// `warp::body::json()` 默认无大小限制，所以路由上若没有显式
-/// `content_length_limit(1 MiB)`，一个粘了巨型 key 文件的已认证调用方就能
-/// 把进程 OOM、或在 `add_keys_batch` 里制造病态锁抖动。有了上限，4 MiB 的
-/// body 根本到不了 json()。
+/// `warp::body::json()` 默认无大小限制，所以路由上若没有显式限长，一个粘了
+/// 巨型 key 文件的已认证调用方就能把进程 OOM、或在 `add_keys_batch` 里制造
+/// 病态锁抖动。限长由 `bounded_body`（聚合后校验、超限 413）承担，4 MiB 的
+/// body 根本到不了 json 解析。
 #[tokio::test]
 async fn admin_keys_add_rejects_oversized_body() {
     let mut cfg = test_config();
@@ -351,8 +354,7 @@ async fn admin_keys_add_rejects_oversized_body() {
     let filter = build_routes(&state);
 
     // 一个 4 MiB body：单个约 4 MiB 合法 JSON 字符的 JSON 串（每个 key 短到能
-    // 过 add_keys_batch 的长度校验——但我们到不了那；content_length_limit 先
-    // 拒）。
+    // 过 add_keys_batch 的长度校验——但我们到不了那；bounded_body 先拒）。
     let huge = "x".repeat(4 * 1024 * 1024);
     let body = format!(r#"["{}"]"#, huge);
     let resp = request()
@@ -369,6 +371,34 @@ async fn admin_keys_add_rejects_oversized_body() {
         "oversized admin add-keys body should be rejected with 413, got {} body={:?}",
         resp.status(),
         std::str::from_utf8(resp.body()).unwrap_or("")
+    );
+}
+
+/// 回归（Kilo Code 411）：不带 Content-Length 的请求（Kilo Code 等 fetch 系
+/// 客户端以 `Transfer-Encoding: chunked` 发 JSON POST）必须能通过 body 层，
+/// 而不是被 `content_length_limit` 以 411 "Content-Length header required"
+/// 拒掉。此前代理路由用 `content_length_limit`，本测试用的 warp 测试请求
+/// 不带 Content-Length——它能过 `bounded_body` 即证明 chunked 兼容。
+#[tokio::test]
+async fn proxy_route_accepts_body_without_content_length() {
+    let cfg = test_config();
+    let state = AppState::new(cfg);
+    let filter = build_routes(&state);
+
+    // warp 测试请求默认不发 Content-Length 头。重点是它**不**返回 411——
+    // 之后因无 mock 会从上游拿错误（test_config 默认 example.com），但
+    // 鉴权关闭、body 层放行即达成本测试目的。
+    let resp = request()
+        .method("POST")
+        .path("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(r#"{"model":"x","stream":false}"#)
+        .reply(&filter)
+        .await;
+    assert_ne!(
+        resp.status(),
+        411,
+        "body without Content-Length must not be rejected with 411 (Kilo Code regression)"
     );
 }
 

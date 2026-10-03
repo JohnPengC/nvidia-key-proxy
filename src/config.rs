@@ -310,6 +310,23 @@ pub struct Config {
     /// 可通过 NVIDIA_RETRY_JITTER_MS 覆盖。
     #[serde(default = "default_retry_jitter_ms")]
     pub retry_jitter_ms: u64,
+
+    // ==================== 全局网络熔断 ====================
+    /// 全局网络熔断阈值：**跨 key** 连续 N 次网络错误（connect timeout / EOF）
+    /// 后打开，在滚动窗口内对后续请求直接 503 + `Retry-After`（不发起上游调用）。
+    /// 网络故障与本机网络/上游整体性相关、与 key 无关（failure.log 2026-09-23
+    /// 爆发：25 个 key 全部出现同样的 connect timeout），per-key 冷却治不了它；
+    /// 熔断省掉每请求 ~10s 的双 connect 超时，也给网络恢复留时间。任一次上游
+    /// 成功都会立即重置计数。0 = 禁用熔断。默认 5。
+    /// 可通过 NVIDIA_NETWORK_BREAKER_THRESHOLD 覆盖。
+    #[serde(default = "default_network_breaker_threshold")]
+    pub network_breaker_threshold: u64,
+
+    /// 全局网络熔断的滚动窗口（秒）。每次网络错误都刷新截止时间；窗口到期自动
+    /// 过期（无探测），下一次真实请求重新尝试上游。默认 30。
+    /// 可通过 NVIDIA_NETWORK_BREAKER_WINDOW_SECONDS 覆盖。
+    #[serde(default = "default_network_breaker_window_secs")]
+    pub network_breaker_window_secs: u64,
 }
 
 /// 用于取得默认 pre-clamp map 的公开封装（供测试使用）。
@@ -440,6 +457,15 @@ fn default_retry_jitter_ms() -> u64 {
     100
 }
 
+/// 全局网络熔断默认值的公开封装（供测试脚手架使用）。
+pub fn default_network_breaker_threshold() -> u64 {
+    5
+}
+
+pub fn default_network_breaker_window_secs() -> u64 {
+    30
+}
+
 fn default_max_tokens_max() -> u64 {
     100_000
 }
@@ -548,6 +574,11 @@ impl fmt::Debug for Config {
                 &self.upstream_pool_idle_timeout_secs,
             )
             .field("retry_jitter_ms", &self.retry_jitter_ms)
+            .field("network_breaker_threshold", &self.network_breaker_threshold)
+            .field(
+                "network_breaker_window_secs",
+                &self.network_breaker_window_secs,
+            )
             .field(
                 "auth",
                 &format!(
@@ -827,6 +858,8 @@ impl Config {
             upstream_connect_timeout_secs: default_upstream_connect_timeout_secs(),
             upstream_pool_idle_timeout_secs: default_upstream_pool_idle_timeout_secs(),
             retry_jitter_ms: default_retry_jitter_ms(),
+            network_breaker_threshold: default_network_breaker_threshold(),
+            network_breaker_window_secs: default_network_breaker_window_secs(),
             request_body_max_bytes: default_request_body_max_bytes(),
         };
 
@@ -1421,6 +1454,16 @@ impl Config {
                     &value,
                     &mut config.retry_jitter_ms
                 )),
+                "network_breaker_threshold" => record!(Self::env_parse_into(
+                    key,
+                    &value,
+                    &mut config.network_breaker_threshold
+                )),
+                "network_breaker_window_seconds" => record!(Self::env_parse_into(
+                    key,
+                    &value,
+                    &mut config.network_breaker_window_secs
+                )),
                 _ => {}
             }
         }
@@ -1493,6 +1536,8 @@ mod config_validation_tests {
             upstream_connect_timeout_secs: 5,
             upstream_pool_idle_timeout_secs: 90,
             retry_jitter_ms: 100,
+            network_breaker_threshold: default_network_breaker_threshold(),
+            network_breaker_window_secs: default_network_breaker_window_secs(),
             request_body_max_bytes: crate::config::default_request_body_max_bytes(),
         }
     }

@@ -112,6 +112,8 @@ impl AppState {
             config.upstream_connect_timeout_secs,
             config.upstream_pool_idle_timeout_secs,
             config.retry_jitter_ms,
+            config.network_breaker_threshold,
+            config.network_breaker_window_secs,
         );
         let health_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let health_checker = Arc::new(HealthChecker::new(
@@ -265,13 +267,14 @@ pub fn build_routes(
         })
         .and(warp::method())
         .and(warp::header::headers_cloned())
-        // 代理路由也必须给 body 设上限：`warp::body::bytes()` 无上限地全量
-        // 缓冲，持 bearer 的 client（或 auth 关闭时任何人）几个 GB 级 POST
-        // 即可 OOM 进程。默认 32 MiB 对含 base64 图片的 chat 请求足够。
-        .and(warp::body::content_length_limit(
-            state.config.request_body_max_bytes,
-        ))
-        .and(warp::body::bytes())
+        // 代理路由也必须给 body 设上限：默认 32 MiB 对含 base64 图片的
+        // chat 请求足够。不用 `warp::body::content_length_limit`——它要求
+        // 请求携带 Content-Length 头，而 Kilo Code 等 fetch 系客户端以
+        // chunked 发 JSON POST（无 Content-Length）会被 411
+        // "Content-Length header required" 直接拒掉。`bounded_body` 改为
+        // 边读边累计、超限即 413，同样挡住 GB 级 OOM，且对 chunked 与
+        // 定长 body 一视同仁。
+        .and(bounded_body(state.config.request_body_max_bytes))
         .and(warp::addr::remote())
         .and_then({
             let proxy = state.proxy.clone();
@@ -378,20 +381,20 @@ pub async fn handle_rejection(err: Rejection) -> Result<impl Reply, Rejection> {
             .unwrap();
         return Ok(res);
     } else if err.find::<AdminDisabled>().is_some() {
-        return Ok(warp::reply::with_status(
-            "Not found".to_string(),
-            StatusCode::NOT_FOUND,
-        )
-        .into_response());
+        return Ok(
+            warp::reply::with_status("Not found".to_string(), StatusCode::NOT_FOUND)
+                .into_response(),
+        );
     }
     if err.find::<warp::reject::InvalidQuery>().is_some() {
         error!("非法 query");
-        Ok(warp::reply::with_status(
-            "Invalid query".to_string(),
-            StatusCode::BAD_REQUEST,
+        Ok(
+            warp::reply::with_status("Invalid query".to_string(), StatusCode::BAD_REQUEST)
+                .into_response(),
         )
-        .into_response())
-    } else if err.find::<warp::reject::PayloadTooLarge>().is_some() {
+    } else if err.find::<warp::reject::PayloadTooLarge>().is_some()
+        || err.find::<BodyTooLarge>().is_some()
+    {
         Ok(warp::reply::with_status(
             "Payload too large".to_string(),
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -403,6 +406,8 @@ pub async fn handle_rejection(err: Rejection) -> Result<impl Reply, Rejection> {
             StatusCode::LENGTH_REQUIRED,
         )
         .into_response())
+    } else if let Some(bad) = err.find::<BadRequestBody>() {
+        Ok(warp::reply::with_status(bad.0.to_string(), StatusCode::BAD_REQUEST).into_response())
     } else if err.find::<warp::reject::MethodNotAllowed>().is_some() {
         Ok(warp::reply::with_status(
             "Method not allowed".to_string(),
@@ -410,11 +415,10 @@ pub async fn handle_rejection(err: Rejection) -> Result<impl Reply, Rejection> {
         )
         .into_response())
     } else if err.is_not_found() {
-        Ok(warp::reply::with_status(
-            "Not found".to_string(),
-            StatusCode::NOT_FOUND,
+        Ok(
+            warp::reply::with_status("Not found".to_string(), StatusCode::NOT_FOUND)
+                .into_response(),
         )
-        .into_response())
     } else {
         error!("未处理的 rejection：{:?}", err);
         Ok(warp::reply::with_status(
@@ -423,6 +427,50 @@ pub async fn handle_rejection(err: Rejection) -> Result<impl Reply, Rejection> {
         )
         .into_response())
     }
+}
+
+// ── 请求 body 限长 ───────────────────────────────────────────────────────
+
+/// 请求 body 在读取/解析阶段失败（读取中途 IO 错误、或管理路由上的非法
+/// JSON）。表现为 400，携带具体的失败原因文本。
+#[derive(Debug, Clone)]
+struct BadRequestBody(&'static str);
+impl warp::reject::Reject for BadRequestBody {}
+
+/// 请求 body 超出限长时返回的 rejection。表现为 413。warp 0.3.7 内建的
+/// `reject::PayloadTooLarge`/`payload_too_large()` 均为 `pub(crate)` 私有，
+/// 外部无法构造，只能自带一个等价的 custom rejection。
+#[derive(Debug, Clone)]
+struct BodyTooLarge;
+impl warp::reject::Reject for BodyTooLarge {}
+
+/// 读取整个请求 body 并强制大小上限（字节），返回聚合后的 `Bytes`。
+///
+/// 与 `warp::body::content_length_limit` 的关键差异：**不要求请求携带
+/// `Content-Length` 头**。Kilo Code 等 fetch 系客户端以
+/// `Transfer-Encoding: chunked` 发送 JSON POST、不带 Content-Length，
+/// content_length_limit 会把它们以 411 "Content-Length header required"
+/// 直接拒掉。这里改为边读边累计：累计超限即以 413 拒绝——只缓冲上限
+/// 之内的数据，超大 body 在撑爆进程内存之前就被拒掉，对 chunked 与
+/// 定长 body 一视同仁。
+fn bounded_body(
+    max_bytes: u64,
+) -> impl Filter<Extract = (bytes::Bytes,), Error = Rejection> + Clone {
+    // 不用 `content_length_limit` 的原因见上（411）。也不能用
+    // `warp::body::stream()` 做边读边限长——它的 extract 是不透明的
+    // `impl Stream<Item = Result<impl Buf, warp::Error>>`，`and_then` 闭包
+    // 参数无法命名（E0282），也无法 `.map()` 落型（`BodyStream` 结构体
+    // 私有）。故用 `warp::body::bytes()`（`take_body` +
+    // `hyper::body::to_bytes`，不要求 Content-Length，chunked 兼容），
+    // 聚合后校验长度、超限 413。
+    warp::body::bytes()
+        .and_then(move |body: bytes::Bytes| async move {
+            if body.len() as u64 > max_bytes {
+                return Err(warp::reject::custom(BodyTooLarge));
+            }
+            Ok::<_, Rejection>(body)
+        })
+        .boxed()
 }
 
 // ── 前置鉴权与管理 API ────────────────────────────────────────────────────
@@ -536,20 +584,21 @@ fn admin_api(state: AppState) -> impl Filter<Extract = impl Reply, Error = Rejec
     // `extract_keys` 跑起来之前就把整个 body 全缓冲进内存——一个粘了巨型 key
     // 文件的已认证调用方（或持 admin token 的恶意一方）能把进程 OOM，或在
     // `add_keys_batch` 里制造病态锁抖动。1 MiB 对任何现实的 add-keys 负载都
-    // 富余（一千个 80 字节 key + JSON 框架约 100 KiB），并以 413 直接挡掉 OOM
-    // 这一类。
+    // 富余（一千个 80 字节 key + JSON 框架约 100 KiB）。限长由 `bounded_body`
+    // 承担：边读边累计、超限即 413，且不要求 Content-Length（chunked 兼容）。
     let add = warp::path!("admin" / "keys")
         .and(warp::post())
-        .and(warp::body::content_length_limit(1024 * 1024))
-        .and(warp::body::json())
+        .and(bounded_body(1024 * 1024))
         .and(warp::header::headers_cloned())
         .and_then({
             let s = state.clone();
-            move |body: serde_json::Value, headers: warp::http::HeaderMap| {
+            move |body: bytes::Bytes, headers: warp::http::HeaderMap| {
                 let s = s.clone();
                 async move {
                     check_admin_token(&s.config.auth.admin_token, &headers)?;
-                    let keys = extract_keys(&body);
+                    let value: serde_json::Value = serde_json::from_slice(&body)
+                        .map_err(|_| warp::reject::custom(BadRequestBody("invalid JSON body")))?;
+                    let keys = extract_keys(&value);
                     let (added, already_present, invalid) = s.key_pool.add_keys_batch(keys).await;
                     Ok::<_, Rejection>(json_reply(
                         200,
@@ -567,16 +616,17 @@ fn admin_api(state: AppState) -> impl Filter<Extract = impl Reply, Error = Rejec
     // 落进 access log / entry_log / 响应体。响应里也只回掩码后的 key。
     let del = warp::path!("admin" / "keys")
         .and(warp::delete())
-        .and(warp::body::content_length_limit(64 * 1024))
-        .and(warp::body::json())
+        .and(bounded_body(64 * 1024))
         .and(warp::header::headers_cloned())
         .and_then({
             let s = state.clone();
-            move |body: serde_json::Value, headers: warp::http::HeaderMap| {
+            move |body: bytes::Bytes, headers: warp::http::HeaderMap| {
                 let s = s.clone();
                 async move {
                     check_admin_token(&s.config.auth.admin_token, &headers)?;
-                    let key = body
+                    let value: serde_json::Value = serde_json::from_slice(&body)
+                        .map_err(|_| warp::reject::custom(BadRequestBody("invalid JSON body")))?;
+                    let key = value
                         .get("key")
                         .and_then(|v| v.as_str())
                         .unwrap_or("")

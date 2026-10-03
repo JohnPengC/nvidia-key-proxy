@@ -110,9 +110,7 @@ async fn main() {
             a, state.config.observability.metrics_path
         );
         let server = warp::serve(routes.clone());
-        let (_, fut) = match server
-            .try_bind_with_graceful_shutdown(a, await_shutdown_signal())
-        {
+        let (_, fut) = match server.try_bind_with_graceful_shutdown(a, await_shutdown_signal()) {
             Ok(x) => x,
             Err(e) => {
                 // 多半是 Linux 上 [::] 与 0.0.0.0 的 EADDRINUSE 冲突；

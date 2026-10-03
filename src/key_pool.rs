@@ -340,7 +340,10 @@ impl TokenBucket {
             return self.capacity;
         }
         let mut st = self.state.lock().await;
-        { let (toks, last) = &mut *st; self.refill_locked(toks, last); }
+        {
+            let (toks, last) = &mut *st;
+            self.refill_locked(toks, last);
+        }
         self.store_approx(st.0);
         st.0
     }
@@ -356,7 +359,10 @@ impl TokenBucket {
         // refill_locked 在 refill_per_sec == 0 时是空操作（内部有判断），
         // 所以一个永久（不补充）的桶在这里就是从初始容量里往下扣 —— 效果与
         // 显式提前返回的 consume() 一样，只是不走那条特判分支。
-        { let (toks, last) = &mut *st; self.refill_locked(toks, last); }
+        {
+            let (toks, last) = &mut *st;
+            self.refill_locked(toks, last);
+        }
         if st.0 >= tokens {
             st.0 -= tokens;
             self.store_approx(st.0);
@@ -383,7 +389,10 @@ impl TokenBucket {
             // 快速路径：刷新补充 + 检查。
             {
                 let mut st = self.state.lock().await;
-                { let (toks, last) = &mut *st; self.refill_locked(toks, last); }
+                {
+                    let (toks, last) = &mut *st;
+                    self.refill_locked(toks, last);
+                }
                 if st.0 >= tokens {
                     st.0 -= tokens;
                     self.store_approx(st.0);
@@ -403,7 +412,10 @@ impl TokenBucket {
                     }
                     // 最终尝试。
                     let mut st = self.state.lock().await;
-                    { let (toks, last) = &mut *st; self.refill_locked(toks, last); }
+                    {
+                        let (toks, last) = &mut *st;
+                        self.refill_locked(toks, last);
+                    }
                     if st.0 >= tokens {
                         st.0 -= tokens;
                         self.store_approx(st.0);
@@ -1294,6 +1306,8 @@ mod retry_state_machine_tests {
             upstream_connect_timeout_secs: 5,
             upstream_pool_idle_timeout_secs: 90,
             retry_jitter_ms: 100,
+            network_breaker_threshold: crate::config::default_network_breaker_threshold(),
+            network_breaker_window_secs: crate::config::default_network_breaker_window_secs(),
             request_body_max_bytes: crate::config::default_request_body_max_bytes(),
         };
         let metrics = Arc::new(Metrics::new());
@@ -1445,10 +1459,7 @@ mod retry_state_machine_tests {
 
         // snapshot 呈现 "expired"
         let snap = pool.snapshot().await;
-        let states: Vec<&str> = snap
-            .iter()
-            .map(|v| v["state"].as_str().unwrap())
-            .collect();
+        let states: Vec<&str> = snap.iter().map(|v| v["state"].as_str().unwrap()).collect();
         assert!(states.contains(&"expired"));
         assert!(states.contains(&"active"));
     }
@@ -1602,6 +1613,8 @@ mod score_selection_tests {
             upstream_connect_timeout_secs: 5,
             upstream_pool_idle_timeout_secs: 90,
             retry_jitter_ms: 100,
+            network_breaker_threshold: crate::config::default_network_breaker_threshold(),
+            network_breaker_window_secs: crate::config::default_network_breaker_window_secs(),
             request_body_max_bytes: crate::config::default_request_body_max_bytes(),
         };
         let metrics = Arc::new(Metrics::new());
@@ -2012,6 +2025,8 @@ mod runtime_key_tests {
             upstream_connect_timeout_secs: 5,
             upstream_pool_idle_timeout_secs: 90,
             retry_jitter_ms: 100,
+            network_breaker_threshold: crate::config::default_network_breaker_threshold(),
+            network_breaker_window_secs: crate::config::default_network_breaker_window_secs(),
             request_body_max_bytes: crate::config::default_request_body_max_bytes(),
         };
         KeyPool::new(&cfg, Arc::new(Metrics::new()))
