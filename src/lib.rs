@@ -95,6 +95,7 @@ impl AppState {
             config.empty_shell_pre_clamp_max_tokens.clone(),
             config.empty_shell_no_retry_prompt_tokens,
             config.request_max_prompt_tokens,
+            config.request_max_prompt_tokens_per_model.clone(),
             crate::proxy::EstPromptCosts {
                 image_cost: config.est_image_token_cost,
                 audio_token_per_kb: config.est_audio_token_per_kb,

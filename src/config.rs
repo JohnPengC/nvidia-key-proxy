@@ -206,7 +206,7 @@ pub struct Config {
     #[serde(default = "default_empty_shell_no_retry_prompt_tokens")]
     pub empty_shell_no_retry_prompt_tokens: u64,
 
-    /// 对请求 estimated prompt tokens 的硬上限：非流式或流式
+    /// 对请求 estimated prompt tokens 的**全局回退**硬上限：非流式或流式
     /// chat-completions 请求，若其估算 prompt 大小大于等于此上限，则
     /// 在最前面就被 HTTP 413 拒绝（不发起上游调用），要求客户端自行压缩
     /// 其上下文。代理拒绝，而不是浪费一次上游往返和一个 key slot 在一个
@@ -214,30 +214,46 @@ pub struct Config {
     /// 自己持有它的对话历史）；我们给出清晰的 413，而不是悄悄改写客户端的
     /// messages。
     ///
-    /// **设定为等于 `empty_shell_no_retry_prompt_tokens`（两者默认都 90000）
-    /// ——软限制和硬限制之间刻意没有灰色地带。** 大于等于硬限制的请求直接
-    /// 拒绝（413）；低于软限制的请求走正常重试路径。消除了该灰带的两轮实测
-    /// 见下方 `default_*` 部分的说明。0 禁用硬限制（始终放行第一次调用）。
+    /// **按模型覆盖**：`request_max_prompt_tokens_per_model` 命中的模型以其
+    /// 值替代本全局值（map 中值 0 = 该模型显式不限）。仅当请求的模型不在
+    /// map 中时本全局值才生效。
     ///
-    /// 默认 90000。从 failure.log 中真实的空壳分布出发，分两轮调出：
-    ///(1) 当上限为 120000 时，观察到的 77 个空壳里 est_prompt_tokens 全在
-    ///     [98288, 109231] 之间——没有一个到达 120k，所以 413 守卫从不触发，
-    ///     每一个注定失败的 /compact 都表现为 502 "empty chat completion"
-    ///     被客户端重试约 10 分钟，而不是一个诚实的 413。（`chars/4` 估算
-    ///     会低估真实 tokens，所以一旦加上 max_tokens，一个 ~109k 的估算
-    ///     实际上就已经让 ~128k 模型窗口溢出。）下调到 95000。
-    ///(2) 当上限为 95000 时（仍允许一次尝试的 [90k, 95k) "一次性" 灰带），
-    ///     第二天全部 32 个空壳的 est 落在 [92488, 93445]——每一个都落在该
-    ///     灰带内，32 个全部空壳（0% 成功）。这条灰带给 Claude Code 一个 502，
-    ///     它又重试约 10 分钟（与第一轮同样的失败模式），而不是一条它能
-    ///     立刻接受的清晰 413。随着会话增长，实测的空壳下限也从 98288 降到
-    ///     了 92488。
-    /// 因此 90000 折叠了该灰带：落在两个实测下限之下，任何 est >= 90000
-    /// → 立即 413，零上游往返、零客户端重试风暴。若日后用更准确的估算器
-    /// 取代 `chars/4`，可重新评估能否重新引入一小段灰带。
+    /// **默认 0 = 不限制**（2026-10-10 起，与 per-model map 一起引入）。
+    /// 历史：曾经是 90000（= `empty_shell_no_retry_prompt_tokens`，刻意相等、
+    /// 软硬之间无灰带——两轮 failure.log 实测把 [90k,95k) "打一发就过" 灰带的
+    /// 恢复率测成 0%，故折叠），后按 kimi-k3 256K 窗口抬到 220000。2026-10-04
+    /// 它把 glm-5.3-flash（实测窗口 ≥324k 真实 token）在 est 220k 处连拒 28 次
+    /// ——est/real 比随会话构成漂移（中文+代码实测 ≈1.47），全局值对部分模型
+    /// 必然失配。若为 glm-5.2（~128k 窗口、90k-era 空壳的全部实测来源）单独
+    /// 配置上限，用 per-model 条目，别回抬全局值。两轮实测记录：
+    ///(1) 上限 120000 时 77 个空壳的 est 全在 [98288,109231]——从不触发，
+    ///     每个注定失败的 /compact 都表现为 502 被 client 重试 ~10 分钟。
+    ///(2) 上限 95000（[90k,95k) 灰带）时 32 个空壳的 est 全在
+    ///     [92488,93445]——32/32 空壳、0% 恢复。
+    /// 若日后用更准确的估算器取代，可重新评估灰带。
     /// 可通过 `NVIDIA_REQUEST_MAX_PROMPT_TOKENS` 覆盖。
     #[serde(default = "default_request_max_prompt_tokens")]
     pub request_max_prompt_tokens: u64,
+
+    /// **按模型**的估算 prompt token 硬上限（413 入口拒绝）。命中 map 的模型
+    /// 以其值替代全局 `request_max_prompt_tokens`；未命中的模型回退到全局值。
+    ///
+    /// 语义（2026-10-10 起）：**默认不做任何限制**——`request_max_prompt_tokens`
+    /// 默认 0（不限），本 map 默认空；只有运营者显式为某模型配置了上限，该模型
+    /// 才会被 413 守卫拦。这修掉了 2026-10-04 的误杀事故：全局 220k 是按
+    /// kimi-k3 256K 窗口调的，却把 glm-5.3-flash（实测吃下真实 324k token 的
+    /// 请求、est/real≈1.47）在 est 220k 处拒了 28 次。每个模型的真实窗口
+    /// 不同、estimator 的 est/real 比也随语言/代码构成漂移，一个全局值注定
+    /// 对某些模型过紧、对某些过松——把决定权交给 per-model 配置。
+    ///
+    /// map 的 key 可以是客户端可见的别名**源**名（重映射前）或 NVIDIA 实际
+    /// 收到的**目标**名（重映射后），两者都会被查找（与
+    /// `concurrency_limit_per_model` 相同的双向查找）。值 0 表示"该模型显式
+    /// 不限制"，可用来对全局默认（若配了非零）开例外。
+    ///
+    /// 可通过 `NVIDIA_REQUEST_MAX_PROMPT_TOKENS_PER_MODEL`（JSON map）覆盖。
+    #[serde(default)]
+    pub request_max_prompt_tokens_per_model: std::collections::HashMap<String, u64>,
 
     // ==================== 多模态 prompt-token 估算 ====================
     /// 在估算多模态请求的 prompt 大小时，给每个 `{type:"image_url",…}` 块
@@ -397,12 +413,20 @@ fn default_empty_shell_no_retry_prompt_tokens() -> u64 {
     90000
 }
 
-/// 硬 prompt-token 上限默认值的公开封装。供 `proxy.rs` / `key_pool.rs` /
+/// 硬 prompt-token 全局上限默认值的公开封装。供 `proxy.rs` / `key_pool.rs` /
 /// `integration_test.rs` 中的测试脚手架使用，使其手工构造的 `Config` 遵循
 /// 生产默认值而无需重述该字面量（与 `default_empty_shell_pre_clamp_max_tokens`
 /// 镜像对应）。
+///
+/// 默认 **0 = 不限制**（2026-10-10 起）。历史上是 90000，后来按 kimi-k3 的
+/// 256K 窗口调到 220000；2026-10-04 它把 glm-5.3-flash（实测窗口 ≥324k 真实
+/// token）在 est 220k 处连续误杀 28 次——est/real 比随语言与代码构成漂移
+/// （本仓库会话实测 ≈1.47），任何全局值都注定对部分模型失配。此后 413 上限
+/// 的语义改为"默认不限，按模型 opt-in"（`request_max_prompt_tokens_per_model`
+/// 命中才拦）。90k 空壳-era 的全部实测来自 glm-5.2 ~128k 窗口；若 glm-5.2
+/// 路径复活，用 per-model 条目为它单独设上限，而不是回抬全局值。
 pub fn default_request_max_prompt_tokens() -> u64 {
-    90000
+    0
 }
 
 fn default_est_image_token_cost() -> u64 {
@@ -542,6 +566,10 @@ impl fmt::Debug for Config {
                 &self.empty_shell_no_retry_prompt_tokens,
             )
             .field("request_max_prompt_tokens", &self.request_max_prompt_tokens)
+            .field(
+                "request_max_prompt_tokens_per_model",
+                &self.request_max_prompt_tokens_per_model,
+            )
             .field("est_image_token_cost", &self.est_image_token_cost)
             .field("est_audio_token_per_kb", &self.est_audio_token_per_kb)
             .field("est_audio_token_cap", &self.est_audio_token_cap)
@@ -842,6 +870,7 @@ impl Config {
             empty_shell_pre_clamp_max_tokens: default_empty_shell_pre_clamp_max_tokens(),
             empty_shell_no_retry_prompt_tokens: default_empty_shell_no_retry_prompt_tokens(),
             request_max_prompt_tokens: default_request_max_prompt_tokens(),
+            request_max_prompt_tokens_per_model: std::collections::HashMap::new(),
             est_image_token_cost: default_est_image_token_cost(),
             est_audio_token_per_kb: default_est_audio_token_per_kb(),
             est_audio_token_cap: default_est_audio_token_cap(),
@@ -977,6 +1006,8 @@ impl Config {
         // `default_request_max_prompt_tokens` 文档里两轮实测：[90k,95k) 的灰带让 32/32
         // /compact 空壳、客户端重试约 10 分钟）。这里只在"硬上限严格高于软不重试阈值"
         // 时 warn——逆向默认就是两者相等。不阻断启动（运维可能在调试期主动留灰带）。
+        // 2026-10-10 起硬上限默认 0（不限）、按模型 opt-in（per_model map 命中才拦），
+        // 所以此 warn 默认沉默，仅在运维显式配置了全局上限时可能触发。
         if self.request_max_prompt_tokens > 0
             && self.empty_shell_no_retry_prompt_tokens > 0
             && self.request_max_prompt_tokens > self.empty_shell_no_retry_prompt_tokens
@@ -984,9 +1015,26 @@ impl Config {
             warn!(
                 "request_max_prompt_tokens={} > empty_shell_no_retry_prompt_tokens={}；\
                  硬上限高于软不重试阈值会在其间复活「打一发就过但注定空壳 + 误导 502」的灰带。\
-                 建议二者相等（默认都 90000）。",
+                 建议二者相等。",
                 self.request_max_prompt_tokens, self.empty_shell_no_retry_prompt_tokens
             );
+        }
+        // per-model 条目也会形成同样的灰带：该模型的生效上限若高于全局软不重试
+        // 阈值，超阈值的请求在入口放行、空壳后却跳过重试，正好落回「一次空壳 +
+        // 502」模式。与上面全局 warn 同理：提醒、不阻断。
+        if self.empty_shell_no_retry_prompt_tokens > 0 {
+            for (m, cap) in &self.request_max_prompt_tokens_per_model {
+                if *cap > self.empty_shell_no_retry_prompt_tokens {
+                    warn!(
+                        model = %m,
+                        request_max_prompt_tokens_per_model = cap,
+                        empty_shell_no_retry_prompt_tokens =
+                            self.empty_shell_no_retry_prompt_tokens,
+                        "per-model 硬上限高于软不重试阈值会在其间复活「打一发就过但注定空壳 \
+                         + 误导 502」的灰带；建议二者相等或硬上限更低。"
+                    );
+                }
+            }
         }
         // 反向灰带：`request_max < no_retry`。软不重试阈值的语义是"prompt 超过这个
         // 就不再耗一次重试"；硬上限是"超过这个就在入口直接 413 拒绝"。如果硬上限
@@ -1383,6 +1431,11 @@ impl Config {
                     &value,
                     &mut config.request_max_prompt_tokens
                 )),
+                "request_max_prompt_tokens_per_model" => record!(Self::env_json_into(
+                    key,
+                    &value,
+                    &mut config.request_max_prompt_tokens_per_model
+                )),
                 "est_image_token_cost" => record!(Self::env_parse_into(
                     key,
                     &value,
@@ -1521,6 +1574,7 @@ mod config_validation_tests {
             empty_shell_pre_clamp_max_tokens: default_empty_shell_pre_clamp_max_tokens(),
             empty_shell_no_retry_prompt_tokens: default_empty_shell_no_retry_prompt_tokens(),
             request_max_prompt_tokens: default_request_max_prompt_tokens(),
+            request_max_prompt_tokens_per_model: std::collections::HashMap::new(),
             est_image_token_cost: default_est_image_token_cost(),
             est_audio_token_per_kb: default_est_audio_token_per_kb(),
             est_audio_token_cap: default_est_audio_token_cap(),
@@ -1613,11 +1667,18 @@ mod config_validation_tests {
 
     #[test]
     fn equal_prompt_ceilings_passes_silently() {
-        // 两者相等（默认形态）—— validate 绝不能 err。
+        // 新默认（2026-10-10）：硬上限 0（不限、按模型 opt-in）＋软不重试阈值
+        // 90000。全局软=硬相等的原则只在**显式配置了**硬上限时适用（见
+        // `hard_ceiling_above_soft_no_retry_warns_but_passes`）；默认 0 意味
+        // 着 413 守卫整体短路，软阈值继续独立管空壳重试旁路。
         let cfg = base_valid_config();
         assert_eq!(
-            cfg.request_max_prompt_tokens, cfg.empty_shell_no_retry_prompt_tokens,
-            "base fixture 应保持默认两者相等"
+            cfg.request_max_prompt_tokens, 0,
+            "base fixture 应保持新默认硬上限 0（不限）"
+        );
+        assert_eq!(
+            cfg.empty_shell_no_retry_prompt_tokens, 90_000,
+            "软不重试阈值默认不变"
         );
         assert!(cfg.validate().is_ok());
     }
@@ -1652,6 +1713,36 @@ mod config_validation_tests {
         let mut cfg = base_valid_config();
         cfg.request_max_prompt_tokens = 100_000;
         cfg.empty_shell_no_retry_prompt_tokens = 0;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn per_model_ceiling_above_soft_no_retry_warns_but_passes() {
+        // per-model 条目高于软不重试阈值时 warn、不阻断——与全局灰带告警
+        // 同一原则（运维可能在调试期主动留灰带）。
+        let mut cfg = base_valid_config();
+        cfg.request_max_prompt_tokens = 0;
+        cfg.request_max_prompt_tokens_per_model = [
+            ("z-ai/glm-5.2".to_string(), 250_000u64),
+            ("moonshotai/kimi-k3".to_string(), 220_000u64),
+        ]
+        .into_iter()
+        .collect();
+        cfg.empty_shell_no_retry_prompt_tokens = 90_000;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn per_model_ceiling_at_or_below_soft_no_retry_passes_silently() {
+        // per-model 条目 ≤ 软阈值：无灰带，validate ok（这是推荐形态——
+        // 为模型配的上限应让其注定失败请求先 413 而非空壳后跳重试）。
+        let mut cfg = base_valid_config();
+        cfg.request_max_prompt_tokens_per_model = [
+            ("z-ai/glm-5.2".to_string(), 90_000u64),
+            ("moonshotai/kimi-k3".to_string(), 80_000u64),
+        ]
+        .into_iter()
+        .collect();
         assert!(cfg.validate().is_ok());
     }
 

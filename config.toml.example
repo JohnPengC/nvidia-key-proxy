@@ -93,14 +93,32 @@ empty_shell_retry_max_tokens = 8192
 # ── prompt-token 硬上限（413）─────────────────────────────────────────────────
 # 估算 prompt token 的硬上限：达到/超过此值会在任何上游调用之前以 HTTP 413
 # 拒绝，要求 client 自行压缩上下文。代理拒绝而非改写 client 的 messages
-#（auto-compact 是 client 的职责）。请把它设成与软阈值
-# `empty_shell_no_retry_prompt_tokens` *相等*（两者默认都 90000）—— 之间不
-# 留任何灰带。两轮实测表明任何"打一发就过"的灰带只会产出注定空壳 + 一个让
-# client 反复重试分钟级的误导性 502：在 ~92k 估算值（按 chars/4 算，会低估
-# 真实 token 数）时，`prompt + max_tokens` 已超出 glm-5.2 的 ~128k 窗口。所以
-# est >= 90000 → 立刻 413，零上游往返、零客户端重试风暴。0 = 关闭硬上限。
+#（auto-compact 是 client 的职责）。
+#
+# **2026-10-10 起该上限按模型生效、默认不限制。** 历史上的全局 90000
+#（后为 220000）在 2026-10-04 把 glm-5.3-flash 连续 413 误杀 28 次：全局值按
+# kimi-k3 256K 窗口调定，而 glm-5.3-flash 实测（真实 324k token 成功、合成
+# 500k token 探测仍 200 OK）窗口远超此线；est/real 比又随语言/代码构成漂移
+#（中文+代码会话实测 ≈1.47），任何全局值都注定对部分模型失配。此后：
+#   - 此处 = **全局回退值**，默认 0 = 不限制；仅当请求模型不在下面的
+#     per_model map 中时才生效。
+#   - per_model map 命中的模型以其值替代全局值（0 = 该模型显式不限）。
+#   - 为某模型配置上限时，仍应让它 ≤ `empty_shell_no_retry_prompt_tokens`
+#     （config validate 会 warn 软硬灰带）——90k-era 两轮实测表明任何
+#     [软, 硬) 灰带只会产出注定空壳 + 一个让 client 反复重试分钟级的误导
+#     性 502（[90k,95k) 灰带 32/32 空壳、0% 恢复）。
 # 环境变量覆盖：NVIDIA_REQUEST_MAX_PROMPT_TOKENS。
-# request_max_prompt_tokens = 90000
+# request_max_prompt_tokens = 0
+#
+# 按模型的上限表。key 可写客户端可见别名源名或重映射后的 NVIDIA 目标名。
+# 例（kimi 系 256K 窗口的保护性上限）：
+#   [request_max_prompt_tokens_per_model]
+#   "moonshotai/kimi-k3" = 220000
+#   "moonshotai/kimi-k2.6" = 220000
+# 注意 TOML 表声明会吞掉其后到下一个表头前的所有裸 key——若启用此表，
+# 请放在文件末尾，或确保其后紧跟另一个表头。
+# 环境变量覆盖：NVIDIA_REQUEST_MAX_PROMPT_TOKENS_PER_MODEL（JSON map）。
+# request_max_prompt_tokens_per_model = {}
 
 # ── 多模态 prompt-token 估算 ──────────────────────────────────────────────────
 # 代理原样转发 OpenAI 风格的多模态 content 数组（image_url / input_audio

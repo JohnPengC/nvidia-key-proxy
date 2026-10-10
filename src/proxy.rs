@@ -354,8 +354,14 @@ pub struct Proxy {
     /// Config::empty_shell_no_retry_prompt_tokens。
     empty_shell_no_retry_prompt_tokens: u64,
     /// 估算 prompt token 数的硬上限；达到/超过时在任何上游调用前就以 413 拒绝。
-    /// 见 Config::request_max_prompt_tokens。
+    /// 见 Config::request_max_prompt_tokens。**全局回退值**——请求的模型命中
+    /// `request_max_prompt_tokens_per_model` 时以 map 值替代（0 = 不限）。
+    /// 见 `effective_request_max_prompt_tokens`。
     request_max_prompt_tokens: u64,
+    /// **按模型**的估算 prompt token 硬上限；命中替代全局回退值。key 可为
+    /// 别名源名或重映射后的目标名（`effective_request_max_prompt_tokens`
+    /// 做双向查找）。见 Config::request_max_prompt_tokens_per_model。
+    request_max_prompt_tokens_per_model: std::collections::HashMap<String, u64>,
     /// 估算 **多模态** 请求（image_url / input_audio 内容块）prompt 大小时用到
     /// 的、按部分类型的粗粒度 token 成本，使 413 硬上限和空壳不重试软限制不被
     /// 内联 base64（会把估算吹爆从而误拒合法请求）或仅 URL 引用（会少算）欺骗。
@@ -1619,6 +1625,7 @@ impl Proxy {
         empty_shell_pre_clamp_max_tokens: std::collections::HashMap<String, u64>,
         empty_shell_no_retry_prompt_tokens: u64,
         request_max_prompt_tokens: u64,
+        request_max_prompt_tokens_per_model: std::collections::HashMap<String, u64>,
         est_costs: EstPromptCosts,
         circuit_breaker_threshold: u32,
         circuit_breaker_per_model: bool,
@@ -1652,6 +1659,9 @@ impl Proxy {
         for k in empty_shell_pre_clamp_max_tokens.keys() {
             known_models.insert(k.clone());
         }
+        for k in request_max_prompt_tokens_per_model.keys() {
+            known_models.insert(k.clone());
+        }
         for k in concurrency_limit_per_model.keys() {
             known_models.insert(k.clone());
         }
@@ -1678,6 +1688,7 @@ impl Proxy {
             empty_shell_pre_clamp_max_tokens,
             empty_shell_no_retry_prompt_tokens,
             request_max_prompt_tokens,
+            request_max_prompt_tokens_per_model,
             est_costs,
             circuit_breaker_threshold,
             circuit_breaker_per_model,
@@ -1693,6 +1704,36 @@ impl Proxy {
                 network_breaker_window_secs,
             )),
         }
+    }
+
+    /// 解析某请求的**生效**估算 prompt-token 硬上限（413 入口拒绝用）。
+    ///
+    /// 查找顺序（与 `concurrency_limit_per_model` 的 `cap_key` 相同的双向语义）：
+    /// 1. 客户端可见的别名**源**名（重映射前）在
+    ///    `request_max_prompt_tokens_per_model` 中的条目——运营者自然按客户端
+    ///    发来的名字作 key；
+    /// 2. 重映射后的**目标**名（NVIDIA 实际收到的 model 字段）的条目——使按
+    ///    上游 id 配置也生效；
+    /// 3. 全局回退 `request_max_prompt_tokens`。
+    ///
+    /// map 中值 0 = 该模型**显式不限制**（可用来对非零全局默认开例外）；
+    /// 全局 0 = 未配置任何限制。返回 0 一律表示放行（413 守卫以 `> 0` 为开关）。
+    ///
+    /// 2026-10-04 事故背景见 `Config::request_max_prompt_tokens_per_model`：
+    /// 全局值对 glm-5.3-flash（窗口 ≥324k 真实 token）在 est 220k 处连误杀 28
+    /// 次，此后 413 改为按模型 opt-in。
+    fn effective_request_max_prompt_tokens(
+        &self,
+        source_model: Option<&str>,
+        target_model: &str,
+    ) -> u64 {
+        // Option<u64> 嵌套：外层 None = 两处都没配 per-model 条目 → 全局回退；
+        // 内层 Some(0) = 显式不限。`and_then` 塌缩后用 `unwrap_or` 保留这一区分。
+        source_model
+            .and_then(|s| self.request_max_prompt_tokens_per_model.get(s))
+            .or_else(|| self.request_max_prompt_tokens_per_model.get(target_model))
+            .copied()
+            .unwrap_or(self.request_max_prompt_tokens)
     }
 
     /// 把一个（可能由客户端提供的）模型字符串塌缩为一个作为 Prometheus 维度
@@ -2330,17 +2371,26 @@ impl Proxy {
         // glm-5.2 的 ~128k 窗（`chars/4` 估算少算真实 token）。与其为一个不可能成功的请
         // 求烧一个 key 槽与一次上游往返，不如预先以 413 拒绝并让客户端自行压缩其上下
         // 文。我们*不*改写客户端 messages——客户端拥有其对话历史（Claude Code 的
-        // /compact 由它跑）；代理的职责是大声失败、而非静默改动。该上限（默认 90000）
-        // 与软不重试上限设为相等，故无灰区：注定失败请求立即命中清晰 413、零上游往返，
-        // 而非一个客户端会重试的 502 "empty chat completion"。`request_max_prompt_tokens
-        // == 0` 时禁用。
-        if self.request_max_prompt_tokens > 0 {
+        // /compact 由它跑）；代理的职责是大声失败、而非静默改动。
+        //
+        // 2026-10-10 起该上限**按模型生效、默认不限制**：`request_max_prompt_tokens
+        // _per_model` 命中（别名源名或重映射目标名，见
+        // `effective_request_max_prompt_tokens`）以 map 值替代，值 0 = 该模型显式
+        // 不限；未命中回退全局 `request_max_prompt_tokens`（默认 0 = 不限）。背景：
+        // 全局 220k（按 kimi-k3 256K 窗口调的）把 glm-5.3-flash（实测 ≥324k 真实
+        // token、est/real≈1.47）在 est 220k 处连误杀 28 次——est/real 比随会话构成
+        // 漂移，全局值必然对部分模型失配。软硬相等的无灰区原则不变：为某模型配置
+        // 上限时仍应让它 ≤ `empty_shell_no_retry_prompt_tokens`（见 config validate
+        // 的 per-model warn）。生效上限 == 0 时本守卫完全放行。
+        let request_max_prompt_tokens = self
+            .effective_request_max_prompt_tokens(model_lookup_source.as_deref(), model.as_str());
+        if request_max_prompt_tokens > 0 {
             if let Some(est) = estimate_prompt_tokens(&body_bytes, &self.est_costs) {
-                if est >= self.request_max_prompt_tokens {
+                if est >= request_max_prompt_tokens {
                     warn!(
                         client_req_id = %client_req_id,
                         est_prompt_tokens = est,
-                        limit = self.request_max_prompt_tokens,
+                        limit = request_max_prompt_tokens,
                         model = %model,
                         "拒绝请求：估算 prompt token 超过硬上限；客户端须压缩其上下文"
                     );
@@ -2354,13 +2404,13 @@ impl Proxy {
                                  ceiling ({}) for this model; the request cannot fit the model's \
                                  context window and would be rejected upstream. Compress your \
                                  conversation context (e.g. clear history / run /compact) and retry.",
-                                est, self.request_max_prompt_tokens
+                                est, request_max_prompt_tokens
                             ),
                             "type": "request_too_large",
                             "code": "prompt_tokens_exceeds_ceiling",
                             "client_req_id": client_req_id,
                             "est_prompt_tokens": est,
-                            "limit": self.request_max_prompt_tokens,
+                            "limit": request_max_prompt_tokens,
                         }
                     });
                     return Ok(json_value_response(
@@ -4227,6 +4277,7 @@ mod proxy_integration_tests {
             empty_shell_pre_clamp_max_tokens: default_empty_shell_pre_clamp_max_tokens(),
             empty_shell_no_retry_prompt_tokens: 90000,
             request_max_prompt_tokens: default_request_max_prompt_tokens(),
+            request_max_prompt_tokens_per_model: std::collections::HashMap::new(),
             est_image_token_cost: 1500,
             est_audio_token_per_kb: 16,
             est_audio_token_cap: 10000,
@@ -4266,6 +4317,7 @@ mod proxy_integration_tests {
             config.empty_shell_pre_clamp_max_tokens.clone(),
             config.empty_shell_no_retry_prompt_tokens,
             config.request_max_prompt_tokens,
+            config.request_max_prompt_tokens_per_model.clone(),
             crate::proxy::EstPromptCosts {
                 image_cost: config.est_image_token_cost,
                 audio_token_per_kb: config.est_audio_token_per_kb,
@@ -4337,6 +4389,7 @@ mod proxy_integration_tests {
             config.empty_shell_pre_clamp_max_tokens.clone(),
             config.empty_shell_no_retry_prompt_tokens,
             config.request_max_prompt_tokens,
+            config.request_max_prompt_tokens_per_model.clone(),
             crate::proxy::EstPromptCosts {
                 image_cost: config.est_image_token_cost,
                 audio_token_per_kb: config.est_audio_token_per_kb,
@@ -4949,6 +5002,213 @@ mod proxy_integration_tests {
         assert!(
             body["error"]["est_prompt_tokens"].as_u64().unwrap_or(0) >= 5,
             "body should expose the estimated prompt tokens at/above the ceiling, got: {body}"
+        );
+    }
+
+    /// 按模型上限（2026-10-10 引入）：全局上限为 0（不限）时，命中
+    /// `request_max_prompt_tokens_per_model` 的模型仍按其 map 值 413；未命中
+    /// 的模型放行。这是"默认不限、按配置限"语义的正向面。
+    #[tokio::test]
+    async fn per_model_prompt_ceiling_limits_only_listed_model() {
+        let mock_server = MockServer::start().await;
+        // listed 模型的请求若到达上游则失败测试（expect(0)）；按 model 字段
+        // 用 partial-json 区分——两条请求 body 只差 model。
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/v1/chat/completions"))
+            .and(matchers::body_partial_json(serde_json::json!({
+                "model": "moonshotai/kimi-k3",
+            })))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/v1/chat/completions"))
+            .and(matchers::body_partial_json(serde_json::json!({
+                "model": "z-ai/glm-5.3-flash",
+            })))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(
+                    r#"{"choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
+                ),
+            )
+            // 恰好一次：只有 unlisted 模型的请求到达上游。
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let mut cfg = test_config(&mock_server.uri(), 3, 60);
+        // 全局 0 = 不限（新默认）；只给 listed 模型设极小上限。
+        cfg.request_max_prompt_tokens = 0;
+        cfg.request_max_prompt_tokens_per_model = [("moonshotai/kimi-k3".to_string(), 5u64)]
+            .into_iter()
+            .collect();
+        let addr = start_proxy(cfg).await;
+        let client = reqwest::Client::new();
+
+        // listed 模型：24 字符内容 → est = 6 ≥ 5 → 413。
+        let resp = client
+            .post(format!("http://{}/v1/chat/completions", addr))
+            .header("content-type", "application/json")
+            .body(r#"{"model":"moonshotai/kimi-k3","max_tokens":32000,"messages":[{"role":"user","content":"twenty four chars here!!"}],"stream":false}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            413,
+            "listed model must hit its per-model ceiling, got: {:?}",
+            resp.status()
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            body["error"]["limit"].as_u64(),
+            Some(5),
+            "413 body should expose the per-model (not global) limit, got: {body}"
+        );
+
+        // unlisted 模型：同样大小（est=6 ≥ 5）但无 map 条目、全局 0 → 放行。
+        let resp = client
+            .post(format!("http://{}/v1/chat/completions", addr))
+            .header("content-type", "application/json")
+            .body(r#"{"model":"z-ai/glm-5.3-flash","max_tokens":32000,"messages":[{"role":"user","content":"twenty four chars here!!"}],"stream":false}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            200,
+            "unlisted model with global=0 must pass through, got: {:?}",
+            resp.status()
+        );
+    }
+
+    /// 按模型上限的**别名源名**查找：客户端发 `gpt-4o`（源名），代理把它重映射
+    /// 到 `moonshotai/kimi-k3`（目标名）。per-model map 以**源名**作 key 时必须
+    /// 命中——与 `concurrency_limit_per_model` 相同的双向语义。
+    #[tokio::test]
+    async fn per_model_prompt_ceiling_matches_alias_source_name() {
+        let mock_server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        let mut cfg = test_config(&mock_server.uri(), 3, 60);
+        cfg.request_max_prompt_tokens = 0;
+        cfg.model_aliases = [("gpt-4o".to_string(), "moonshotai/kimi-k3".to_string())]
+            .into_iter()
+            .collect();
+        // 按源名配置（运营者按客户端发来的名字作 key）。
+        cfg.request_max_prompt_tokens_per_model =
+            [("gpt-4o".to_string(), 5u64)].into_iter().collect();
+        let addr = start_proxy(cfg).await;
+        let client = reqwest::Client::new();
+
+        // 24 字符 → est = 6 ≥ 5：413 必须在重映射后仍按源名命中。
+        let resp = client
+            .post(format!("http://{}/v1/chat/completions", addr))
+            .header("content-type", "application/json")
+            .body(r#"{"model":"gpt-4o","max_tokens":32000,"messages":[{"role":"user","content":"twenty four chars here!!"}],"stream":false}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            413,
+            "alias source-name lookup must hit the per-model ceiling, got: {:?}",
+            resp.status()
+        );
+    }
+
+    /// per-model map 值 0 = 该模型**显式不限制**——即使全局回退非零。这是
+    /// "为小窗口模型配全局保护、给大窗口模型开例外"的机制。
+    #[tokio::test]
+    async fn per_model_prompt_ceiling_zero_entry_overrides_global() {
+        let mock_server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/v1/chat/completions"))
+            .and(matchers::body_partial_json(serde_json::json!({
+                "model": "z-ai/glm-5.3-flash",
+            })))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(
+                    r#"{"choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
+                ),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let mut cfg = test_config(&mock_server.uri(), 3, 60);
+        // 全局 5（会把 est=6 拒掉）；glm-5.3-flash 条目 0 → 显式豁免。
+        cfg.request_max_prompt_tokens = 5;
+        cfg.request_max_prompt_tokens_per_model = [("z-ai/glm-5.3-flash".to_string(), 0u64)]
+            .into_iter()
+            .collect();
+        let addr = start_proxy(cfg).await;
+        let client = reqwest::Client::new();
+
+        let resp = client
+            .post(format!("http://{}/v1/chat/completions", addr))
+            .header("content-type", "application/json")
+            .body(r#"{"model":"z-ai/glm-5.3-flash","max_tokens":32000,"messages":[{"role":"user","content":"twenty four chars here!!"}],"stream":false}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            200,
+            "per-model 0 entry must exempt the model from the global ceiling, got: {:?}",
+            resp.status()
+        );
+    }
+
+    /// 新默认语义回归：**默认配置（全局 0、map 空）不拒绝任何请求**——
+    /// 2026-10-04 误杀事故的直接反例。est=6 虽小，但默认零配置下 413 守卫
+    /// 必须整体短路（`effective == 0`），请求原样放行。
+    #[tokio::test]
+    async fn default_config_does_not_reject_any_prompt_size() {
+        let mock_server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(
+                    r#"{"choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
+                ),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        // test_config 的 request_max_prompt_tokens = default_request_max_prompt_tokens()
+        //（新默认 0），map 为空——即生产默认形态。
+        let cfg = test_config(&mock_server.uri(), 3, 60);
+        assert_eq!(
+            cfg.request_max_prompt_tokens, 0,
+            "production default must be 0 (no global ceiling)"
+        );
+        assert!(
+            cfg.request_max_prompt_tokens_per_model.is_empty(),
+            "production default per-model map must be empty"
+        );
+        let addr = start_proxy(cfg).await;
+        let client = reqwest::Client::new();
+
+        let resp = client
+            .post(format!("http://{}/v1/chat/completions", addr))
+            .header("content-type", "application/json")
+            .body(r#"{"model":"z-ai/glm-5.3-flash","max_tokens":64000,"messages":[{"role":"user","content":"twenty four chars here!!"}],"stream":false}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            200,
+            "default config must pass every request through, got: {:?}",
+            resp.status()
         );
     }
 
