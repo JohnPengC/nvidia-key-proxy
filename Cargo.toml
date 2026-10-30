@@ -2,6 +2,10 @@
 name = "nvidia-key-proxy"
 version = "0.1.0"
 edition = "2021"
+description = "A lightweight Rust load-balancing proxy for multiple NVIDIA API keys, with per-key rate limiting, health checks, and Prometheus observability"
+license = "MIT"
+authors = ["John Peng"]
+repository = "https://github.com/JohnPengC/nvidia-key-proxy"
 
 [dependencies]
 tokio = { version = "1.38", features = ["full"] }

@@ -26,14 +26,15 @@
 
 1. **克隆并构建**
    ```bash
-   git clone <repository-url>
+   git clone https://github.com/JohnPengC/nvidia-key-proxy.git
    cd nvidia-key-proxy
    cargo build --release
    ```
 
 2. **配置**（项目根目录的 `config.toml`）：
    ```toml
-   listen_addr = "0.0.0.0:8888"
+   # 只监听回环地址；对外暴露前请先开启 [auth]（见 config.toml.example）
+   listen_addr = "127.0.0.1:8888"
    base_url    = "https://integrate.api.nvidia.com"
 
    # API keys —— 也可通过 NVIDIA_KEYS 环境变量设置（逗号分隔）
@@ -431,7 +432,7 @@ cargo test --release
 
 ## License
 
-MIT
+MIT — 详见 [LICENSE](LICENSE)。
 
 ## 致谢
 

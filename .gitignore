@@ -7,6 +7,7 @@ config.toml
 
 # Runtime log artifacts
 failure.log
+failure.log.*
 
 # Editor / OS
 .DS_Store
